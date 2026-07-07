@@ -19,7 +19,8 @@ import (
 )
 
 type state struct {
-	mgr *cmgr.Manager
+	mgr  *cmgr.Manager
+	gate *telemetryGate
 }
 
 var artifact_dir string
@@ -54,7 +55,10 @@ func main() {
 		log.Fatal("failed to initialize cmgr library")
 	}
 
-	s := state{mgr: mgr}
+	gate := newTelemetryGate()
+	go gate.run()
+
+	s := state{mgr: mgr, gate: gate}
 
 	http.HandleFunc("/challenges", s.listHandler)
 	http.HandleFunc("/challenges/", s.challengeHandler)
@@ -105,8 +109,13 @@ Relevant environment variables:
       filesystems (NFS, SMB) as this may cause corruption; set to 'false'
       to disable.
 
-  CMGR_CONCURRENT_LAUNCHES - the maximum number of concurrent container 
+  CMGR_CONCURRENT_LAUNCHES - the maximum number of concurrent container
       launches allowed (defaults to 2); allowed values are 1 or 2.
+
+  CMGR_TELEMETRY_URL - full URL of the telemetry agent's health endpoint used
+      to gate instance starts; if unset, defaults to the Docker host on port
+      2136 (e.g. 'http://<docker-host>:2136/health', or 127.0.0.1 for a local
+      socket); overloaded hosts reject starts with 503, unreachable with 500.
 
   Note: The Docker client is configured via Docker's standard environment
       variables.  See https://docs.docker.com/engine/reference/commandline/cli/
@@ -266,6 +275,14 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 			body, err = json.Marshal(meta)
 		}
 	case "POST":
+		if code, msg, deny := s.gate.reject(); deny {
+			if code == http.StatusServiceUnavailable {
+				w.Header().Set("Retry-After", "1")
+			}
+			w.WriteHeader(code)
+			w.Write([]byte(msg))
+			return
+		}
 		var instance cmgr.InstanceId
 		envVars := make(map[string]string)
 		if r.Body != nil {
