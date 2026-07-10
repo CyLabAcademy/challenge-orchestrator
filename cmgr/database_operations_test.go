@@ -916,7 +916,7 @@ func TestExplicitPortReadbackRedundant(t *testing.T) {
 		}
 		for _, portStr := range image.Ports {
 			portName := revPortMap[portStr]
-			hostPort, err := mgr.reservePort(instance.Id, portName)
+			hostPort, err := mgr.reservePort(instance.Id, "", portName)
 			if err != nil {
 				t.Fatalf("reservePort(%q) failed: %s", portName, err)
 			}
@@ -1076,7 +1076,7 @@ func TestUsedPortBitset(t *testing.T) {
 	mgr := setupPortAssignments(t, portLow, portHigh, assignedPorts)
 	defer mgr.db.Close()
 
-	bitset, err := mgr.usedPortBitset()
+	bitset, err := mgr.usedPortBitset("")
 	if err != nil {
 		t.Fatalf("usedPortBitset failed: %s", err)
 	}
@@ -1110,7 +1110,7 @@ func TestUsedPortBitsetNoRange(t *testing.T) {
 	defer mgr.db.Close()
 	// portLow defaults to 0 from setupTestManager
 
-	bitset, err := mgr.usedPortBitset()
+	bitset, err := mgr.usedPortBitset("")
 	if err != nil {
 		t.Fatalf("usedPortBitset failed: %s", err)
 	}
@@ -1126,7 +1126,7 @@ func TestReservePortNoRange(t *testing.T) {
 	defer mgr.db.Close()
 	// portLow defaults to 0
 
-	_, err := mgr.reservePort(1, "test")
+	_, err := mgr.reservePort(1, "", "test")
 	if err == nil {
 		t.Errorf("expected error when port reservation disabled, got nil")
 	}
@@ -1164,7 +1164,7 @@ func TestReservePortWithRange(t *testing.T) {
 		t.Fatalf("openInstance failed: %v", err)
 	}
 
-	port, err := mgr.reservePort(instance.Id, "test")
+	port, err := mgr.reservePort(instance.Id, "", "test")
 	if err != nil {
 		t.Fatalf("reservePort failed: %s", err)
 	}
@@ -1195,7 +1195,7 @@ func TestReservePortSkipsUsed(t *testing.T) {
 		t.Fatalf("failed to get instance id: %v", err)
 	}
 
-	port, err := mgr.reservePort(instId, "test")
+	port, err := mgr.reservePort(instId, "", "test")
 	if err != nil {
 		t.Fatalf("reservePort failed: %s", err)
 	}
@@ -1229,7 +1229,7 @@ func TestReservePortAllUsed(t *testing.T) {
 		t.Fatalf("failed to get instance id: %v", err)
 	}
 
-	_, err := mgr.reservePort(instId, "test")
+	_, err := mgr.reservePort(instId, "", "test")
 	if err == nil {
 		t.Error("expected an error when all ports are in use, got nil")
 	}

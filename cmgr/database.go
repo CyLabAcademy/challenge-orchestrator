@@ -132,6 +132,7 @@ const schemaQuery string = `
 		build INTEGER NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		is_finalized INTEGER NOT NULL DEFAULT 0 CHECK(is_finalized IN (0,1)),
+		worker TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (build) REFERENCES builds (id)
 			ON UPDATE RESTRICT ON DELETE RESTRICT
 	);
@@ -140,8 +141,20 @@ const schemaQuery string = `
 		instance INTEGER NOT NULL,
 		name TEXT NOT NULL,
 		port INTEGER NOT NULL CHECK (port > 0 AND port < 65536),
+		worker TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (instance) REFERENCES instances (id)
 			ON UPDATE RESTRICT ON DELETE CASCADE
+	);
+
+	-- Docker workers for multi-host instance placement. ip is the private
+	-- orchestration address cmgr dials; public is the player-facing address
+	-- (IP or hostname) surfaced in instance metadata, '' meaning the private
+	-- IP doubles as public. worker-remove purges the row along with the
+	-- worker's instance records. (DBs created before this scheme carry a
+	-- leftover 'removed' column; it is never read.)
+	CREATE TABLE IF NOT EXISTS workers (
+		ip TEXT NOT NULL PRIMARY KEY,
+		public TEXT NOT NULL DEFAULT ''
 	);
 
 	CREATE TABLE IF NOT EXISTS containers (
@@ -280,6 +293,42 @@ func (m *Manager) initDatabase() error {
 	if err != nil {
 		m.log.errorf("could not create instanceCreatedAtIndex index: %s", err)
 		return err
+	}
+
+	// Migrate pre-multi-worker DBs in place: instances and portAssignments
+	// gain a worker column ('' = local daemon, which is what every existing
+	// row was). Keeps builds intact so nothing gets rebuilt.
+	for _, table := range []string{"instances", "portAssignments"} {
+		var workerCols int
+		err = db.QueryRow(
+			fmt.Sprintf("SELECT COUNT(1) FROM pragma_table_info('%s') WHERE name='worker';", table),
+		).Scan(&workerCols)
+		if err != nil {
+			m.log.errorf("could not inspect %s schema: %s", table, err)
+			return err
+		}
+		if workerCols == 0 {
+			_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN worker TEXT NOT NULL DEFAULT '';", table))
+			if err != nil {
+				m.log.errorf("could not migrate %s.worker column: %s", table, err)
+				return err
+			}
+		}
+	}
+
+	// Migrate older DBs: add the workers.public column if it is not present.
+	var workerPublicCols int
+	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('workers') WHERE name = 'public';").Scan(&workerPublicCols)
+	if err != nil {
+		m.log.errorf("could not check workers table schema: %s", err)
+		return err
+	}
+	if workerPublicCols == 0 {
+		_, err = db.Exec("ALTER TABLE workers ADD COLUMN public TEXT NOT NULL DEFAULT '';")
+		if err != nil {
+			m.log.errorf("could not migrate workers.public column: %s", err)
+			return err
+		}
 	}
 
 	var fkeysEnforced bool
@@ -468,7 +517,9 @@ func (m *Manager) usedPortSet() (map[int]struct{}, error) {
 	return portSet, err
 }
 
-func (m *Manager) usedPortBitset() ([]uint64, error) {
+// usedPortBitset reports the ports in use on one daemon (workers each have
+// their own pool; ” is the local daemon).
+func (m *Manager) usedPortBitset(worker string) ([]uint64, error) {
 	if m.portLow == 0 {
 		return nil, nil
 	}
@@ -476,7 +527,7 @@ func (m *Manager) usedPortBitset() ([]uint64, error) {
 	numPorts := m.portHigh - m.portLow + 1
 	bitset := make([]uint64, (numPorts+63)/64)
 
-	rows, err := m.db.Query("SELECT port FROM portAssignments WHERE port BETWEEN ? AND ?", m.portLow, m.portHigh)
+	rows, err := m.db.Query("SELECT port FROM portAssignments WHERE worker = ? AND port BETWEEN ? AND ?", worker, m.portLow, m.portHigh)
 	if err != nil {
 		return nil, err
 	}

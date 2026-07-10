@@ -45,6 +45,10 @@ func NewManager(logLevel LogLevel) *Manager {
 		return nil
 	}
 
+	if err := mgr.initWorkers(); err != nil {
+		return nil
+	}
+
 	mgr.pruneInterval = 1 * time.Minute
 	pruneAgeStr, isSet := os.LookupEnv(PRUNE_AGE_ENV)
 	if !isSet {
@@ -243,6 +247,18 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 		Ports:      make(map[string]int),
 		Containers: []string{},
 	}
+
+	// Placement (cmgrd only): pick a worker before the instance row is
+	// created so the worker is recorded with it. With no workers configured
+	// selectWorker returns "" and the instance runs on the local daemon.
+	if m.placementEnabled {
+		worker, err := m.selectWorker()
+		if err != nil {
+			return 0, err
+		}
+		iMeta.Worker = worker
+	}
+
 	err := m.openInstance(iMeta)
 	if err != nil {
 		return 0, err
@@ -269,7 +285,7 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 			}
 			for _, portStr := range image.Ports {
 				portName := revPortMap[portStr]
-				hostPort, err := m.reservePort(iMeta.Id, portName)
+				hostPort, err := m.reservePort(iMeta.Id, iMeta.Worker, portName)
 				if err != nil {
 					m.stopInstance(iMeta)
 					return 0, err
@@ -316,6 +332,15 @@ func (m *Manager) Stop(instance InstanceId) error {
 }
 
 func (m *Manager) stopInstance(instance *InstanceMetadata) error {
+	// A down (or purged) worker cannot be reached: clear our records and
+	// report success so callers (the platform's stop/restart/TTL flows) are
+	// never wedged behind a dead box. Any containers actually left running
+	// are docker-reaper's or manual cleanup's problem.
+	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+		m.log.warnf("worker %s down: clearing instance %d records without docker teardown", instance.Worker, instance.Id)
+		return m.removeInstanceMetadata(instance.Id)
+	}
+
 	err := m.stopContainers(instance)
 	if err != nil {
 		return err
@@ -578,7 +603,16 @@ func (m *Manager) GetBuildMetadata(build BuildId) (*BuildMetadata, error) {
 }
 
 func (m *Manager) GetInstanceMetadata(instance InstanceId) (*InstanceMetadata, error) {
-	return m.lookupInstanceMetadata(instance)
+	iMeta, err := m.lookupInstanceMetadata(instance)
+	if err != nil {
+		return nil, err
+	}
+	// Resolve the player-facing address at read time so a worker's public
+	// address can be corrected by re-adding it, without touching instances.
+	if iMeta.Worker != "" {
+		iMeta.WorkerPublic = m.workerPublicAddr(iMeta.Worker)
+	}
+	return iMeta, nil
 }
 
 func (m *Manager) DumpState(challenges []ChallengeId) ([]*ChallengeMetadata, error) {

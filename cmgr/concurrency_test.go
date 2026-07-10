@@ -49,7 +49,7 @@ func TestConcurrentPortReservation(t *testing.T) {
 		wg.Add(1)
 		go func(instanceId InstanceId) {
 			defer wg.Done()
-			port, err := mgr.reservePort(instanceId, "test-port")
+			port, err := mgr.reservePort(instanceId, "", "test-port")
 			if err != nil {
 				errs <- err
 			} else {

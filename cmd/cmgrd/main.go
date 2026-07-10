@@ -55,6 +55,11 @@ func main() {
 		log.Fatal("failed to initialize cmgr library")
 	}
 
+	// cmgrd is the runtime orchestrator: new instances are placed on the
+	// configured workers (round robin, skipping overloaded/down ones). The
+	// cmgr CLI never enables placement, so CLI instances stay local.
+	mgr.EnableWorkerPlacement()
+
 	gate := newTelemetryGate()
 	go gate.run()
 
@@ -64,8 +69,12 @@ func main() {
 	http.HandleFunc("/challenges/", s.challengeHandler)
 	http.HandleFunc("/builds/", s.buildHandler)
 	http.HandleFunc("/instances/", s.instanceHandler)
-	http.HandleFunc("/schemas", s.schemaHandler)
-	http.HandleFunc("/schemas/", s.existingSchemaHandler)
+	http.HandleFunc("/workers", s.workersHandler)
+	http.HandleFunc("/workers/", s.workerHandler)
+	// Schema-based starts are unused in this deployment, so the endpoints are
+	// disabled here; the cmgr CLI keeps its schema commands (local only).
+	// http.HandleFunc("/schemas", s.schemaHandler)
+	// http.HandleFunc("/schemas/", s.existingSchemaHandler)
 
 	connStr := fmt.Sprintf("%s:%d", iface, port)
 	log.Fatal(http.ListenAndServe(connStr, nil))
@@ -116,6 +125,30 @@ Relevant environment variables:
       to gate instance starts; if unset, defaults to the Docker host on port
       2136 (e.g. 'http://<docker-host>:2136/health', or 127.0.0.1 for a local
       socket); overloaded hosts reject starts with 503, unreachable with 500.
+
+  CMGR_REGISTRY - the docker registry holding built challenge images; when
+      set, images are pulled from it before each instance start (must match
+      the value used by cmgr when building).
+
+Workers:
+  When docker workers are configured (POST/DELETE/GET on /workers, or the
+  cmgr worker-* commands), new instances are placed on them round robin,
+  skipping overloaded and down workers; with none configured, cmgrd behaves
+  as a single-host daemon using DOCKER_HOST. Worker connections use the TLS
+  material from DOCKER_CERT_PATH with the server name pinned to
+  'academy-docker-worker' (the shared worker certificate), dockerd on port
+  2376, and the telemetry agent on port 2136.
+
+  A worker goes down (sticky) after 30s of telemetry silence or a single
+  hung/refused docker control call; recovery is re-adding it (POST /workers
+  or cmgr worker-add). Stops for instances on a down worker clear the
+  records and return success without touching docker. DELETE on /workers
+  purges the worker and all of its instance records.
+
+  Workers have two addresses: the private IP cmgrd dials, and an optional
+  player-facing public address ("public" in the POST /workers body).
+  Instance metadata reports the public one as "worker_public" (falling back
+  to the private IP when unset).
 
   Note: The Docker client is configured via Docker's standard environment
       variables.  See https://docs.docker.com/engine/reference/commandline/cli/
@@ -275,13 +308,18 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 			body, err = json.Marshal(meta)
 		}
 	case "POST":
-		if code, msg, deny := s.gate.reject(); deny {
-			if code == http.StatusServiceUnavailable {
-				w.Header().Set("Retry-After", "1")
+		// Legacy single-host mode only: with workers configured, admission is
+		// decided per worker inside the library (selection skips overloaded
+		// and down workers and errors when none admit).
+		if !s.mgr.WorkersConfigured() {
+			if code, msg, deny := s.gate.reject(); deny {
+				if code == http.StatusServiceUnavailable {
+					w.Header().Set("Retry-After", "1")
+				}
+				w.WriteHeader(code)
+				w.Write([]byte(msg))
+				return
 			}
-			w.WriteHeader(code)
-			w.Write([]byte(msg))
-			return
 		}
 		var instance cmgr.InstanceId
 		envVars := make(map[string]string)
@@ -327,6 +365,12 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 		respCode = http.StatusInternalServerError
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
+		}
+		// Every worker was skipped: overloaded somewhere means retryable,
+		// everything down means a real failure.
+		if errors.Is(err, cmgr.ErrAllWorkersOverloaded) {
+			respCode = http.StatusServiceUnavailable
+			w.Header().Set("Retry-After", "1")
 		}
 		body = []byte(err.Error())
 	}
@@ -431,6 +475,12 @@ func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {
 		respCode = http.StatusNoContent
 	case "DELETE":
 		err = s.mgr.Stop(instance)
+		// Idempotent delete: the instance may already be gone (pruned by the
+		// TTL sweep, or cleared when its worker died). Callers only need to
+		// know it no longer exists.
+		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+			err = nil
+		}
 		respCode = http.StatusNoContent
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)

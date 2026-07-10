@@ -38,6 +38,15 @@ func main() {
 		logLevel = cmgr.WARN
 	}
 
+	// In registry mode the CLI always builds on the local docker daemon:
+	// images reach workers through the registry, and DOCKER_HOST (from an
+	// env file shared with cmgrd) points at a worker, not the build daemon.
+	if os.Getenv(cmgr.REGISTRY_ENV) != "" {
+		os.Unsetenv("DOCKER_HOST")
+		os.Unsetenv("DOCKER_TLS_VERIFY")
+		os.Unsetenv("DOCKER_CERT_PATH")
+	}
+
 	log.SetFlags(0)
 	mgr := cmgr.NewManager(logLevel)
 	if mgr == nil {
@@ -89,6 +98,12 @@ func main() {
 		exitCode = showSchema(mgr, cmdArgs)
 	case "playtest":
 		exitCode = playtestChallenge(mgr, cmdArgs)
+	case "worker-add":
+		exitCode = addWorker(mgr, cmdArgs)
+	case "worker-remove":
+		exitCode = removeWorker(mgr, cmdArgs)
+	case "worker-list":
+		exitCode = listWorkers(mgr, cmdArgs)
 	case "version":
 		fmt.Println(cmgr.Version())
 		exitCode = NO_ERROR
@@ -200,6 +215,27 @@ Available commands:
       Creates a build and instance of the challenge and then starts a simple
       http front-end scoped to only that instance.
 
+  worker-add <ip> [public-address]
+      Registers a docker worker for instance placement by cmgrd (dockerd on
+      port 2376, telemetry agent on port 2136). <ip> is the private address
+      cmgr dials; the optional public address (IP or hostname) is what
+      instance metadata reports to players, defaulting to the private IP.
+      Re-adding an existing worker rebuilds its connection and replaces its
+      public address — this is also how a worker marked down is brought
+      back. Instances started from this CLI always run on the local docker
+      daemon regardless of configured workers.
+
+  worker-remove <ip>
+      Purges the worker: deletes its registry entry and all of its instance
+      records (destructive). Containers still running on a live worker are
+      not stopped; docker-reaper or manual cleanup handles them.
+
+  worker-list
+      Lists all configured workers with their health (ok, overloaded, or
+      down) and current instance count. Down is sticky: it is set after 30s
+      of telemetry silence or a hung/refused docker call, and cleared only by
+      re-adding the worker.
+
   dockerfile <type>
   		Prints out the Dockerfile associated with the given challenge type.
 
@@ -239,7 +275,12 @@ Relevant environment variables:
 
   CMGR_REGISTRY - the host/IP and follow on path for a docker registry; all
       frozen challenges will be pushed as images into this registry (i.e.,
-      <registry>/<challenge_slug>).
+      <registry>/<challenge_slug>). When set, built challenge images are also
+      tagged with the registry prefix and pushed after each build, and they
+      are pulled from the registry before each instance start; cmgr and cmgrd
+      must use the same value. In this mode cmgr ignores DOCKER_HOST and
+      always builds on the local docker daemon (only cmgrd talks to remote
+      workers).
 
   CMGR_REGISTRY_USER - the username to use to authenticate with the registry
 

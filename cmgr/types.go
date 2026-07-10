@@ -55,6 +55,16 @@ type Manager struct {
 	pruneInterval        time.Duration
 	pruneAge             time.Duration
 	launchSemaphore      chan struct{}
+
+	// Multi-worker state (see workers.go). placementEnabled is only set by
+	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run
+	// on the local daemon.
+	workersMu         sync.RWMutex
+	workers           map[string]*workerConn
+	workerOrder       []string // round-robin iteration order over workers
+	rrCursor          int      // guarded by workersMu
+	placementEnabled  bool
+	launchConcurrency int // per-daemon launch cap from CMGR_CONCURRENT_LAUNCHES
 }
 
 type PortInfo struct {
@@ -159,6 +169,16 @@ type InstanceMetadata struct {
 	LastSolved  int64          `json:"last_solved"`
 	CreatedAt   *time.Time     `json:"created_at" db:"created_at"`
 	Build       BuildId        `json:"build_id"`
+	// Worker is the IP of the docker worker hosting this instance; empty means
+	// the local (env-configured) daemon. Included in the JSON so API consumers
+	// get the host along with the ports.
+	Worker string `json:"worker,omitempty" db:"worker"`
+	// WorkerPublic is the worker's player-facing address (IP or hostname) —
+	// what consumers should hand to users, since Worker is the private
+	// orchestration address. Resolved from the worker registry at read time
+	// (GetInstanceMetadata), never stored; falls back to Worker when the
+	// worker has no public address configured.
+	WorkerPublic string `json:"worker_public,omitempty" db:"-"`
 }
 
 type Schema struct {

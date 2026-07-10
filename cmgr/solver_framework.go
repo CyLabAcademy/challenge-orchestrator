@@ -25,6 +25,13 @@ func (m *Manager) runSolver(instance InstanceId) error {
 		return err
 	}
 
+	// The solver builds and runs on the local daemon and joins the instance's
+	// docker network, which only exists on the daemon hosting the instance —
+	// so worker-hosted instances cannot be checked from here.
+	if iMeta.Worker != "" {
+		return fmt.Errorf("instance %d runs on worker %s: solve checks only work for local instances", instance, iMeta.Worker)
+	}
+
 	bMeta, err := m.lookupBuildMetadata(iMeta.Build)
 	if err != nil {
 		return err

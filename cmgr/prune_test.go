@@ -300,7 +300,7 @@ func TestPruneGCReleasesReservedPorts(t *testing.T) {
 		t.Fatalf("openInstance failed: %s", err)
 	}
 
-	port, err := mgr.reservePort(instance.Id, "http")
+	port, err := mgr.reservePort(instance.Id, "", "http")
 	if err != nil {
 		t.Fatalf("reservePort failed: %s", err)
 	}
@@ -330,7 +330,7 @@ func TestPruneAgeReleasesReservedPorts(t *testing.T) {
 	mgr.portLow = 10000
 	mgr.portHigh = 20000
 
-	port, err := mgr.reservePort(iid, "http")
+	port, err := mgr.reservePort(iid, "", "http")
 	if err != nil {
 		t.Fatalf("reservePort failed: %s", err)
 	}

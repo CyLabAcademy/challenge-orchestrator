@@ -223,7 +223,7 @@ func profileInstanceLaunch(t *testing.T, instanceCount int) {
 			portCount += len(image.Ports)
 		}
 		for i := 0; i < portCount; i++ {
-			_, err := mgr.reservePort(iMeta.Id, fmt.Sprintf("test-port-%d", i))
+			_, err := mgr.reservePort(iMeta.Id, "", fmt.Sprintf("test-port-%d", i))
 			if err != nil {
 				t.Fatalf("reservePort failed: %s", err)
 			}
@@ -457,7 +457,7 @@ func profileBenchmarkInstanceLaunchPath(b *testing.B, mgr *Manager, build *Build
 		b.Fatalf("getReversePortMap failed: %s", err)
 	}
 
-	_, err = mgr.reservePort(iMeta.Id, "test-port")
+	_, err = mgr.reservePort(iMeta.Id, "", "test-port")
 	if err != nil {
 		b.Fatalf("reservePort failed: %s", err)
 	}

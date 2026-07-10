@@ -79,6 +79,7 @@ func (m *Manager) initDocker() error {
 		}
 	}
 	m.log.infof("setting launch concurrency limit to %d", concurrencyLimit)
+	m.launchConcurrency = concurrencyLimit
 	m.launchSemaphore = make(chan struct{}, concurrencyLimit)
 
 	chalInterface, isSet := os.LookupEnv(IFACE_ENV)
@@ -238,6 +239,81 @@ func challengeToFreezeName(challenge ChallengeId) string {
 	return strings.ReplaceAll(string(challenge), "/", "_")
 }
 
+// instanceImageName returns the docker tag for a build's per-host image. When
+// CMGR_REGISTRY is set the name is registry-qualified so that images can be
+// pushed after building and pulled before launching; cmgr and cmgrd must be
+// configured with the same registry value for the derived names to agree.
+func (m *Manager) instanceImageName(challenge ChallengeId, bMeta *BuildMetadata, image Image) string {
+	name := fmt.Sprintf("%s:%s", challenge, bMeta.dockerId(image))
+	if m.challengeRegistry != "" {
+		name = fmt.Sprintf("%s/%s", m.challengeRegistry, name)
+	}
+	return name
+}
+
+// extractDockerError finds an error message embedded in a docker
+// build/push/pull response stream; these are not propagated as API errors.
+func extractDockerError(messages []byte) []byte {
+	re := regexp.MustCompile(`{"errorDetail":[^\n]+`)
+	errMsg := re.Find(messages)
+	if errMsg == nil {
+		return nil
+	}
+	var dMsg dockerError
+	if json.Unmarshal(errMsg, &dMsg) == nil {
+		return []byte(dMsg.Error)
+	}
+	return errMsg
+}
+
+func (m *Manager) pushImage(imageName string) error {
+	pushOpts := client.ImagePushOptions{RegistryAuth: m.authString}
+	pushResp, err := m.cli.ImagePush(m.ctx, imageName, pushOpts)
+	if err != nil {
+		m.log.errorf("failed to push image '%s': %s", imageName, err)
+		return err
+	}
+	messages, err := ioutil.ReadAll(pushResp)
+	pushResp.Close()
+	if err != nil {
+		m.log.errorf("failed to read push response from docker: %s", err)
+		return err
+	}
+	if errMsg := extractDockerError(messages); errMsg != nil {
+		err = fmt.Errorf("failed to push image '%s': %s", imageName, errMsg)
+		m.log.error(err)
+		return err
+	}
+	return nil
+}
+
+// pullImage pulls on the given daemon (workers pull with their own registry
+// certs via certs.d, so no credentials travel with the request). A pull that
+// exceeds workerPullTimeout fails the launch but never marks the worker down:
+// slow pulls are legitimate.
+func (m *Manager) pullImage(cli *client.Client, imageName string) error {
+	ctx, cancel := m.pullCtx()
+	defer cancel()
+	pullOpts := client.ImagePullOptions{RegistryAuth: m.authString}
+	pullResp, err := cli.ImagePull(ctx, imageName, pullOpts)
+	if err != nil {
+		m.log.errorf("failed to pull image '%s': %s", imageName, err)
+		return err
+	}
+	messages, err := ioutil.ReadAll(pullResp)
+	pullResp.Close()
+	if err != nil {
+		m.log.errorf("failed to read pull response from docker: %s", err)
+		return err
+	}
+	if errMsg := extractDockerError(messages); errMsg != nil {
+		err = fmt.Errorf("failed to pull image '%s': %s", imageName, errMsg)
+		m.log.error(err)
+		return err
+	}
+	return nil
+}
+
 func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 	cMeta, err := m.lookupChallengeMetadata(challenge)
 	if err != nil {
@@ -303,35 +379,7 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 	}
 
 	// Push the image
-	pushOpts := client.ImagePushOptions{RegistryAuth: m.authString}
-	pushResp, err := m.cli.ImagePush(m.ctx, imageName, pushOpts)
-	if err != nil {
-		m.log.errorf("failed to push base image: %s", err)
-		return err
-	}
-
-	// Read the response because errors aren't propagated.
-	messages, err = ioutil.ReadAll(pushResp)
-	pushResp.Close()
-	if err != nil {
-		m.log.errorf("failed to read push response from docker: %s", err)
-		return err
-	}
-
-	// Search the response for an error message
-	errMsg = re.Find(messages)
-	if errMsg != nil {
-		var dMsg dockerError
-		err = json.Unmarshal(errMsg, &dMsg)
-		if err == nil {
-			errMsg = []byte(dMsg.Error)
-		}
-		err = fmt.Errorf("failed to push image: %s", errMsg)
-		m.log.error(err)
-		return err
-	}
-
-	return nil
+	return m.pushImage(imageName)
 }
 
 func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, buildCtxFile string) error {
@@ -361,7 +409,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	var buildImage string
 	for _, host := range cMeta.Hosts {
 		image := Image{Host: host.Name, Ports: []string{}}
-		imageName := fmt.Sprintf("%s:%s", cMeta.Id, bMeta.dockerId(image))
+		imageName := m.instanceImageName(cMeta.Id, bMeta, image)
 
 		if host.Name == "builder" || (host.Name == "challenge" && buildImage == "") {
 			buildImage = imageName
@@ -419,6 +467,15 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 			err = fmt.Errorf("failed to build image: %s", errMsg)
 			m.log.error(err)
 			return err
+		}
+
+		// Registry mode: workers pull instance images from the registry, so
+		// every image a worker may run must be pushed at build time. The
+		// "builder" image is only used locally for artifact extraction.
+		if m.challengeRegistry != "" && image.Host != "builder" {
+			if err := m.pushImage(imageName); err != nil {
+				return err
+			}
 		}
 		images = append(images, image)
 	}
@@ -584,7 +641,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 		iro := client.ImageRemoveOptions{Force: false, PruneChildren: true}
 		for _, image := range bMeta.Images {
-			imageName := fmt.Sprintf("%s:%s", bMeta.Challenge, bMeta.dockerId(image))
+			imageName := m.instanceImageName(bMeta.Challenge, bMeta, image)
 			_, _ = m.cli.ImageRemove(m.ctx, imageName, iro)
 		}
 	}
@@ -595,26 +652,40 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 }
 
 func (m *Manager) startNetwork(instance *InstanceMetadata, opts NetworkOptions) error {
+	cli, err := m.instanceClient(instance)
+	if err != nil {
+		return err
+	}
 	netSpec := client.NetworkCreateOptions{
 		Driver: "bridge",
 	}
 	netname := instance.getNetworkName()
-	_, err := m.cli.NetworkCreate(m.ctx, netname, netSpec)
+	ctx, cancel := m.controlCtx()
+	defer cancel()
+	_, err = cli.NetworkCreate(ctx, netname, netSpec)
 	if err != nil {
 		m.log.errorf("could not create challenge network (%s): %s", netname, err)
+		m.noteWorkerTransportError(instance.Worker, err)
 	}
 	return err
 }
 
 func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
+	cli, err := m.instanceClient(instance)
+	if err != nil {
+		return err
+	}
 	networkName := instance.getNetworkName()
-	_, err := m.cli.NetworkRemove(m.ctx, networkName, client.NetworkRemoveOptions{})
+	ctx, cancel := m.controlCtx()
+	defer cancel()
+	_, err = cli.NetworkRemove(ctx, networkName, client.NetworkRemoveOptions{})
 	if err != nil {
 		if errdefs.IsNotFound(err) {
 			m.log.warnf("skipped removing network (not found): %s", networkName)
 			err = nil
 		} else {
 			m.log.errorf("failed to remove network: %s", err)
+			m.noteWorkerTransportError(instance.Worker, err)
 		}
 	}
 	return err
@@ -642,8 +713,33 @@ func portsAlreadyKnown(portLow int, imagePorts []string, ports map[string]int, r
 }
 
 func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetadata, opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string) error {
-	m.launchSemaphore <- struct{}{}
-	defer func() { <-m.launchSemaphore }()
+	// Everything below runs against the daemon hosting this instance: the
+	// local one, or the recorded worker's.
+	cli, err := m.instanceClient(instance)
+	if err != nil {
+		return err
+	}
+
+	// Registry mode: make sure this daemon has the current images before
+	// launching. Kept outside the launch semaphore: a cached image costs one
+	// manifest round-trip, and a cold pull must not stall the serialized
+	// launch section.
+	if m.challengeRegistry != "" {
+		for _, image := range build.Images {
+			if image.Host == "builder" {
+				continue
+			}
+			if err := m.pullImage(cli, m.instanceImageName(build.Challenge, build, image)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Each worker has its own launch semaphore so one busy daemon does not
+	// serialize launches on the others.
+	sem := m.launchSem(instance)
+	sem <- struct{}{}
+	defer func() { <-sem }()
 
 	// Call create in docker
 	netname := instance.getNetworkName()
@@ -689,7 +785,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 		}
 
 		cConfig := container.Config{
-			Image:        fmt.Sprintf("%s:%s", build.Challenge, build.dockerId(image)),
+			Image:        m.instanceImageName(build.Challenge, build, image),
 			Hostname:     image.Host,
 			ExposedPorts: exposedPorts,
 			Labels:       cLabels,
@@ -788,13 +884,16 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			},
 		}
 
-		respCC, err := m.cli.ContainerCreate(m.ctx, client.ContainerCreateOptions{
+		ccCtx, ccCancel := m.controlCtx()
+		respCC, err := cli.ContainerCreate(ccCtx, client.ContainerCreateOptions{
 			Config:           &cConfig,
 			HostConfig:       &hConfig,
 			NetworkingConfig: &nConfig,
 		})
+		ccCancel()
 		if err != nil {
 			m.log.errorf("failed to create instance container: %s", err)
+			m.noteWorkerTransportError(instance.Worker, err)
 			return err
 		}
 
@@ -802,9 +901,12 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 		instance.Containers = append(instance.Containers, cid)
 		m.log.infof("created new container: %s", cid)
 
-		_, err = m.cli.ContainerStart(m.ctx, cid, client.ContainerStartOptions{})
+		csCtx, csCancel := m.controlCtx()
+		_, err = cli.ContainerStart(csCtx, cid, client.ContainerStartOptions{})
+		csCancel()
 		if err != nil {
 			m.log.errorf("failed to start container: %s", err)
+			m.noteWorkerTransportError(instance.Worker, err)
 			return err
 		}
 
@@ -822,9 +924,12 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			for !done && backoff < time.Second {
 				m.log.debug("Querying docker for port info...")
 
-				cInfo, err := m.cli.ContainerInspect(m.ctx, cid, client.ContainerInspectOptions{})
+				ciCtx, ciCancel := m.controlCtx()
+				cInfo, err := cli.ContainerInspect(ciCtx, cid, client.ContainerInspectOptions{})
+				ciCancel()
 				if err != nil {
 					m.log.errorf("failed to get container info: %s", err)
+					m.noteWorkerTransportError(instance.Worker, err)
 					return err
 				}
 				if cInfo.Container.NetworkSettings == nil {
@@ -865,16 +970,22 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 }
 
 func (m *Manager) stopContainers(instance *InstanceMetadata) error {
-	var err error
+	cli, err := m.instanceClient(instance)
+	if err != nil {
+		return err
+	}
 	for _, cid := range instance.Containers {
 		crOpts := client.ContainerRemoveOptions{RemoveVolumes: true, Force: true}
-		_, err = m.cli.ContainerRemove(m.ctx, cid, crOpts)
+		crCtx, crCancel := m.controlCtx()
+		_, err = cli.ContainerRemove(crCtx, cid, crOpts)
+		crCancel()
 		if err != nil {
 			if errdefs.IsNotFound(err) {
 				m.log.warnf("skipped removing container (not found): %s", cid)
 				err = nil
 			} else {
 				m.log.errorf("failed to remove container: %s", err)
+				m.noteWorkerTransportError(instance.Worker, err)
 			}
 		}
 	}
@@ -916,7 +1027,7 @@ func (m *Manager) destroyImages(build BuildId) error {
 	iro := client.ImageRemoveOptions{Force: true, PruneChildren: true}
 	for _, image := range bMeta.Images {
 
-		imageName := fmt.Sprintf("%s:%s", bMeta.Challenge, bMeta.dockerId(image))
+		imageName := m.instanceImageName(bMeta.Challenge, bMeta, image)
 		_, err := m.cli.ImageRemove(m.ctx, imageName, iro)
 		if err != nil {
 			if errdefs.IsNotFound(err) {

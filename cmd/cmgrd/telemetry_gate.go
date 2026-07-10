@@ -38,7 +38,7 @@ const (
 
 	pollInterval = 500 * time.Millisecond
 	pollTimeout  = 250 * time.Millisecond // must stay under pollInterval so a hung agent counts as a miss
-	maxMisses    = 2                       // consecutive failed polls before declaring the host down
+	maxMisses    = 2                      // consecutive failed polls before declaring the host down
 )
 
 // telemetryGate polls the host-local telemetry agent and exposes a single

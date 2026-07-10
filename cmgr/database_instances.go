@@ -4,14 +4,17 @@ import (
 	"fmt"
 )
 
-func (m *Manager) reservePort(instance InstanceId, name string) (int, error) {
+// reservePort claims a free host port for the instance on the daemon that
+// will run it. Pools are per worker (” = local daemon): the same port number
+// can be in use on every worker simultaneously.
+func (m *Manager) reservePort(instance InstanceId, worker string, name string) (int, error) {
 	if m.portLow == 0 {
 		return 0, fmt.Errorf("port reservation disabled")
 	}
 
 	numPorts := m.portHigh - m.portLow + 1
 
-	bitset, err := m.usedPortBitset()
+	bitset, err := m.usedPortBitset(worker)
 	if err != nil {
 		return 0, err
 	}
@@ -39,10 +42,10 @@ func (m *Manager) reservePort(instance InstanceId, name string) (int, error) {
 		}
 
 		// Atomic claim: INSERT ... SELECT ... WHERE NOT EXISTS
-		query := `INSERT INTO portAssignments(instance, name, port)
-                  SELECT ?, ?, ?
-                  WHERE NOT EXISTS (SELECT 1 FROM portAssignments WHERE port = ?);`
-		res, err := m.db.Exec(query, instance, name, candidate, candidate)
+		query := `INSERT INTO portAssignments(instance, name, port, worker)
+                  SELECT ?, ?, ?, ?
+                  WHERE NOT EXISTS (SELECT 1 FROM portAssignments WHERE port = ? AND worker = ?);`
+		res, err := m.db.Exec(query, instance, name, candidate, worker, candidate, worker)
 		if err != nil {
 			return 0, err
 		}
@@ -64,7 +67,7 @@ func (m *Manager) reservePort(instance InstanceId, name string) (int, error) {
 }
 
 func (m *Manager) openInstance(meta *InstanceMetadata) error {
-	res, err := m.db.NamedExec("INSERT INTO instances(build, lastsolved) VALUES (:build, :lastsolved);", meta)
+	res, err := m.db.NamedExec("INSERT INTO instances(build, lastsolved, worker) VALUES (:build, :lastsolved, :worker);", meta)
 
 	if err != nil {
 		m.log.errorf("failed to create instance entry: %s", err)
@@ -86,10 +89,11 @@ func (m *Manager) finalizeInstance(meta *InstanceMetadata) error {
 	var err error
 	if m.portLow == 0 {
 		for name, port := range meta.Ports {
-			_, err = txn.Exec("INSERT INTO portAssignments(instance, name, port) VALUES (?, ?, ?);",
+			_, err = txn.Exec("INSERT INTO portAssignments(instance, name, port, worker) VALUES (?, ?, ?, ?);",
 				meta.Id,
 				name,
-				port)
+				port,
+				meta.Worker)
 
 			if err != nil {
 				m.log.errorf("failed to record port assignment: %s", err)
