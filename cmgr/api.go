@@ -369,11 +369,6 @@ func (m *Manager) Destroy(build BuildId) error {
 	return m.destroyImages(build)
 }
 
-// Runs the automated solver against the designated instance.
-func (m *Manager) CheckInstance(instance InstanceId) error {
-	return m.runSolver(instance)
-}
-
 // Obtains a list of challenges with minimal version information filled into
 // the metadata object.
 func (m *Manager) ListChallenges() []*ChallengeMetadata {

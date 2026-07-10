@@ -19,8 +19,7 @@ import (
 )
 
 type state struct {
-	mgr  *cmgr.Manager
-	gate *telemetryGate
+	mgr *cmgr.Manager
 }
 
 var artifact_dir string
@@ -55,15 +54,13 @@ func main() {
 		log.Fatal("failed to initialize cmgr library")
 	}
 
-	// cmgrd is the runtime orchestrator: new instances are placed on the
-	// configured workers (round robin, skipping overloaded/down ones). The
-	// cmgr CLI never enables placement, so CLI instances stay local.
+	// cmgrd is the sole owner of the database and the docker/registry state:
+	// every action (deploys, builds, instance lifecycle, worker management)
+	// goes through its HTTP API. New instances are placed on the configured
+	// workers (round robin, skipping overloaded/down ones).
 	mgr.EnableWorkerPlacement()
 
-	gate := newTelemetryGate()
-	go gate.run()
-
-	s := state{mgr: mgr, gate: gate}
+	s := state{mgr: mgr}
 
 	http.HandleFunc("/challenges", s.listHandler)
 	http.HandleFunc("/challenges/", s.challengeHandler)
@@ -71,10 +68,11 @@ func main() {
 	http.HandleFunc("/instances/", s.instanceHandler)
 	http.HandleFunc("/workers", s.workersHandler)
 	http.HandleFunc("/workers/", s.workerHandler)
-	// Schema-based starts are unused in this deployment, so the endpoints are
-	// disabled here; the cmgr CLI keeps its schema commands (local only).
-	// http.HandleFunc("/schemas", s.schemaHandler)
-	// http.HandleFunc("/schemas/", s.existingSchemaHandler)
+	http.HandleFunc("/schemas", s.schemaHandler)
+	http.HandleFunc("/schemas/", s.existingSchemaHandler)
+	http.HandleFunc("/update", s.updateHandler)
+	http.HandleFunc("/state", s.stateHandler)
+	http.HandleFunc("/version", s.versionHandler)
 
 	connStr := fmt.Sprintf("%s:%d", iface, port)
 	log.Fatal(http.ListenAndServe(connStr, nil))
@@ -121,18 +119,21 @@ Relevant environment variables:
   CMGR_CONCURRENT_LAUNCHES - the maximum number of concurrent container
       launches allowed (defaults to 2); allowed values are 1 or 2.
 
-  CMGR_TELEMETRY_URL - full URL of the telemetry agent's health endpoint used
-      to gate instance starts; if unset, defaults to the Docker host on port
-      2136 (e.g. 'http://<docker-host>:2136/health', or 127.0.0.1 for a local
-      socket); overloaded hosts reject starts with 503, unreachable with 500.
-
   CMGR_REGISTRY - the docker registry holding built challenge images; when
       set, images are pulled from it before each instance start (must match
       the value used by cmgr when building).
 
+HTTP API:
+  cmgrd owns all state; every action goes through its API (the cmgrd-cli
+  binary is a thin wrapper around it). In addition to the challenge, build,
+  instance, worker, and schema endpoints, POST /update re-scans the
+  challenge directory (body: {"path": "<dir>", "dry_run": false}),
+  GET /state dumps the full challenge/build/instance state, and
+  GET /version reports the server version.
+
 Workers:
-  When docker workers are configured (POST/DELETE/GET on /workers, or the
-  cmgr worker-* commands), new instances are placed on them round robin,
+  When docker workers are configured (POST/DELETE/GET on /workers or
+  cmgrd-cli worker-*), new instances are placed on them round robin,
   skipping overloaded and down workers; with none configured, cmgrd behaves
   as a single-host daemon using DOCKER_HOST. Worker connections use the TLS
   material from DOCKER_CERT_PATH with the server name pinned to
@@ -141,7 +142,7 @@ Workers:
 
   A worker goes down (sticky) after 30s of telemetry silence or a single
   hung/refused docker control call; recovery is re-adding it (POST /workers
-  or cmgr worker-add). Stops for instances on a down worker clear the
+  or cmgrd-cli worker-add). Stops for instances on a down worker clear the
   records and return success without touching docker. DELETE on /workers
   purges the worker and all of its instance records.
 
@@ -308,19 +309,6 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 			body, err = json.Marshal(meta)
 		}
 	case "POST":
-		// Legacy single-host mode only: with workers configured, admission is
-		// decided per worker inside the library (selection skips overloaded
-		// and down workers and errors when none admit).
-		if !s.mgr.WorkersConfigured() {
-			if code, msg, deny := s.gate.reject(); deny {
-				if code == http.StatusServiceUnavailable {
-					w.Header().Set("Retry-After", "1")
-				}
-				w.WriteHeader(code)
-				w.Write([]byte(msg))
-				return
-			}
-		}
 		var instance cmgr.InstanceId
 		envVars := make(map[string]string)
 		if r.Body != nil {
@@ -470,9 +458,6 @@ func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			body, err = json.Marshal(meta)
 		}
-	case "POST":
-		err = s.mgr.CheckInstance(instance)
-		respCode = http.StatusNoContent
 	case "DELETE":
 		err = s.mgr.Stop(instance)
 		// Idempotent delete: the instance may already be gone (pruned by the
@@ -556,6 +541,111 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(respCode)
+	w.Write(body)
+}
+
+type UpdateRequest struct {
+	Path   string `json:"path"`
+	DryRun bool   `json:"dry_run"`
+}
+
+// ChallengeUpdates with ids instead of full metadata and marshalable errors.
+type UpdateResponse struct {
+	Added      []cmgr.ChallengeId `json:"added"`
+	Refreshed  []cmgr.ChallengeId `json:"refreshed"`
+	Updated    []cmgr.ChallengeId `json:"updated"`
+	Removed    []cmgr.ChallengeId `json:"removed"`
+	Unmodified []cmgr.ChallengeId `json:"unmodified"`
+	Errors     []string           `json:"errors"`
+}
+
+func challengeIds(metas []*cmgr.ChallengeMetadata) []cmgr.ChallengeId {
+	ids := make([]cmgr.ChallengeId, len(metas))
+	for i, meta := range metas {
+		ids[i] = meta.Id
+	}
+	return ids
+}
+
+func (s state) updateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req UpdateRequest
+	if r.Body != nil {
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil && err != io.EOF {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("invalid request body: " + err.Error()))
+			return
+		}
+	}
+
+	path := req.Path
+	if path == "" {
+		path = os.Getenv(cmgr.DIR_ENV)
+		if path == "" {
+			path = "."
+		}
+	}
+
+	// Synchronous: changed challenges are rebuilt (images + registry pushes)
+	// before this returns, so large deploys need a generous client timeout.
+	var updates *cmgr.ChallengeUpdates
+	if req.DryRun {
+		updates = s.mgr.DetectChanges(path)
+	} else {
+		updates = s.mgr.Update(path)
+	}
+
+	resp := UpdateResponse{
+		Added:      challengeIds(updates.Added),
+		Refreshed:  challengeIds(updates.Refreshed),
+		Updated:    challengeIds(updates.Updated),
+		Removed:    challengeIds(updates.Removed),
+		Unmodified: challengeIds(updates.Unmodified),
+		Errors:     make([]string, len(updates.Errors)),
+	}
+	for i, updateErr := range updates.Errors {
+		resp.Errors[i] = updateErr.Error()
+	}
+
+	body, err := json.Marshal(resp)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+	w.Write(body)
+}
+
+func (s state) stateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	meta, err := s.mgr.DumpState(nil)
+	var body []byte
+	if err == nil {
+		body, err = json.Marshal(meta)
+	}
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(err.Error()))
+		return
+	}
+	w.Write(body)
+}
+
+func (s state) versionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := json.Marshal(map[string]string{"version": cmgr.Version()})
 	w.Write(body)
 }
 
