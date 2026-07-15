@@ -33,7 +33,13 @@ import (
 var seccompPolicy string
 
 func (m *Manager) initDocker() error {
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+	// Deliberately not client.FromEnv: DOCKER_CERT_PATH holds the worker mTLS
+	// material (see workers.go) and must not switch this local unix-socket
+	// client into HTTPS mode.
+	cli, err := client.NewClientWithOpts(
+		client.WithHostFromEnv(),
+		client.WithVersionFromEnv(),
+	)
 	if err != nil {
 		m.log.errorf("could not create docker client: %s", err)
 		return err
