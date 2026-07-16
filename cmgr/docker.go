@@ -273,14 +273,20 @@ func extractDockerError(messages []byte) []byte {
 }
 
 // extractPushDigest finds the manifest digest in a docker push response
-// stream (reported in the final "aux" message).
+// stream. The graphdriver path reports it in a final "aux" message; the
+// containerd image store path emits no aux, only the status line
+// "<tag>: digest: sha256:... size: <n>", so fall back to that.
 func extractPushDigest(messages []byte) string {
-	re := regexp.MustCompile(`"aux":\{[^}]*"Digest":"(sha256:[0-9a-f]+)"`)
-	matches := re.FindAllSubmatch(messages, -1)
-	if matches == nil {
-		return ""
+	for _, re := range []*regexp.Regexp{
+		regexp.MustCompile(`"aux":\{[^}]*"Digest":"(sha256:[0-9a-f]+)"`),
+		regexp.MustCompile(`digest: (sha256:[0-9a-f]+) size:`),
+	} {
+		matches := re.FindAllSubmatch(messages, -1)
+		if matches != nil {
+			return string(matches[len(matches)-1][1])
+		}
 	}
-	return string(matches[len(matches)-1][1])
+	return ""
 }
 
 // pushImage pushes the image and returns the manifest digest the registry

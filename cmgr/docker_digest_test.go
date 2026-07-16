@@ -71,7 +71,14 @@ func TestExtractPushDigest(t *testing.T) {
 			want: digest,
 		},
 		{
-			name:     "no aux message",
+			name: "containerd image store stream (status line, no aux)",
+			messages: `{"status":"Pushed","progressDetail":{},"id":"5f70bf18a086"}
+{"status":"8-challenge: digest: ` + digest + ` size: 1786"}
+`,
+			want: digest,
+		},
+		{
+			name:     "no aux message or digest status line",
 			messages: `{"status":"Pushed","progressDetail":{},"id":"5f70bf18a086"}`,
 			want:     "",
 		},
