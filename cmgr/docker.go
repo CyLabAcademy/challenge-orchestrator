@@ -272,25 +272,44 @@ func extractDockerError(messages []byte) []byte {
 	return errMsg
 }
 
-func (m *Manager) pushImage(imageName string) error {
+// extractPushDigest finds the manifest digest in a docker push response
+// stream (reported in the final "aux" message).
+func extractPushDigest(messages []byte) string {
+	re := regexp.MustCompile(`"aux":\{[^}]*"Digest":"(sha256:[0-9a-f]+)"`)
+	matches := re.FindAllSubmatch(messages, -1)
+	if matches == nil {
+		return ""
+	}
+	return string(matches[len(matches)-1][1])
+}
+
+// pushImage pushes the image and returns the manifest digest the registry
+// assigned to it. An empty digest with a nil error means the push succeeded
+// but the digest could not be extracted; callers treat that as "unknown" (the
+// start path then pulls unconditionally).
+func (m *Manager) pushImage(imageName string) (string, error) {
 	pushOpts := client.ImagePushOptions{RegistryAuth: m.authString}
 	pushResp, err := m.cli.ImagePush(m.ctx, imageName, pushOpts)
 	if err != nil {
 		m.log.errorf("failed to push image '%s': %s", imageName, err)
-		return err
+		return "", err
 	}
 	messages, err := ioutil.ReadAll(pushResp)
 	pushResp.Close()
 	if err != nil {
 		m.log.errorf("failed to read push response from docker: %s", err)
-		return err
+		return "", err
 	}
 	if errMsg := extractDockerError(messages); errMsg != nil {
 		err = fmt.Errorf("failed to push image '%s': %s", imageName, errMsg)
 		m.log.error(err)
-		return err
+		return "", err
 	}
-	return nil
+	digest := extractPushDigest(messages)
+	if digest == "" {
+		m.log.warnf("no digest found in push response for '%s'; instance starts will always pull", imageName)
+	}
+	return digest, nil
 }
 
 // pullImage pulls on the given daemon (workers pull with their own registry
@@ -318,6 +337,38 @@ func (m *Manager) pullImage(cli *client.Client, imageName string) error {
 		return err
 	}
 	return nil
+}
+
+// imageDigestMatches reports whether one of an image's RepoDigests entries
+// (formatted "<registry>/<repo>@sha256:...") carries the given manifest digest.
+func imageDigestMatches(repoDigests []string, digest string) bool {
+	if digest == "" {
+		return false
+	}
+	for _, repoDigest := range repoDigests {
+		if strings.HasSuffix(repoDigest, "@"+digest) {
+			return true
+		}
+	}
+	return false
+}
+
+// workerHasImage reports whether the daemon already holds imageName at
+// exactly the given registry manifest digest, in which case a pull would be a
+// no-op and can be skipped. Any uncertainty (no stored digest, image missing,
+// inspect failure) returns false so the caller falls back to pulling.
+func (m *Manager) workerHasImage(cli *client.Client, imageName, digest string) bool {
+	if digest == "" {
+		return false
+	}
+	info, err := cli.ImageInspect(m.ctx, imageName)
+	if err != nil {
+		if !errdefs.IsNotFound(err) {
+			m.log.warnf("failed to inspect image '%s': %s", imageName, err)
+		}
+		return false
+	}
+	return imageDigestMatches(info.RepoDigests, digest)
 }
 
 func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
@@ -384,8 +435,10 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 		return err
 	}
 
-	// Push the image
-	return m.pushImage(imageName)
+	// Push the image (base images are only pulled by the build daemon, so
+	// the digest is not tracked)
+	_, err = m.pushImage(imageName)
+	return err
 }
 
 func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, buildCtxFile string) error {
@@ -477,11 +530,15 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 		// Registry mode: workers pull instance images from the registry, so
 		// every image a worker may run must be pushed at build time. The
-		// "builder" image is only used locally for artifact extraction.
+		// "builder" image is only used locally for artifact extraction. The
+		// returned digest lets the start path skip pulls on workers that
+		// already hold this exact content.
 		if m.challengeRegistry != "" && image.Host != "builder" {
-			if err := m.pushImage(imageName); err != nil {
+			digest, err := m.pushImage(imageName)
+			if err != nil {
 				return err
 			}
+			image.Digest = digest
 		}
 		images = append(images, image)
 	}
@@ -727,15 +784,22 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 	}
 
 	// Registry mode: make sure this daemon has the current images before
-	// launching. Kept outside the launch semaphore: a cached image costs one
-	// manifest round-trip, and a cold pull must not stall the serialized
-	// launch section.
+	// launching. When the daemon already holds an image at the digest
+	// recorded at push time, the pull is skipped entirely: a local inspect
+	// is cheap and doesn't serialize inside dockerd, while concurrent pulls
+	// of the same image convoy on shared metadata even when fully cached.
+	// Kept outside the launch semaphore: a cold pull must not stall the
+	// serialized launch section.
 	if m.challengeRegistry != "" {
 		for _, image := range build.Images {
 			if image.Host == "builder" {
 				continue
 			}
-			if err := m.pullImage(cli, m.instanceImageName(build.Challenge, build, image)); err != nil {
+			imageName := m.instanceImageName(build.Challenge, build, image)
+			if m.workerHasImage(cli, imageName, image.Digest) {
+				continue
+			}
+			if err := m.pullImage(cli, imageName); err != nil {
 				return err
 			}
 		}
@@ -897,6 +961,20 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			NetworkingConfig: &nConfig,
 		})
 		ccCancel()
+		if errdefs.IsNotFound(err) && m.challengeRegistry != "" {
+			// The image vanished between the pre-launch digest check and the
+			// create (e.g. an image reaper on the worker). Pull and retry once.
+			m.log.warnf("image '%s' disappeared before create; pulling and retrying", cConfig.Image)
+			if err = m.pullImage(cli, cConfig.Image); err == nil {
+				ccCtx, ccCancel = m.controlCtx()
+				respCC, err = cli.ContainerCreate(ccCtx, client.ContainerCreateOptions{
+					Config:           &cConfig,
+					HostConfig:       &hConfig,
+					NetworkingConfig: &nConfig,
+				})
+				ccCancel()
+			}
+		}
 		if err != nil {
 			m.log.errorf("failed to create instance container: %s", err)
 			m.noteWorkerTransportError(instance.Worker, err)

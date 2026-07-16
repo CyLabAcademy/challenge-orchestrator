@@ -248,7 +248,7 @@ func TestDatabaseBuildLifecycle(t *testing.T) {
 	build.HasArtifacts = false
 	build.LookupData = map[string]string{"key1": "val1"}
 	build.Images = []Image{
-		{Host: "challenge", Ports: []string{"8080/tcp"}},
+		{Host: "challenge", Ports: []string{"8080/tcp"}, Digest: "sha256:6aea1af2ab09dfa5f20b7c93d2325ee29a8104e2b8ab853d5b60dbc23ee1a2af"},
 	}
 
 	err = mgr.finalizeBuild(build)
@@ -279,6 +279,9 @@ func TestDatabaseBuildLifecycle(t *testing.T) {
 	}
 	if got.Images[0].Host != "challenge" {
 		t.Errorf("expected image host 'challenge', got %q", got.Images[0].Host)
+	}
+	if got.Images[0].Digest != build.Images[0].Digest {
+		t.Errorf("expected image digest %q, got %q", build.Images[0].Digest, got.Images[0].Digest)
 	}
 
 	// Look up a non-existent build
@@ -1528,6 +1531,69 @@ func setupTestManager(t *testing.T) *Manager {
 	}
 
 	return mgr
+}
+
+// TestImagesDigestMigration verifies that a database whose images table
+// predates the digest column is migrated in place: the column is added,
+// existing rows read back with an empty digest (= "unknown, always pull"),
+// and re-running the migration is a no-op.
+func TestImagesDigestMigration(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "cmgr-digest-migrate-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %s", err)
+	}
+	dbFile.Close()
+	t.Cleanup(func() { removeDBFiles(dbFile.Name()) })
+
+	// Seed with FK enforcement off: only the old-shape images table is
+	// created here (initDatabase creates the rest canonically), so the seeded
+	// row's builds reference dangles until then.
+	dsn := dbFile.Name() + "?_fk=false&_journal_mode=WAL&_busy_timeout=50&_synchronous=NORMAL"
+	legacy, err := sqlx.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("failed to open db: %s", err)
+	}
+	schema := `
+	CREATE TABLE images (
+		id INTEGER PRIMARY KEY,
+		build INTEGER NOT NULL,
+		host TEXT NOT NULL,
+		FOREIGN KEY (build) REFERENCES builds (id)
+			ON UPDATE RESTRICT ON DELETE CASCADE
+	);
+	INSERT INTO images(build, host) VALUES (1, 'challenge');`
+	if _, err := legacy.Exec(schema); err != nil {
+		t.Fatalf("failed to create legacy schema: %s", err)
+	}
+	legacy.Close()
+
+	os.Setenv(DB_ENV, dbFile.Name())
+	defer os.Unsetenv(DB_ENV)
+
+	for _, pass := range []string{"migration", "idempotence"} {
+		mgr := new(Manager)
+		mgr.log = newLogger(DISABLED)
+		if err := mgr.initDatabase(); err != nil {
+			t.Fatalf("initDatabase failed (%s pass): %s", pass, err)
+		}
+
+		var n int
+		if err := mgr.db.Get(&n, "SELECT COUNT(*) FROM pragma_table_info('images') WHERE name = 'digest';"); err != nil {
+			t.Fatalf("schema check failed (%s pass): %s", pass, err)
+		}
+		if n != 1 {
+			t.Errorf("expected exactly one digest column after %s pass, got %d", pass, n)
+		}
+
+		var digest string
+		if err := mgr.db.Get(&digest, "SELECT digest FROM images WHERE build = 1;"); err != nil {
+			t.Fatalf("failed to read legacy row (%s pass): %s", pass, err)
+		}
+		if digest != "" {
+			t.Errorf("expected empty digest for pre-migration row, got %q", digest)
+		}
+		mgr.db.Close()
+	}
 }
 
 // openLegacyInstancesDB creates a temp database whose `instances` table omits

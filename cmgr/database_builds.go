@@ -140,9 +140,10 @@ func (m *Manager) finalizeBuild(build *BuildMetadata) error {
 		return err
 	}
 	for _, image := range build.Images {
-		res, err := txn.Exec("INSERT INTO images(build, host) VALUES (?, ?);",
+		res, err := txn.Exec("INSERT INTO images(build, host, digest) VALUES (?, ?, ?);",
 			build.Id,
-			image.Host)
+			image.Host,
+			image.Digest)
 		if err != nil {
 			m.log.errorf("failed to finalize images for build (%d/%s): %s", build.Id, image.Host, err)
 			cerr := txn.Rollback()
@@ -249,7 +250,7 @@ func (m *Manager) lookupBuildMetadata(build BuildId) (*BuildMetadata, error) {
 
 	metadata.Images = []Image{}
 	if err == nil {
-		err = txn.Select(&metadata.Images, "SELECT id, host FROM images WHERE build=?", build)
+		err = txn.Select(&metadata.Images, "SELECT id, host, digest FROM images WHERE build=?", build)
 		if err == nil {
 			for i, image := range metadata.Images {
 				err = txn.Select(&metadata.Images[i].Ports, "SELECT port FROM imagePorts WHERE image=?", image.Id)

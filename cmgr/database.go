@@ -107,6 +107,7 @@ const schemaQuery string = `
 		id INTEGER PRIMARY KEY,
 		build INTEGER NOT NULL,
 		host TEXT NOT NULL,
+		digest TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (build) REFERENCES builds (id)
 		    ON UPDATE RESTRICT ON DELETE CASCADE
 	);
@@ -327,6 +328,23 @@ func (m *Manager) initDatabase() error {
 		_, err = db.Exec("ALTER TABLE workers ADD COLUMN public TEXT NOT NULL DEFAULT '';")
 		if err != nil {
 			m.log.errorf("could not migrate workers.public column: %s", err)
+			return err
+		}
+	}
+
+	// Migrate older DBs: add the images.digest column if it is not present.
+	// Existing rows keep '' (digest unknown), which the start path treats as
+	// "pull unconditionally" until the build is rebuilt.
+	var imageDigestCols int
+	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('images') WHERE name = 'digest';").Scan(&imageDigestCols)
+	if err != nil {
+		m.log.errorf("could not check images table schema: %s", err)
+		return err
+	}
+	if imageDigestCols == 0 {
+		_, err = db.Exec("ALTER TABLE images ADD COLUMN digest TEXT NOT NULL DEFAULT '';")
+		if err != nil {
+			m.log.errorf("could not migrate images.digest column: %s", err)
 			return err
 		}
 	}

@@ -158,6 +158,10 @@ type Image struct {
 	Host  string   `json:"host"`
 	Ports []string `json:"exposed_ports"`
 	Build BuildId  `json:"build"`
+	// Digest is the registry manifest digest recorded when this image was
+	// pushed; empty when the image predates digest tracking or was never
+	// pushed (no registry configured).
+	Digest string `json:"digest,omitempty"`
 }
 
 type InstanceId int64
