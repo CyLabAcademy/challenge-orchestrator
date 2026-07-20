@@ -277,21 +277,6 @@ func (m *Manager) instanceImageName(challenge ChallengeId, bMeta *BuildMetadata,
 	return name
 }
 
-// extractDockerError finds an error message embedded in a docker
-// build/push/pull response stream; these are not propagated as API errors.
-func extractDockerError(messages []byte) []byte {
-	re := regexp.MustCompile(`{"errorDetail":[^\n]+`)
-	errMsg := re.Find(messages)
-	if errMsg == nil {
-		return nil
-	}
-	var dMsg dockerError
-	if json.Unmarshal(errMsg, &dMsg) == nil {
-		return []byte(dMsg.Error)
-	}
-	return errMsg
-}
-
 // extractPushDigest finds the manifest digest in a docker push response
 // stream. The graphdriver path reports it in a final "aux" message; the
 // containerd image store path emits no aux, only the status line
@@ -326,8 +311,8 @@ func (m *Manager) pushImage(imageName string) (string, error) {
 		m.log.errorf("failed to read push response from docker: %s", err)
 		return "", err
 	}
-	if errMsg := extractDockerError(messages); errMsg != nil {
-		err = fmt.Errorf("failed to push image '%s': %s", imageName, errMsg)
+	if streamErr := dockerStreamError(messages); streamErr != nil {
+		err = fmt.Errorf("failed to push image '%s': %s", imageName, streamErr)
 		m.log.error(err)
 		return "", err
 	}
@@ -357,8 +342,8 @@ func (m *Manager) pullImage(cli *client.Client, imageName string) error {
 		m.log.errorf("failed to read pull response from docker: %s", err)
 		return err
 	}
-	if errMsg := extractDockerError(messages); errMsg != nil {
-		err = fmt.Errorf("failed to pull image '%s': %s", imageName, errMsg)
+	if streamErr := dockerStreamError(messages); streamErr != nil {
+		err = fmt.Errorf("failed to pull image '%s': %s", imageName, streamErr)
 		m.log.error(err)
 		return err
 	}
