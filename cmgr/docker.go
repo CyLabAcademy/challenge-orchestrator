@@ -372,9 +372,12 @@ func (m *Manager) migrateBuildChecksums(db *sqlx.DB) error {
 
 		// Retag first: checksum=0 is the resume marker, so it is stamped only
 		// once the images provably carry the new tag (or are shown to need no
-		// retag). A genuine docker error aborts, leaving the row at 0.
+		// retag). A docker or registry error skips just this row — it stays
+		// at 0 and is retried on the next start — rather than aborting the
+		// migration: a registry hiccup here must not stop cmgrd from booting.
 		if err := m.retagLegacyImages(db, row.Id, row.Challenge, row.Seed, checksum); err != nil {
-			return err
+			m.log.errorf("could not migrate images for build %d (will retry next start): %s", row.Id, err)
+			continue
 		}
 
 		if _, err := db.Exec("UPDATE builds SET checksum = ? WHERE id = ?;", checksum, row.Id); err != nil {
@@ -382,15 +385,16 @@ func (m *Manager) migrateBuildChecksums(db *sqlx.DB) error {
 		}
 	}
 
-	// Rows that never joined a challenge (e.g. out-of-band DB edits with foreign
-	// keys off) stay at checksum=0 and would yield an invalid s{seed}-0 tag;
-	// surface them rather than failing silently at launch time.
+	// Rows still at checksum=0 — a retag/push failure above, or a build that
+	// never joined a challenge (e.g. out-of-band DB edits with foreign keys
+	// off) — would yield an invalid s{seed}-0 tag; surface them rather than
+	// failing silently at launch time.
 	var unmigrated int
 	if err := db.Get(&unmigrated, "SELECT COUNT(1) FROM builds WHERE checksum = 0;"); err != nil {
 		return err
 	}
 	if unmigrated > 0 {
-		m.log.warnf("%d build(s) have no content checksum (missing challenge row?); their images cannot be resolved until the challenge is rebuilt", unmigrated)
+		m.log.warnf("%d build(s) have no content checksum; their images cannot be resolved until migration succeeds on a later start or the challenge is rebuilt", unmigrated)
 	}
 
 	return nil
