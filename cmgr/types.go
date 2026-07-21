@@ -12,18 +12,19 @@ import (
 )
 
 const (
-	DB_ENV             string = "CMGR_DB"
-	DIR_ENV            string = "CMGR_DIR"
-	ARTIFACT_DIR_ENV   string = "CMGR_ARTIFACT_DIR"
-	REGISTRY_ENV       string = "CMGR_REGISTRY"
-	REGISTRY_USER_ENV  string = "CMGR_REGISTRY_USER"
-	REGISTRY_TOKEN_ENV string = "CMGR_REGISTRY_TOKEN"
-	LOGGING_ENV        string = "CMGR_LOGGING"
-	IFACE_ENV          string = "CMGR_INTERFACE"
-	PORTS_ENV          string = "CMGR_PORTS"
-	DISK_QUOTA_ENV     string = "CMGR_ENABLE_DISK_QUOTAS"
-	PRUNE_AGE_ENV      string = "CMGR_PRUNE_AGE"
-	DB_WAL_ENV         string = "CMGR_DB_WAL"
+	DB_ENV                string = "CMGR_DB"
+	DIR_ENV               string = "CMGR_DIR"
+	ARTIFACT_DIR_ENV      string = "CMGR_ARTIFACT_DIR"
+	REGISTRY_ENV          string = "CMGR_REGISTRY"
+	REGISTRY_USER_ENV     string = "CMGR_REGISTRY_USER"
+	REGISTRY_TOKEN_ENV    string = "CMGR_REGISTRY_TOKEN"
+	REGISTRY_CERT_DIR_ENV string = "CMGR_REGISTRY_CERT_DIR"
+	LOGGING_ENV           string = "CMGR_LOGGING"
+	IFACE_ENV             string = "CMGR_INTERFACE"
+	PORTS_ENV             string = "CMGR_PORTS"
+	DISK_QUOTA_ENV        string = "CMGR_ENABLE_DISK_QUOTAS"
+	PRUNE_AGE_ENV         string = "CMGR_PRUNE_AGE"
+	DB_WAL_ENV            string = "CMGR_DB_WAL"
 
 	DYNAMIC_INSTANCES int = -1
 	LOCKED            int = -2

@@ -1310,6 +1310,14 @@ func (m *Manager) pruneReplacedImages(replaced []replacedImages) {
 			} else {
 				m.log.infof("pruned replaced image %s", tag)
 			}
+			// Registry mode: also untag the generation in the registry, or it
+			// accumulates one immutable tag per rebuild forever. Best-effort —
+			// a leaked registry tag is recoverable, a failed update is not.
+			if m.challengeRegistry != "" {
+				if err := m.registryDeleteTag(tag); err != nil {
+					m.log.warnf("could not prune replaced registry tag %s: %s", tag, err)
+				}
+			}
 		}
 	}
 }
@@ -1370,6 +1378,12 @@ func (m *Manager) destroyImages(build BuildId) error {
 					m.log.warnf("could not remove image %s (leaving it in place): %s", imageName, err)
 				}
 			}
+			// Best-effort registry untag, mirroring pruneReplacedImages.
+			if m.challengeRegistry != "" && image.Host != "builder" {
+				if err := m.registryDeleteTag(imageName); err != nil {
+					m.log.warnf("could not remove registry tag %s: %s", imageName, err)
+				}
+			}
 		}
 	}
 
@@ -1388,6 +1402,11 @@ func (m *Manager) destroyImages(build BuildId) error {
 				imageName := m.instanceImageName(bMeta.Challenge, &prevMeta, image)
 				if _, err := m.cli.ImageRemove(m.ctx, imageName, iro); err != nil && !errdefs.IsNotFound(err) {
 					m.log.warnf("could not remove rollback-generation image %s: %s", imageName, err)
+				}
+				if m.challengeRegistry != "" && image.Host != "builder" {
+					if err := m.registryDeleteTag(imageName); err != nil {
+						m.log.warnf("could not remove rollback-generation registry tag %s: %s", imageName, err)
+					}
 				}
 			}
 		}
