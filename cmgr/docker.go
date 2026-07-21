@@ -456,50 +456,27 @@ func (m *Manager) instanceImageName(challenge ChallengeId, bMeta *BuildMetadata,
 	return name
 }
 
-// extractPushDigest finds the manifest digest in a docker push response
-// stream. The graphdriver path reports it in a final "aux" message; the
-// containerd image store path emits no aux, only the status line
-// "<tag>: digest: sha256:... size: <n>", so fall back to that.
-func extractPushDigest(messages []byte) string {
-	for _, re := range []*regexp.Regexp{
-		regexp.MustCompile(`"aux":\{[^}]*"Digest":"(sha256:[0-9a-f]+)"`),
-		regexp.MustCompile(`digest: (sha256:[0-9a-f]+) size:`),
-	} {
-		matches := re.FindAllSubmatch(messages, -1)
-		if matches != nil {
-			return string(matches[len(matches)-1][1])
-		}
-	}
-	return ""
-}
-
-// pushImage pushes the image and returns the manifest digest the registry
-// assigned to it. An empty digest with a nil error means the push succeeded
-// but the digest could not be extracted; callers treat that as "unknown" (the
-// start path then pulls unconditionally).
-func (m *Manager) pushImage(imageName string) (string, error) {
+// pushImage pushes the image to the configured registry under its
+// content-addressed tag.
+func (m *Manager) pushImage(imageName string) error {
 	pushOpts := client.ImagePushOptions{RegistryAuth: m.authString}
 	pushResp, err := m.cli.ImagePush(m.ctx, imageName, pushOpts)
 	if err != nil {
 		m.log.errorf("failed to push image '%s': %s", imageName, err)
-		return "", err
+		return err
 	}
 	messages, err := ioutil.ReadAll(pushResp)
 	pushResp.Close()
 	if err != nil {
 		m.log.errorf("failed to read push response from docker: %s", err)
-		return "", err
+		return err
 	}
 	if streamErr := dockerStreamError(messages); streamErr != nil {
 		err = fmt.Errorf("failed to push image '%s': %s", imageName, streamErr)
 		m.log.error(err)
-		return "", err
+		return err
 	}
-	digest := extractPushDigest(messages)
-	if digest == "" {
-		m.log.warnf("no digest found in push response for '%s'; instance starts will always pull", imageName)
-	}
-	return digest, nil
+	return nil
 }
 
 // pullImage pulls on the given daemon (workers pull with their own registry
@@ -529,36 +506,20 @@ func (m *Manager) pullImage(cli *client.Client, imageName string) error {
 	return nil
 }
 
-// imageDigestMatches reports whether one of an image's RepoDigests entries
-// (formatted "<registry>/<repo>@sha256:...") carries the given manifest digest.
-func imageDigestMatches(repoDigests []string, digest string) bool {
-	if digest == "" {
-		return false
-	}
-	for _, repoDigest := range repoDigests {
-		if strings.HasSuffix(repoDigest, "@"+digest) {
-			return true
-		}
-	}
-	return false
-}
-
-// workerHasImage reports whether the daemon already holds imageName at
-// exactly the given registry manifest digest, in which case a pull would be a
-// no-op and can be skipped. Any uncertainty (no stored digest, image missing,
+// workerHasTag reports whether the daemon already holds an image under the
+// given tag, in which case the pull before launch can be skipped. Tags are
+// content-addressed (see dockerId) and cmgrd is their sole writer, so a
+// present tag always names the right content. Any uncertainty (image missing,
 // inspect failure) returns false so the caller falls back to pulling.
-func (m *Manager) workerHasImage(cli *client.Client, imageName, digest string) bool {
-	if digest == "" {
-		return false
-	}
-	info, err := cli.ImageInspect(m.ctx, imageName)
+func (m *Manager) workerHasTag(cli *client.Client, imageName string) bool {
+	_, err := cli.ImageInspect(m.ctx, imageName)
 	if err != nil {
 		if !errdefs.IsNotFound(err) {
 			m.log.warnf("failed to inspect image '%s': %s", imageName, err)
 		}
 		return false
 	}
-	return imageDigestMatches(info.RepoDigests, digest)
+	return true
 }
 
 func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
@@ -622,10 +583,7 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 		return err
 	}
 
-	// Push the image (base images are only pulled by the build daemon, so
-	// the digest is not tracked)
-	_, err = m.pushImage(imageName)
-	return err
+	return m.pushImage(imageName)
 }
 
 func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, buildCtxFile string) error {
@@ -716,15 +674,11 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 		// Registry mode: workers pull instance images from the registry, so
 		// every image a worker may run must be pushed at build time. The
-		// "builder" image is only used locally for artifact extraction. The
-		// returned digest lets the start path skip pulls on workers that
-		// already hold this exact content.
+		// "builder" image is only used locally for artifact extraction.
 		if m.challengeRegistry != "" && image.Host != "builder" {
-			digest, err := m.pushImage(imageName)
-			if err != nil {
+			if err := m.pushImage(imageName); err != nil {
 				return err
 			}
-			image.Digest = digest
 		}
 		images = append(images, image)
 	}
@@ -994,9 +948,9 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 		return err
 	}
 
-	// Registry mode: make sure this daemon has the current images before
-	// launching. When the daemon already holds an image at the digest
-	// recorded at push time, the pull is skipped entirely: a local inspect
+	// Registry mode: make sure this daemon has the build's images before
+	// launching. Tags are content-addressed, so if the tag is already present
+	// the content is right and the pull is skipped entirely: a local inspect
 	// is cheap and doesn't serialize inside dockerd, while concurrent pulls
 	// of the same image convoy on shared metadata even when fully cached.
 	// Kept outside the launch semaphore: a cold pull must not stall the
@@ -1007,7 +961,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 				continue
 			}
 			imageName := m.instanceImageName(build.Challenge, build, image)
-			if m.workerHasImage(cli, imageName, image.Digest) {
+			if m.workerHasTag(cli, imageName) {
 				continue
 			}
 			if err := m.pullImage(cli, imageName); err != nil {

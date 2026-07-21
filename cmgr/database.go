@@ -111,7 +111,6 @@ const schemaQuery string = `
 		id INTEGER PRIMARY KEY,
 		build INTEGER NOT NULL,
 		host TEXT NOT NULL,
-		digest TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (build) REFERENCES builds (id)
 		    ON UPDATE RESTRICT ON DELETE CASCADE
 	);
@@ -378,19 +377,20 @@ func (m *Manager) initDatabase() error {
 		}
 	}
 
-	// Migrate older DBs: add the images.digest column if it is not present.
-	// Existing rows keep '' (digest unknown), which the start path treats as
-	// "pull unconditionally" until the build is rebuilt.
+	// Drop the images.digest column left behind by the digest-based worker
+	// freshness check: content-addressed tags make the stored registry digest
+	// redundant (the start path now only checks tag existence). Plain ALTER ...
+	// DROP COLUMN works here — the column has no index or FK reference.
 	var imageDigestCols int
 	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('images') WHERE name = 'digest';").Scan(&imageDigestCols)
 	if err != nil {
 		m.log.errorf("could not check images table schema: %s", err)
 		return err
 	}
-	if imageDigestCols == 0 {
-		_, err = db.Exec("ALTER TABLE images ADD COLUMN digest TEXT NOT NULL DEFAULT '';")
+	if imageDigestCols > 0 {
+		_, err = db.Exec("ALTER TABLE images DROP COLUMN digest;")
 		if err != nil {
-			m.log.errorf("could not migrate images.digest column: %s", err)
+			m.log.errorf("could not drop images.digest column: %s", err)
 			return err
 		}
 	}
