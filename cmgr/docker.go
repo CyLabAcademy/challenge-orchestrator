@@ -417,6 +417,15 @@ func (m *Manager) retagLegacyImages(db *sqlx.DB, id BuildId, challenge string, s
 	for _, host := range hosts {
 		oldRef := fmt.Sprintf("%s:%d-%s", challenge, id, host)
 		newRef := fmt.Sprintf("%s:%s", challenge, newMeta.dockerId(Image{Host: host}))
+		if m.challengeRegistry != "" {
+			oldRef = fmt.Sprintf("%s/%s", m.challengeRegistry, oldRef)
+			newRef = fmt.Sprintf("%s/%s", m.challengeRegistry, newRef)
+		}
+		// Registry mode: workers resolve instance images from the registry by
+		// tag, so after a local retag the new-form tag must also be pushed or
+		// instance starts would pull a tag zot has never seen. Builder images
+		// stay local-only, matching executeBuild.
+		needsPush := m.challengeRegistry != "" && host != "builder"
 
 		if _, err := m.cli.ImageTag(m.ctx, client.ImageTagOptions{Source: oldRef, Target: newRef}); err != nil {
 			if !errdefs.IsNotFound(err) {
@@ -425,17 +434,32 @@ func (m *Manager) retagLegacyImages(db *sqlx.DB, id BuildId, challenge string, s
 				return fmt.Errorf("could not retag legacy image %s as %s: %w", oldRef, newRef, err)
 			}
 			// Source absent: either already retagged (new ref present) or never
-			// present locally (fresh daemon / pruned out-of-band). Nothing to
-			// recover; the next rebuild recreates it under the new name.
-			m.log.debugf("legacy image %s not present; skipping retag", oldRef)
-			continue
+			// present locally (fresh daemon / pruned out-of-band). If a prior
+			// interrupted run already produced the new tag, fall through so the
+			// registry push below still happens; otherwise nothing to recover —
+			// the next rebuild recreates the image under the new name.
+			if !needsPush || !m.workerHasTag(m.cli, newRef) {
+				m.log.debugf("legacy image %s not present; skipping retag", oldRef)
+				continue
+			}
+		} else {
+			// Drop the legacy ref; the image survives under the new one. A missing
+			// legacy tag here is fine (idempotent re-run after a prior removal).
+			if _, err := m.cli.ImageRemove(m.ctx, oldRef, client.ImageRemoveOptions{Force: false, PruneChildren: false}); err != nil && !errdefs.IsNotFound(err) {
+				m.log.warnf("could not remove legacy image tag %s: %s", oldRef, err)
+			}
+			m.log.infof("retagged image %s as %s", oldRef, newRef)
 		}
-		// Drop the legacy ref; the image survives under the new one. A missing
-		// legacy tag here is fine (idempotent re-run after a prior removal).
-		if _, err := m.cli.ImageRemove(m.ctx, oldRef, client.ImageRemoveOptions{Force: false, PruneChildren: false}); err != nil && !errdefs.IsNotFound(err) {
-			m.log.warnf("could not remove legacy image tag %s: %s", oldRef, err)
+
+		if needsPush {
+			// Layers already live in the registry from the original push;
+			// this uploads little more than the manifest under the new tag.
+			// Abort on failure so the row stays at checksum=0 and the push is
+			// retried next start (ImageTag above is idempotent).
+			if err := m.pushImage(newRef); err != nil {
+				return fmt.Errorf("could not push retagged image %s: %w", newRef, err)
+			}
 		}
-		m.log.infof("retagged image %s as %s", oldRef, newRef)
 	}
 	return nil
 }

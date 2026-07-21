@@ -743,7 +743,7 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 						}
 						tags := make([]string, 0, len(build.Images))
 						for _, image := range build.Images {
-							tags = append(tags, fmt.Sprintf("%s:%s", build.Challenge, displacedMeta.dockerId(image)))
+							tags = append(tags, m.instanceImageName(build.Challenge, &displacedMeta, image))
 						}
 						replaced = append(replaced, replacedImages{tags: tags, meta: displacedMeta})
 					}
