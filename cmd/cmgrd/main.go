@@ -127,7 +127,9 @@ HTTP API:
   cmgrd owns all state; every action goes through its API (the cmgrd-cli
   binary is a thin wrapper around it). In addition to the challenge, build,
   instance, worker, and schema endpoints, POST /update re-scans the
-  challenge directory (body: {"path": "<dir>", "dry_run": false}),
+  challenge directory (body: {"path": "<dir>", "dry_run": false,
+  "prune_old": false} — prune_old removes image generations displaced from
+  rollback retention, on the build daemon and in the registry),
   GET /state dumps the full challenge/build/instance state, and
   GET /version reports the server version.
 
@@ -549,6 +551,10 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 type UpdateRequest struct {
 	Path   string `json:"path"`
 	DryRun bool   `json:"dry_run"`
+	// PruneOld additionally removes image generations that fall out of
+	// rollback retention when a rebuild lands ({current, previous} are kept
+	// per build), both on the build daemon and in the challenge registry.
+	PruneOld bool `json:"prune_old"`
 }
 
 // ChallengeUpdates with ids instead of full metadata and marshalable errors.
@@ -599,7 +605,7 @@ func (s state) updateHandler(w http.ResponseWriter, r *http.Request) {
 	if req.DryRun {
 		updates = s.mgr.DetectChanges(path)
 	} else {
-		updates = s.mgr.Update(path)
+		updates = s.mgr.UpdateWithOptions(path, cmgr.UpdateOptions{PruneOldImages: req.PruneOld})
 	}
 
 	resp := UpdateResponse{
