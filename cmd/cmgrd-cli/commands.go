@@ -61,6 +61,7 @@ func updateCommand(c *client, args []string) int {
 	parser := flag.NewFlagSet("update", flag.ExitOnError)
 	dryRun := parser.Bool("dry-run", false, "detect changes without applying them")
 	verbose := parser.Bool("verbose", false, "also list unmodified challenges")
+	pruneOld := parser.Bool("prune-old", false, "remove image generations displaced from rollback retention (daemon and registry)")
 	parser.Parse(args)
 
 	if parser.NArg() > 1 {
@@ -80,7 +81,7 @@ func updateCommand(c *client, args []string) int {
 	}
 
 	var resp UpdateResponse
-	body := map[string]interface{}{"path": path, "dry_run": *dryRun}
+	body := map[string]interface{}{"path": path, "dry_run": *dryRun, "prune_old": *pruneOld}
 	if err := c.doJSON("POST", "/update", body, &resp); err != nil {
 		return runtimeError(err)
 	}

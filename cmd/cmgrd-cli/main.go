@@ -105,10 +105,12 @@ A thin HTTP client for cmgrd: every command is an API call against the
 server; nothing touches the database, docker, or the registry directly.
 
 Deployment:
-  update [--dry-run] [--verbose] [<dir>]
+  update [--dry-run] [--verbose] [--prune-old] [<dir>]
       re-scan the challenge directory on the server (rebuilding changed
       challenges) and print the resulting changes; <dir> must be inside the
-      server's CMGR_DIR and defaults to all of it
+      server's CMGR_DIR and defaults to all of it; --prune-old additionally
+      removes the image generation each rebuild displaces from rollback
+      retention, on the build daemon and in the registry
   update-schema <schema file>
       create or update the schema defined in the given yaml/json file and
       converge its builds/instances

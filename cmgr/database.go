@@ -93,6 +93,8 @@ const schemaQuery string = `
 		flag TEXT NOT NULL,
 		format TEXT NOT NULL,
 		seed INTEGER NOT NULL,
+		checksum INTEGER NOT NULL DEFAULT 0,
+		prevchecksum INTEGER NOT NULL DEFAULT 0,
 		hasartifacts INTEGER NOT NULL CHECK (hasartifacts = 0 OR hasartifacts = 1),
 		lastsolved INTEGER,
 		challenge TEXT NOT NULL,
@@ -109,7 +111,6 @@ const schemaQuery string = `
 		id INTEGER PRIMARY KEY,
 		build INTEGER NOT NULL,
 		host TEXT NOT NULL,
-		digest TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (build) REFERENCES builds (id)
 		    ON UPDATE RESTRICT ON DELETE CASCADE
 	);
@@ -251,6 +252,48 @@ func (m *Manager) initDatabase() error {
 		}
 	}
 
+	// Migrate older DBs: add builds.checksum, the content identity embedded in
+	// each build's docker tags. Rows predating the column are backfilled and
+	// their local images retagged from the legacy id-based tag form so existing
+	// deployments keep launching without a rebuild. The column is added once,
+	// but the backfill is driven by data (rows still at the default checksum=0)
+	// and runs on every start until it completes: a crash or transient docker
+	// error mid-migration leaves the affected rows at 0 and they are retried
+	// next start, rather than being skipped forever by a column-existence guard.
+	var buildsChecksumCols int
+	err = db.QueryRow("SELECT COUNT(1) FROM pragma_table_info('builds') WHERE name='checksum';").Scan(&buildsChecksumCols)
+	if err != nil {
+		m.log.errorf("could not inspect builds schema: %s", err)
+		return err
+	}
+	if buildsChecksumCols == 0 {
+		_, err = db.Exec("ALTER TABLE builds ADD COLUMN checksum INTEGER NOT NULL DEFAULT 0;")
+		if err != nil {
+			m.log.errorf("could not migrate builds.checksum column: %s", err)
+			return err
+		}
+	}
+	if err = m.migrateBuildChecksums(db); err != nil {
+		m.log.errorf("could not backfill builds.checksum: %s", err)
+		return err
+	}
+
+	// builds.prevchecksum records the generation retained for rollback (0 =
+	// none known); no backfill is possible for rows that predate it.
+	var prevChecksumCols int
+	err = db.QueryRow("SELECT COUNT(1) FROM pragma_table_info('builds') WHERE name='prevchecksum';").Scan(&prevChecksumCols)
+	if err != nil {
+		m.log.errorf("could not inspect builds schema: %s", err)
+		return err
+	}
+	if prevChecksumCols == 0 {
+		_, err = db.Exec("ALTER TABLE builds ADD COLUMN prevchecksum INTEGER NOT NULL DEFAULT 0;")
+		if err != nil {
+			m.log.errorf("could not migrate builds.prevchecksum column: %s", err)
+			return err
+		}
+	}
+
 	// Bring an older `instances` table up to the current schema. created_at
 	// (DEFAULT CURRENT_TIMESTAMP) and is_finalized were both added after the
 	// original release. SQLite cannot ALTER ... ADD COLUMN a non-constant
@@ -334,19 +377,20 @@ func (m *Manager) initDatabase() error {
 		}
 	}
 
-	// Migrate older DBs: add the images.digest column if it is not present.
-	// Existing rows keep '' (digest unknown), which the start path treats as
-	// "pull unconditionally" until the build is rebuilt.
+	// Drop the images.digest column left behind by the digest-based worker
+	// freshness check: content-addressed tags make the stored registry digest
+	// redundant (the start path now only checks tag existence). Plain ALTER ...
+	// DROP COLUMN works here — the column has no index or FK reference.
 	var imageDigestCols int
 	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('images') WHERE name = 'digest';").Scan(&imageDigestCols)
 	if err != nil {
 		m.log.errorf("could not check images table schema: %s", err)
 		return err
 	}
-	if imageDigestCols == 0 {
-		_, err = db.Exec("ALTER TABLE images ADD COLUMN digest TEXT NOT NULL DEFAULT '';")
+	if imageDigestCols > 0 {
+		_, err = db.Exec("ALTER TABLE images DROP COLUMN digest;")
 		if err != nil {
-			m.log.errorf("could not migrate images.digest column: %s", err)
+			m.log.errorf("could not drop images.digest column: %s", err)
 			return err
 		}
 	}

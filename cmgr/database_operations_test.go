@@ -169,7 +169,7 @@ func TestDatabaseUpdateChallenge(t *testing.T) {
 	challenge.Tags = []string{"updated", "modified"}
 	challenge.Attributes = map[string]string{"version": "2", "status": "active"}
 
-	errs = mgr.updateChallenges([]*ChallengeMetadata{challenge}, false)
+	errs = mgr.updateChallenges([]*ChallengeMetadata{challenge}, false, false)
 	if len(errs) > 0 {
 		t.Fatalf("updateChallenges failed: %v", errs)
 	}
@@ -248,7 +248,7 @@ func TestDatabaseBuildLifecycle(t *testing.T) {
 	build.HasArtifacts = false
 	build.LookupData = map[string]string{"key1": "val1"}
 	build.Images = []Image{
-		{Host: "challenge", Ports: []string{"8080/tcp"}, Digest: "sha256:6aea1af2ab09dfa5f20b7c93d2325ee29a8104e2b8ab853d5b60dbc23ee1a2af"},
+		{Host: "challenge", Ports: []string{"8080/tcp"}},
 	}
 
 	err = mgr.finalizeBuild(build)
@@ -280,10 +280,6 @@ func TestDatabaseBuildLifecycle(t *testing.T) {
 	if got.Images[0].Host != "challenge" {
 		t.Errorf("expected image host 'challenge', got %q", got.Images[0].Host)
 	}
-	if got.Images[0].Digest != build.Images[0].Digest {
-		t.Errorf("expected image digest %q, got %q", build.Images[0].Digest, got.Images[0].Digest)
-	}
-
 	// Look up a non-existent build
 	_, err = mgr.lookupBuildMetadata(BuildId(99999))
 	if err == nil {
@@ -1534,9 +1530,8 @@ func setupTestManager(t *testing.T) *Manager {
 }
 
 // TestImagesDigestMigration verifies that a database whose images table
-// predates the digest column is migrated in place: the column is added,
-// existing rows read back with an empty digest (= "unknown, always pull"),
-// and re-running the migration is a no-op.
+// carries the retired digest column is migrated in place: the column is
+// dropped, existing rows survive, and re-running the migration is a no-op.
 func TestImagesDigestMigration(t *testing.T) {
 	dbFile, err := os.CreateTemp("", "cmgr-digest-migrate-*.db")
 	if err != nil {
@@ -1558,10 +1553,11 @@ func TestImagesDigestMigration(t *testing.T) {
 		id INTEGER PRIMARY KEY,
 		build INTEGER NOT NULL,
 		host TEXT NOT NULL,
+		digest TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (build) REFERENCES builds (id)
 			ON UPDATE RESTRICT ON DELETE CASCADE
 	);
-	INSERT INTO images(build, host) VALUES (1, 'challenge');`
+	INSERT INTO images(build, host, digest) VALUES (1, 'challenge', 'sha256:abc');`
 	if _, err := legacy.Exec(schema); err != nil {
 		t.Fatalf("failed to create legacy schema: %s", err)
 	}
@@ -1581,16 +1577,16 @@ func TestImagesDigestMigration(t *testing.T) {
 		if err := mgr.db.Get(&n, "SELECT COUNT(*) FROM pragma_table_info('images') WHERE name = 'digest';"); err != nil {
 			t.Fatalf("schema check failed (%s pass): %s", pass, err)
 		}
-		if n != 1 {
-			t.Errorf("expected exactly one digest column after %s pass, got %d", pass, n)
+		if n != 0 {
+			t.Errorf("expected digest column dropped after %s pass, still present", pass)
 		}
 
-		var digest string
-		if err := mgr.db.Get(&digest, "SELECT digest FROM images WHERE build = 1;"); err != nil {
+		var host string
+		if err := mgr.db.Get(&host, "SELECT host FROM images WHERE build = 1;"); err != nil {
 			t.Fatalf("failed to read legacy row (%s pass): %s", pass, err)
 		}
-		if digest != "" {
-			t.Errorf("expected empty digest for pre-migration row, got %q", digest)
+		if host != "challenge" {
+			t.Errorf("expected legacy row to survive column drop, got host %q", host)
 		}
 		mgr.db.Close()
 	}
@@ -1800,8 +1796,11 @@ func TestInitDatabaseRepairsStaleIsFinalizedDefault(t *testing.T) {
 	}
 	// Mirror the pre-rebuild schema: created_at present, is_finalized added with
 	// the legacy DEFAULT 1. Seed one already-launched instance (default 1).
+	// The builds stub carries the seed/format/challenge columns every real
+	// pre-checksum database has, so the builds.checksum migration's backfill
+	// query can run against it (its challenges join simply matches nothing).
 	legacy := `
-	CREATE TABLE builds (id INTEGER PRIMARY KEY, schema TEXT);
+	CREATE TABLE builds (id INTEGER PRIMARY KEY, schema TEXT, seed INTEGER, format TEXT, challenge TEXT);
 	CREATE TABLE instances (
 		id INTEGER PRIMARY KEY,
 		lastsolved INTEGER,
