@@ -82,6 +82,35 @@ second boundary is possible, and the recipes below show how, but a profile that
 does it is not something to copy without understanding it — see
 [Relaxing container isolation](#relaxing-container-isolation).
 
+## Reviewing a profile
+
+A consequence of the full-copy format: reading a profile top to bottom tells
+you almost nothing, and one unwanted rule in the middle of 800 lines is easy
+to miss in review. Review the *delta* instead:
+
+```console
+$ python3 profile-diff.py execstack.json
+baseline: .../cmgr/seccomp.json
+profile:  execstack.json
+
+~ personality
+    - SCMP_ACT_ALLOW arg0 & 0xfffffffffff9fff7 == 0 (only bits 0x60008 permitted)
+    + SCMP_ACT_ALLOW arg0 & 0xffffffffffb9fff7 == 0 (only bits 0x460008 permitted)
+
+0 syscall(s) added, 1 changed, 0 removed
+```
+
+[`profile-diff.py`](profile-diff.py) compares a profile against cmgr's
+embedded default (auto-located in a cmgr checkout; pass `--baseline`
+otherwise) and prints only what changed, ignoring comments and rule order.
+Every `+` line is new attack surface: a clean review is a delta that matches
+what the challenge's `problem.md` says it needs and nothing else. A buried
+`{"names": ["unshare", "setns"], "action": "SCMP_ACT_ALLOW"}` that would be
+invisible in the raw file shows up as two `+ SCMP_ACT_ALLOW` lines.
+
+Exit codes follow `diff`: 0 means semantically identical to the baseline, 1
+means differences were found, 2 means error — so it can also gate CI.
+
 ## Profiles must let the container start
 
 runc installs the seccomp filter *before* it executes the container's command,
