@@ -57,6 +57,36 @@ func safeArchiveName(name string) (string, error) {
 	return clean, nil
 }
 
+const (
+	// artifactMetadataBytesPerEntry allows this many decompressed bytes of tar
+	// header and metadata records per permitted entry. A legitimate entry needs
+	// a 512-byte header plus, at most, a long-name/PAX record whose name is
+	// already bounded to 4096 bytes by safeArchiveName.
+	artifactMetadataBytesPerEntry = 8 * 1024
+	// artifactTrailerSlackBytes covers the tar end-of-archive blocks and block
+	// padding so an archive exactly at its byte limit is not falsely rejected.
+	artifactTrailerSlackBytes = 4 * 1024
+)
+
+// boundedReader caps the total number of bytes read from an underlying reader
+// and reports a clear error once the cap is passed.
+type boundedReader struct {
+	reader    io.Reader
+	remaining int64
+}
+
+func (b *boundedReader) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, fmt.Errorf("artifact archive decompresses beyond its size limit")
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.reader.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
 func (m *Manager) cacheArtifacts(
 	source io.Reader,
 	destination string,
@@ -88,7 +118,16 @@ func (m *Manager) cacheArtifacts(
 		return nil, fmt.Errorf("could not decode artifact gzip stream: %w", err)
 	}
 	defer sourceGzip.Close()
-	sourceTar := tar.NewReader(sourceGzip)
+	// tar.Reader.Next consumes PAX, global, and GNU long-name records
+	// internally before returning a file header, so the per-entry and per-total
+	// checks below never see them. Bound the decompressed stream as a whole so a
+	// flood of highly compressible metadata records cannot force unbounded
+	// decompression: the cap is the allowed body bytes plus a header/metadata
+	// allowance scaled to the entry limit, plus slack for the tar trailer.
+	decompressedLimit := maxBytes +
+		int64(maxFiles)*artifactMetadataBytesPerEntry +
+		artifactTrailerSlackBytes
+	sourceTar := tar.NewReader(&boundedReader{reader: sourceGzip, remaining: decompressedLimit})
 	destinationGzip := gzip.NewWriter(tempFile)
 	destinationTar := tar.NewWriter(destinationGzip)
 

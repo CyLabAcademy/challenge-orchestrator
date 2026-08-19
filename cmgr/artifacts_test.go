@@ -7,6 +7,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -322,5 +324,60 @@ func TestCacheArtifactsRejectsOverlongRawName(t *testing.T) {
 	if _, err := manager.cacheArtifacts(bytes.NewReader(archive),
 		filepath.Join(directory, "out.tar.gz")); err == nil {
 		t.Fatalf("an oversized raw name (%d bytes) was accepted", len(longName))
+	}
+}
+
+func TestBoundedReaderCapsTotalBytes(t *testing.T) {
+	src := bytes.NewReader(make([]byte, 10000))
+	b := &boundedReader{reader: src, remaining: 4096}
+	n, err := io.Copy(io.Discard, b)
+	if err == nil {
+		t.Fatalf("boundedReader did not error after its limit (read %d bytes)", n)
+	}
+	if n > 4096 {
+		t.Fatalf("boundedReader passed %d bytes past its 4096 limit", n)
+	}
+}
+
+// tar.Reader.Next consumes GNU long-name / PAX records internally, so their
+// decompressed bytes never reach entryCount or totalBytes. A metadata flood
+// must therefore be caught by the aggregate decompressed-stream bound, not the
+// per-entry limits.
+func TestCacheArtifactsBoundsUncountedMetadata(t *testing.T) {
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	tw := tar.NewWriter(gz)
+	for i := 0; i < 20; i++ {
+		// A 200KB name forces a GNU long-name record Next() reads internally.
+		name := strings.Repeat("a", 200000) + fmt.Sprintf("%d", i)
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name, Typeflag: tar.TypeReg, Size: 1, Format: tar.FormatGNU,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		tw.Write([]byte("x"))
+	}
+	tw.Close()
+	gz.Close()
+
+	directory := t.TempDir()
+	// Budget = maxBytes + maxFiles*8KB + slack ~= 85KB, below a single 200KB
+	// long-name record, so the bound fires while reading metadata — before the
+	// oversized name would even surface to safeArchiveName.
+	manager := &Manager{
+		artifactsDir: directory,
+		policy: managerPolicy{
+			MaxArtifactFiles:     10,
+			MaxArtifactBytes:     1024,
+			MaxArtifactFileBytes: 1024,
+		},
+	}
+	_, err := manager.cacheArtifacts(bytes.NewReader(raw.Bytes()),
+		filepath.Join(directory, "out.tar.gz"))
+	if err == nil {
+		t.Fatal("metadata-record flood was not bounded")
+	}
+	if !strings.Contains(err.Error(), "decompresses beyond") {
+		t.Fatalf("expected the decompressed-size bound to fire, got: %s", err)
 	}
 }
