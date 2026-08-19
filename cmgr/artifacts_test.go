@@ -1,0 +1,260 @@
+// Adapted from ArmyCyberInstitute/cmgr at commit bdbf839, under the Apache
+// License 2.0. The upstream staged-build rollback test is omitted because this
+// fork has not adopted staged builds.
+package cmgr
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+type artifactTestEntry struct {
+	name     string
+	typeflag byte
+	body     string
+	linkname string
+}
+
+func artifactTestArchive(t *testing.T, entries []artifactTestEntry) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	gzipWriter := gzip.NewWriter(&output)
+	tarWriter := tar.NewWriter(gzipWriter)
+	for _, entry := range entries {
+		header := &tar.Header{
+			Name:     entry.name,
+			Typeflag: entry.typeflag,
+			Mode:     0644,
+			Size:     int64(len(entry.body)),
+			Linkname: entry.linkname,
+		}
+		if entry.typeflag == tar.TypeDir || entry.typeflag == tar.TypeSymlink {
+			header.Size = 0
+		}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if header.Size != 0 {
+			if _, err := tarWriter.Write([]byte(entry.body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func TestCacheArtifactsValidatesAndInstallsAtomically(t *testing.T) {
+	directory := t.TempDir()
+	manager := &Manager{
+		artifactsDir: directory,
+		policy: managerPolicy{
+			MaxArtifactFiles:     10,
+			MaxArtifactBytes:     1024,
+			MaxArtifactFileBytes: 512,
+		},
+	}
+	destination := filepath.Join(directory, "1.tar.gz")
+	files, err := manager.cacheArtifacts(
+		bytes.NewReader(artifactTestArchive(t, []artifactTestEntry{
+			{name: "docs", typeflag: tar.TypeDir},
+			{name: "docs/readme.txt", typeflag: tar.TypeReg, body: "hello"},
+		})),
+		destination,
+	)
+	if err != nil {
+		t.Fatalf("valid archive was rejected: %v", err)
+	}
+	if len(files) != 1 || files[0] != "docs/readme.txt" {
+		t.Fatalf("unexpected artifact list: %#v", files)
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("artifact mode is %o, expected 600", info.Mode().Perm())
+	}
+}
+
+func TestCacheArtifactsRejectsUnsafeOrOversizedArchives(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []artifactTestEntry
+		policy  managerPolicy
+		match   string
+	}{
+		{
+			name: "traversal",
+			entries: []artifactTestEntry{
+				{name: "../escape", typeflag: tar.TypeReg, body: "bad"},
+			},
+			match: "escapes",
+		},
+		{
+			name: "symlink",
+			entries: []artifactTestEntry{
+				{name: "link", typeflag: tar.TypeSymlink, linkname: "/etc/passwd"},
+			},
+			match: "unsupported tar type",
+		},
+		{
+			name: "entry count",
+			entries: []artifactTestEntry{
+				{name: "one", typeflag: tar.TypeReg, body: "1"},
+				{name: "two", typeflag: tar.TypeReg, body: "2"},
+			},
+			policy: managerPolicy{
+				MaxArtifactFiles:     1,
+				MaxArtifactBytes:     100,
+				MaxArtifactFileBytes: 100,
+			},
+			match: "more than 1 entries",
+		},
+		{
+			name: "uncompressed bytes",
+			entries: []artifactTestEntry{
+				{name: "large", typeflag: tar.TypeReg, body: "12345"},
+			},
+			policy: managerPolicy{
+				MaxArtifactFiles:     10,
+				MaxArtifactBytes:     4,
+				MaxArtifactFileBytes: 10,
+			},
+			match: "exceeds 4 uncompressed bytes",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			manager := &Manager{artifactsDir: directory, policy: test.policy}
+			destination := filepath.Join(directory, "existing.tar.gz")
+			if err := os.WriteFile(destination, []byte("original"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := manager.cacheArtifacts(
+				bytes.NewReader(artifactTestArchive(t, test.entries)),
+				destination,
+			)
+			if err == nil || !strings.Contains(err.Error(), test.match) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			data, readErr := os.ReadFile(destination)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(data) != "original" {
+				t.Fatal("failed archive replaced the prior artifact")
+			}
+		})
+	}
+}
+
+func TestArtifactDefaultLimitsMatchReleasePolicy(t *testing.T) {
+	manager := new(Manager)
+	files, total, _ := manager.artifactLimits()
+	if files != 10_000 {
+		t.Fatalf("default artifact entry limit is %d", files)
+	}
+	if total != 5*1024*1024*1024 {
+		t.Fatalf("default artifact byte limit is %d", total)
+	}
+}
+
+func TestInitPolicyReadsArtifactLimitsFromEnvironment(t *testing.T) {
+	t.Setenv(maxArtifactFilesEnv, "5")
+	t.Setenv(maxArtifactBytesEnv, "2m")
+	t.Setenv(maxArtifactFileBytesEnv, "512k")
+
+	manager := new(Manager)
+	if err := manager.initPolicy(); err != nil {
+		t.Fatalf("initPolicy rejected valid limits: %s", err)
+	}
+	files, total, perFile := manager.artifactLimits()
+	if files != 5 {
+		t.Fatalf("artifact entry limit is %d; expected 5", files)
+	}
+	if total != 2*1024*1024 {
+		t.Fatalf("artifact byte limit is %d; expected %d", total, 2*1024*1024)
+	}
+	if perFile != 512*1024 {
+		t.Fatalf("per-file byte limit is %d; expected %d", perFile, 512*1024)
+	}
+}
+
+func TestInitPolicyRejectsInvalidArtifactLimits(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"zero entries", maxArtifactFilesEnv, "0"},
+		{"negative entries", maxArtifactFilesEnv, "-1"},
+		{"unparseable entries", maxArtifactFilesEnv, "many"},
+		{"zero bytes", maxArtifactBytesEnv, "0"},
+		{"unparseable bytes", maxArtifactBytesEnv, "big"},
+		{"unparseable per-file bytes", maxArtifactFileBytesEnv, "huge"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(test.key, test.value)
+			if err := new(Manager).initPolicy(); err == nil {
+				t.Fatalf("initPolicy accepted %s=%q", test.key, test.value)
+			}
+		})
+	}
+}
+
+// `tar czf artifacts.tar.gz -C dir .` emits a "./" root entry. It is legitimate
+// and common, so it must be skipped rather than failing the whole archive.
+func TestCacheArtifactsAcceptsTarRootEntry(t *testing.T) {
+	directory := t.TempDir()
+	manager := &Manager{
+		artifactsDir: directory,
+		policy: managerPolicy{
+			MaxArtifactFiles:     10,
+			MaxArtifactBytes:     1024,
+			MaxArtifactFileBytes: 1024,
+		},
+	}
+	archive := artifactTestArchive(t, []artifactTestEntry{
+		{name: "./", typeflag: tar.TypeDir},
+		{name: "./reader", typeflag: tar.TypeReg, body: "x"},
+		{name: "notes.txt", typeflag: tar.TypeReg, body: "hi"},
+	})
+	files, err := manager.cacheArtifacts(bytes.NewReader(archive),
+		filepath.Join(directory, "out.tar.gz"))
+	if err != nil {
+		t.Fatalf("root entry archive was rejected: %s", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %v", files)
+	}
+}
+
+// artifactLimits' zero-fallbacks must equal the initPolicy defaults, so a
+// Manager built either way sees the same bounds.
+func TestArtifactZeroFallbacksMatchInitPolicyDefaults(t *testing.T) {
+	fallbackFiles, fallbackBytes, fallbackFileBytes := new(Manager).artifactLimits()
+
+	configured := new(Manager)
+	if err := configured.initPolicy(); err != nil {
+		t.Fatal(err)
+	}
+	files, total, perFile := configured.artifactLimits()
+
+	if fallbackFiles != files || fallbackBytes != total || fallbackFileBytes != perFile {
+		t.Fatalf("zero-fallback limits (%d/%d/%d) differ from initPolicy defaults (%d/%d/%d)",
+			fallbackFiles, fallbackBytes, fallbackFileBytes, files, total, perFile)
+	}
+}

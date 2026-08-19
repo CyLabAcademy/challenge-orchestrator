@@ -62,6 +62,7 @@ type Manager struct {
 	pruneInterval      time.Duration
 	pruneAge           time.Duration
 	launchSemaphore    chan struct{}
+	policy             managerPolicy
 }
 
 type PortInfo struct {

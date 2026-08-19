@@ -2,7 +2,6 @@ package cmgr
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -688,71 +687,14 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 			delete(lookups, "flag")
 		} else if hdr.Name == "challenge/artifacts.tar.gz" {
-			artifactsFileName := bMeta.getArtifactsFilename()
-			// Iterate through reading filenames and copying over the tarball
-			artifactsFile, err := os.Create(filepath.Join(m.artifactsDir, artifactsFileName))
+			artifactsPath := filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename())
+			files, err = m.cacheArtifacts(cTar, artifactsPath)
 			if err != nil {
-				m.log.errorf("could not create cached artifacts archive: %s", err)
+				m.log.errorf("could not cache artifacts: %s", err)
 				return err
 			}
-			defer artifactsFile.Close()
-
-			srcGz, err := gzip.NewReader(cTar)
-			if err != nil {
-				m.log.errorf("could not gzip read artifacts file: %s", err)
-				return err
-			}
-
-			dstGz := gzip.NewWriter(artifactsFile)
-			srcTar := tar.NewReader(srcGz)
-			dstTar := tar.NewWriter(dstGz)
-
-			var h *tar.Header
-			for h, err = srcTar.Next(); err == nil; h, err = srcTar.Next() {
-				files = append(files, h.Name)
-				m.log.debugf("artifact found: %s", h.Name)
-				err = dstTar.WriteHeader(h)
-				if err != nil {
-					m.log.errorf("could not write header to artifacts file: %s", err)
-					return err
-				}
-
-				if h.Typeflag != tar.TypeDir {
-					_, err = io.Copy(dstTar, srcTar)
-					if err != nil {
-						m.log.errorf("could not write body to artifacts file: %s", err)
-						return err
-					}
-				}
-			}
-
-			if err != io.EOF {
-				m.log.errorf("error occurred during copy of artifacts: %s", err)
-				return err
-			}
-
-			err = dstTar.Close()
-			if err != nil {
-				m.log.errorf("error closing artifacts tar file: %s", err)
-				return err
-			}
-
-			err = srcGz.Close()
-			if err != nil {
-				m.log.errorf("error closing GZIP decoder: %s", err)
-				return err
-			}
-
-			err = dstGz.Close()
-			if err != nil {
-				m.log.errorf("error closing GZIP encoder: %s", err)
-				return err
-			}
-
-			err = artifactsFile.Close()
-			if err != nil {
-				m.log.errorf("error occurred when closing artifacts: %s", err)
-				return err
+			for _, name := range files {
+				m.log.debugf("artifact found: %s", name)
 			}
 		}
 	}
@@ -775,7 +717,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 	err = m.validateBuild(cMeta, bMeta, files)
 	if err != nil {
-		os.Remove(bMeta.getArtifactsFilename())
+		os.Remove(filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename()))
 
 		// Free the build image now rather than waiting for the deferred
 		// container cleanup: while the extraction container exists it references
