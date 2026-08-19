@@ -88,7 +88,10 @@ func validateSeccompProfileFilename(profilePath string) error {
 	if filepath.Ext(profilePath) != ".json" {
 		return fmt.Errorf("seccomp profile filename must end with '.json'")
 	}
-	if profilePath == "problem.json" || profilePath == "problem.md" {
+	// problem.json/problem.md are the challenge's own metadata; metadata.json is
+	// the build-output metadata cmgr generates and reads back. None can double as
+	// a profile without colliding with a file cmgr already owns.
+	if profilePath == "problem.json" || profilePath == "problem.md" || profilePath == "metadata.json" {
 		return fmt.Errorf("%s cannot also be used as a seccomp profile", profilePath)
 	}
 	for _, character := range profilePath {
@@ -154,6 +157,34 @@ func readSeccompProfile(challengeDir, profilePath string) (string, error) {
 	return string(data), nil
 }
 
+// validSeccompActions and validSeccompOperators are the action and argument
+// operator enums defined by the OCI runtime spec. Docker checks a profile
+// against these when it creates a container; checking them here as well means a
+// typo such as SCMP_ACT_ALOW is rejected during challenge validation, when the
+// author can see it, rather than surfacing only when the first runtime container
+// fails to launch. Keep these in sync with the spec if it grows new values.
+var validSeccompActions = map[string]bool{
+	"SCMP_ACT_KILL":         true,
+	"SCMP_ACT_KILL_PROCESS": true,
+	"SCMP_ACT_KILL_THREAD":  true,
+	"SCMP_ACT_TRAP":         true,
+	"SCMP_ACT_ERRNO":        true,
+	"SCMP_ACT_TRACE":        true,
+	"SCMP_ACT_ALLOW":        true,
+	"SCMP_ACT_LOG":          true,
+	"SCMP_ACT_NOTIFY":       true,
+}
+
+var validSeccompOperators = map[string]bool{
+	"SCMP_CMP_NE":        true,
+	"SCMP_CMP_LT":        true,
+	"SCMP_CMP_LE":        true,
+	"SCMP_CMP_EQ":        true,
+	"SCMP_CMP_GE":        true,
+	"SCMP_CMP_GT":        true,
+	"SCMP_CMP_MASKED_EQ": true,
+}
+
 func validateSeccompProfile(profile string) error {
 	var document seccompProfile
 	if err := json.Unmarshal([]byte(profile), &document); err != nil {
@@ -161,6 +192,9 @@ func validateSeccompProfile(profile string) error {
 	}
 	if document.DefaultAction == "" {
 		return fmt.Errorf("invalid seccomp profile: defaultAction must be a non-empty string")
+	}
+	if !validSeccompActions[document.DefaultAction] {
+		return fmt.Errorf("invalid seccomp profile: unknown defaultAction %q", document.DefaultAction)
 	}
 	for i, syscall := range document.Syscalls {
 		if syscall.Name != "" && len(syscall.Names) != 0 {
@@ -172,9 +206,15 @@ func validateSeccompProfile(profile string) error {
 		if syscall.Action == "" {
 			return fmt.Errorf("invalid seccomp profile: syscall rule %d does not specify an action", i)
 		}
+		if !validSeccompActions[syscall.Action] {
+			return fmt.Errorf("invalid seccomp profile: syscall rule %d has unknown action %q", i, syscall.Action)
+		}
 		for j, argument := range syscall.Args {
 			if argument.Op == "" {
 				return fmt.Errorf("invalid seccomp profile: argument %d in syscall rule %d does not specify an operator", j, i)
+			}
+			if !validSeccompOperators[argument.Op] {
+				return fmt.Errorf("invalid seccomp profile: argument %d in syscall rule %d has unknown operator %q", j, i, argument.Op)
 			}
 		}
 	}

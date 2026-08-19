@@ -21,11 +21,14 @@ challenge selects otherwise. It is a broad allowlist, not a jail:
 
 - `defaultAction` is `SCMP_ACT_ERRNO` returning `EPERM`
 - 346 syscalls are allowed unconditionally, including `execve`, `open`,
-  `openat`, `mmap`, `mprotect`, `clone`, and `ptrace`
-- 61 more are gated on a capability or kernel version. The practical effect is
-  that `unshare`, `setns`, `mount`, `bpf`, and `perf_event_open` are **denied**,
-  because they require `CAP_SYS_ADMIN` (or `CAP_BPF` / `CAP_PERFMON`) and cmgr
-  containers do not have those.
+  `openat`, `read`, `write`, `mmap`, and `mprotect`
+- 61 more are conditional. Some are gated on a capability the container lacks,
+  so `unshare`, `setns`, `mount`, `bpf`, and `perf_event_open` are **denied**
+  (they require `CAP_SYS_ADMIN`, or `CAP_BPF` / `CAP_PERFMON`). Others are
+  allowed but argument- or kernel-filtered: `clone` is permitted for thread and
+  process creation while its namespace-creation flags are gated on
+  `CAP_SYS_ADMIN`, and `ptrace` with `process_vm_readv`/`process_vm_writev` is
+  allowed on kernels ≥ 4.8 (effectively always) or with `CAP_SYS_PTRACE`.
 - `pivot_root`, `keyctl`, and `userfaultfd` are denied outright
 - `personality` is allowed only for `UNAME26`, `ADDR_NO_RANDOMIZE`, and
   `PER_LINUX32`; other bits, notably `READ_IMPLIES_EXEC`, are denied

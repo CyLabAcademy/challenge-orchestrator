@@ -7,20 +7,26 @@
 
 ## Description
 
-This challenge is an older 32-bit binary exploitation service whose intended
-solve executes shellcode from the heap. That needs the `READ_IMPLIES_EXEC`
-process personality, which the challenge requests at startup. cmgr's default
-seccomp policy blocks the `personality` syscall, so the challenge selects a
-seccomp profile that permits it.
-
-You can connect to the problem at `nc {{server}} {{port}}`.
+This is a demonstration of the per-challenge `seccomp` option rather than a
+full exploitation challenge. It is built around one older-style
+memory-corruption need — running code from the heap — which requires the
+`READ_IMPLIES_EXEC` process personality. cmgr's default seccomp policy permits
+`personality` in its query form and for a few benign values, but denies the
+`READ_IMPLIES_EXEC` bit specifically, so the challenge selects a profile that
+widens that one rule. The observable result is the heap becoming executable,
+after which the service serves the flag.
 
 ## Details
 
+Connect with `nc {{server}} {{port}}`.
+
 This example exists to show the `seccomp` challenge option below, and the full
-wiring an author needs when a challenge requires a syscall the default policy
-denies. `execstack.c` is written to be read: its comments record two facts that
-are easy to get wrong.
+wiring an author needs when a challenge requires a syscall value the default
+policy denies. It is deliberately small: the service probes whether its heap is
+executable and reports the result — it does not implement a heap-shellcode
+exploit. Point an author here for the wiring, not for an exploit to study.
+The source file {{url_for('execstack.c', 'execstack.c')}} is written to be
+read: its comments record two facts that are easy to get wrong.
 
 - `READ_IMPLIES_EXEC` is applied by the ELF loader at `execve`, not when the
   syscall returns. Calling `personality()` from inside a running process is too
@@ -42,10 +48,9 @@ The wiring itself:
 
 The service reports whether its heap is executable and then serves the flag.
 Without the profile it degrades rather than becoming a dead socket: it prints
-`heap executable: no` and a warning explaining that the sandbox blocked
-`personality`. With the profile it prints `heap executable: yes`. The solver
-requires `yes`, so a missing profile fails the solve legibly instead of quietly
-passing on a challenge whose exploit path was closed.
+`heap executable: no` and a warning naming the denied `READ_IMPLIES_EXEC` bit.
+With the profile it prints `heap executable: yes`. The solver requires `yes`,
+so a missing profile fails the solve legibly instead of quietly passing.
 
 ## Challenge Options
 
@@ -56,17 +61,17 @@ seccomp:
 
 ## Solution Overview
 
-The service needs `READ_IMPLIES_EXEC`, which requires the `personality` syscall
-that cmgr's default policy denies. Selecting the bundled `execstack.json`
-profile permits it; the program re-execs itself so the loader applies the
-personality, the heap becomes executable, and the flag is served. The solver
-connects, confirms the heap is executable, and reads the flag.
+The heap needs to be executable, which requires the `READ_IMPLIES_EXEC`
+personality bit that cmgr's default policy denies. Selecting the bundled
+`execstack.json` profile permits it; the program re-execs itself so the loader
+applies the personality, the heap becomes executable, and the flag is served.
+The solver connects, confirms the heap is executable, and reads the flag.
 
 ## Learning Objective
 
 By the end of this challenge, authors should understand how to supply a custom
-per-challenge seccomp profile for challenges that need a syscall the default
-policy denies, and the 32-bit constraint on an executable heap via
+per-challenge seccomp profile for challenges that need a syscall value the
+default policy denies, and the 32-bit constraint on an executable heap via
 `READ_IMPLIES_EXEC`.
 
 ## Tags

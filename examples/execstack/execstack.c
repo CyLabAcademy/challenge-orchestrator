@@ -52,10 +52,11 @@ static void ensure_exec_heap(char **argv) {
         int e = errno;
         fprintf(stderr,
             "WARNING: personality(READ_IMPLIES_EXEC) denied (%s).\n"
-            "WARNING: the sandbox seccomp profile is blocking the personality syscall,\n"
-            "WARNING: so the heap cannot be made executable and the intended solve\n"
-            "WARNING: cannot finish.  Serving anyway so the service is not a dead socket.\n",
-            e ? strerror(e) : "blocked by sandbox seccomp policy");
+            "WARNING: the sandbox seccomp profile permits personality() but not the\n"
+            "WARNING: READ_IMPLIES_EXEC bit, so the heap cannot be made executable\n"
+            "WARNING: and the intended solve cannot finish.  Serving anyway so the\n"
+            "WARNING: service is not a dead socket.\n",
+            e ? strerror(e) : "READ_IMPLIES_EXEC denied by sandbox seccomp policy");
         return;                                /* degrade, do not exit */
     }
 

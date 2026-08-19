@@ -74,6 +74,12 @@ func TestResolveRejectsUnsafeProfileReferences(t *testing.T) {
 	writeProfile(t, dir, "noaction.json", `{"defaultAction": ""}`)
 	writeProfile(t, dir, "norule.json",
 		`{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"action":"SCMP_ACT_ALLOW"}]}`)
+	writeProfile(t, dir, "metadata.json", testSeccompProfile)
+	writeProfile(t, dir, "badaction.json", `{"defaultAction":"SCMP_ACT_ALOW"}`)
+	writeProfile(t, dir, "badsyscallaction.json",
+		`{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["read"],"action":"SCMP_ACT_ALOW"}]}`)
+	writeProfile(t, dir, "badoperator.json",
+		`{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["personality"],"action":"SCMP_ACT_ALLOW","args":[{"index":0,"op":"SCMP_CMP_BOGUS"}]}]}`)
 	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -87,11 +93,15 @@ func TestResolveRejectsUnsafeProfileReferences(t *testing.T) {
 		{"wrong extension", "notjson.txt"},
 		{"challenge metadata json", "problem.json"},
 		{"challenge metadata markdown", "problem.md"},
+		{"challenge build metadata", "metadata.json"},
 		{"unsupported characters", "pro file.json"},
 		{"missing", "absent.json"},
 		{"directory", "sub"},
 		{"malformed json", "bad.json"},
 		{"empty default action", "noaction.json"},
+		{"unknown default action", "badaction.json"},
+		{"unknown syscall action", "badsyscallaction.json"},
+		{"unknown argument operator", "badoperator.json"},
 		{"rule without names", "norule.json"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -223,9 +233,14 @@ func TestSeccompOptionParsesFromChallengeMetadata(t *testing.T) {
 // challenge's. This catches a malformed edit and catches an example drifting
 // out of sync with the validator.
 func TestExampleProfilesAreValid(t *testing.T) {
+	// Only the profile library is globbed. The execstack challenge directory is
+	// intentionally excluded: building it with `make` generates non-profile JSON
+	// (metadata.json), which is not a seccomp profile and would fail validation
+	// here after a developer builds the example. Its execstack.json copy is
+	// covered instead by TestExecstackExampleMatchesLibraryProfile, which proves
+	// it is byte-identical to the library profile validated below.
 	dirs := []string{
 		filepath.Join("..", "examples", "seccomp"),
-		filepath.Join("..", "examples", "execstack"),
 	}
 	found := 0
 	for _, dir := range dirs {
