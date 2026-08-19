@@ -258,3 +258,69 @@ func TestArtifactZeroFallbacksMatchInitPolicyDefaults(t *testing.T) {
 			fallbackFiles, fallbackBytes, fallbackFileBytes, files, total, perFile)
 	}
 }
+
+// A literal "./" root entry is skipped but still counted, so a flood of root
+// entries cannot slip past CMGR_MAX_ARTIFACT_FILES.
+func TestCacheArtifactsCountsSkippedRootEntries(t *testing.T) {
+	directory := t.TempDir()
+	manager := &Manager{
+		artifactsDir: directory,
+		policy: managerPolicy{
+			MaxArtifactFiles:     3,
+			MaxArtifactBytes:     1024,
+			MaxArtifactFileBytes: 1024,
+		},
+	}
+	entries := make([]artifactTestEntry, 0, 5)
+	for i := 0; i < 5; i++ {
+		entries = append(entries, artifactTestEntry{name: "./", typeflag: tar.TypeDir})
+	}
+	archive := artifactTestArchive(t, entries)
+	if _, err := manager.cacheArtifacts(bytes.NewReader(archive),
+		filepath.Join(directory, "out.tar.gz")); err == nil {
+		t.Fatal("a flood of skipped root entries evaded the entry-count limit")
+	}
+}
+
+// A directory name that only cleans to "." (e.g. "a/..") is no longer silently
+// skipped; it reaches safeArchiveName and is rejected.
+func TestCacheArtifactsRejectsCleanedRootDirName(t *testing.T) {
+	directory := t.TempDir()
+	manager := &Manager{
+		artifactsDir: directory,
+		policy: managerPolicy{
+			MaxArtifactFiles:     10,
+			MaxArtifactBytes:     1024,
+			MaxArtifactFileBytes: 1024,
+		},
+	}
+	archive := artifactTestArchive(t, []artifactTestEntry{
+		{name: "a/..", typeflag: tar.TypeDir},
+	})
+	if _, err := manager.cacheArtifacts(bytes.NewReader(archive),
+		filepath.Join(directory, "out.tar.gz")); err == nil {
+		t.Fatal("a non-literal root dir name 'a/..' was silently accepted")
+	}
+}
+
+// A raw name longer than the path bound is rejected even when path.Clean
+// collapses it to a short name.
+func TestCacheArtifactsRejectsOverlongRawName(t *testing.T) {
+	directory := t.TempDir()
+	manager := &Manager{
+		artifactsDir: directory,
+		policy: managerPolicy{
+			MaxArtifactFiles:     10,
+			MaxArtifactBytes:     1 << 20,
+			MaxArtifactFileBytes: 1 << 20,
+		},
+	}
+	longName := strings.Repeat("./", 5000) + "realfile" // cleans to "realfile"
+	archive := artifactTestArchive(t, []artifactTestEntry{
+		{name: longName, typeflag: tar.TypeReg, body: "x"},
+	})
+	if _, err := manager.cacheArtifacts(bytes.NewReader(archive),
+		filepath.Join(directory, "out.tar.gz")); err == nil {
+		t.Fatalf("an oversized raw name (%d bytes) was accepted", len(longName))
+	}
+}

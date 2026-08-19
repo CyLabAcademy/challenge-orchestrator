@@ -43,13 +43,16 @@ func safeArchiveName(name string) (string, error) {
 		strings.Contains(name, `\`) {
 		return "", fmt.Errorf("invalid archive path %q", name)
 	}
+	// Bound the archive-supplied name before cleaning; path.Clean can collapse
+	// an arbitrarily long name (e.g. many "./" components) to a short one, so a
+	// post-clean check would not enforce this limit on the raw input.
+	if len(name) > 4096 {
+		return "", fmt.Errorf("archive path is too long: %q", name)
+	}
 	clean := path.Clean(name)
 	if clean == "." || path.IsAbs(clean) || clean == ".." ||
 		strings.HasPrefix(clean, "../") {
 		return "", fmt.Errorf("archive path escapes its root: %q", name)
-	}
-	if len(clean) > 4096 {
-		return "", fmt.Errorf("archive path is too long: %q", name)
 	}
 	return clean, nil
 }
@@ -100,18 +103,21 @@ func (m *Manager) cacheArtifacts(
 		if nextErr != nil {
 			return nil, fmt.Errorf("could not read artifact archive: %w", nextErr)
 		}
-		// `tar -C dir .` emits a "./" root entry. It carries no content, and its
-		// cleaned form is ".", which safeArchiveName treats as an escape, so
-		// skip it rather than failing an otherwise legitimate archive.
-		if header.Typeflag == tar.TypeDir && path.Clean(header.Name) == "." {
-			continue
-		}
 		entryCount++
 		if entryCount > maxFiles {
 			return nil, fmt.Errorf(
 				"artifact archive contains more than %d entries",
 				maxFiles,
 			)
+		}
+		// `tar -C dir .` emits a literal "./" (or ".") root entry that carries
+		// no content. Skip it rather than failing an otherwise legitimate
+		// archive. It is counted above so a flood of root entries cannot evade
+		// maxFiles, and the match is restricted to the conventional root names
+		// so traversal-style names like "a/.." still reach safeArchiveName.
+		if header.Typeflag == tar.TypeDir &&
+			(header.Name == "." || header.Name == "./") {
+			continue
 		}
 		name, err := safeArchiveName(header.Name)
 		if err != nil {

@@ -687,6 +687,11 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 			delete(lookups, "flag")
 		} else if hdr.Name == "challenge/artifacts.tar.gz" {
+			// cacheArtifacts writes atomically, but to the final build-ID path,
+			// so a rebuild replaces the prior archive here before the rest of the
+			// build is validated. Preserving the previous artifact across a failed
+			// rebuild requires staging the whole build and promoting on success,
+			// which is deferred to the staged-build work.
 			artifactsPath := filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename())
 			files, err = m.cacheArtifacts(cTar, artifactsPath)
 			if err != nil {
