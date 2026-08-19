@@ -1,7 +1,10 @@
 # Example seccomp profiles
 
 Starting points for challenges that need a seccomp policy other than cmgr's
-default. Copy one next to your `problem.md`, edit if needed, and reference it:
+default. Copy one next to your `problem.md`, edit if needed, and reference it
+(for a change neither worked example covers, start from `default.json` — a
+pristine copy of the embedded policy — make your edit, and confirm it with
+`profile-diff.py`):
 
 ```yaml
 seccomp:
@@ -101,8 +104,9 @@ profile:  execstack.json
 ```
 
 [`profile-diff.py`](profile-diff.py) compares a profile against cmgr's
-embedded default (auto-located in a cmgr checkout; pass `--baseline`
-otherwise) and prints only what changed, ignoring comments and rule order.
+embedded default (the embedded policy in a cmgr checkout, or the bundled
+[`default.json`](default.json) copy otherwise; `--baseline` overrides both)
+and prints only what changed, ignoring comments and rule order.
 Every `+` line is new attack surface: a clean review is a delta that matches
 what the challenge's `problem.md` says it needs and nothing else. A buried
 `{"names": ["unshare", "setns"], "action": "SCMP_ACT_ALLOW"}` that would be
@@ -147,6 +151,17 @@ directly. "Before" is the embedded default.
 
 For a complete challenge wired up with this profile end to end -- problem.md,
 profile, Makefile, and solver -- see [../execstack/](../execstack/).
+
+### `default.json` — the baseline
+
+A pristine copy of the embedded policy (`cmgr/seccomp.json`), kept
+byte-identical by a test. Selecting it as a challenge's profile just
+reproduces the default; its purpose is to be **copied** when you need a
+change the other examples do not cover: copy it beside your `problem.md`,
+make your edit, and run `profile-diff.py` on the result to confirm the delta
+says exactly what you intended — and nothing else. It is also the baseline
+`profile-diff.py` falls back to when the examples are used outside a cmgr
+checkout.
 
 ### `execstack.json` — widen
 

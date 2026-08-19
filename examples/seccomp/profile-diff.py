@@ -120,9 +120,13 @@ def describe(context_json):
 
 
 def find_default_baseline():
+    # The embedded policy from a cmgr checkout is authoritative; default.json
+    # beside this script is its test-enforced identical copy, shipped with the
+    # examples so the tool also works outside a checkout.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(script_dir, "..", "..", "cmgr", "seccomp.json"),
+        os.path.join(script_dir, "default.json"),
         os.path.join(os.getcwd(), "cmgr", "seccomp.json"),
     ]
     for candidate in candidates:

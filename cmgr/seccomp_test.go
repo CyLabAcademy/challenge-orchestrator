@@ -264,8 +264,17 @@ func TestExampleProfilesAreValid(t *testing.T) {
 				if options.effectiveProfile == "" || options.ProfileHash == "" {
 					t.Fatal("example profile resolved to an empty policy")
 				}
-				// Each example is the embedded policy plus a delta, so it should
-				// differ from it while remaining recognizably the same shape.
+				// default.json is the pristine baseline authors copy to make
+				// their own edits (and profile-diff.py's fallback baseline
+				// outside a cmgr checkout), so it must track the embedded
+				// policy exactly. Every other example is the embedded policy
+				// plus a delta, so it must differ.
+				if entry.Name() == "default.json" {
+					if options.effectiveProfile != seccompPolicy {
+						t.Fatal("examples/seccomp/default.json has drifted from the embedded cmgr/seccomp.json")
+					}
+					return
+				}
 				if options.effectiveProfile == seccompPolicy {
 					t.Fatal("example profile is identical to the embedded policy")
 				}
