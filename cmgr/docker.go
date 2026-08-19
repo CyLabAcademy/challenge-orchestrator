@@ -988,8 +988,19 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			if hasContainerOpts && cOpts.CapImmutable {
 				hConfig.CapAdd = append(hConfig.CapAdd, "LINUX_IMMUTABLE")
 			}
-			m.log.debug("inserting custom seccomp profile")
-			hConfig.SecurityOpt = append(hConfig.SecurityOpt, "seccomp:"+seccompPolicy)
+			profile := seccompPolicy
+			if hasContainerOpts && cOpts.Seccomp != nil &&
+				cOpts.Seccomp.effectiveProfile != "" {
+				profile = cOpts.Seccomp.effectiveProfile
+				m.log.debugf(
+					"inserting challenge seccomp profile %s (%s)",
+					cOpts.Seccomp.Profile,
+					cOpts.Seccomp.ProfileHash,
+				)
+			} else {
+				m.log.debug("inserting custom seccomp profile")
+			}
+			hConfig.SecurityOpt = append(hConfig.SecurityOpt, "seccomp:"+profile)
 		}
 
 		nConfig := network.NetworkingConfig{

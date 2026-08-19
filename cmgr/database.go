@@ -178,6 +178,7 @@ const schemaQuery string = `
 		diskquota TEXT NOT NULL,
 		cgroupparent TEXT NOT NULL,
 		capimmutable INTEGER NOT NULL CHECK(capimmutable == 0 OR capimmutable == 1) DEFAULT 0,
+		seccomp TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (challenge) REFERENCES challenges (id)
 			ON UPDATE CASCADE ON DELETE CASCADE
 	);
@@ -235,6 +236,23 @@ func (m *Manager) initDatabase() error {
 		_, err = db.Exec("ALTER TABLE containerOptions ADD COLUMN capimmutable INTEGER NOT NULL DEFAULT 0;")
 		if err != nil {
 			m.log.errorf("could not migrate containerOptions.capimmutable column: %s", err)
+			return err
+		}
+	}
+
+	// Migrate older DBs: add seccomp, the per-challenge seccomp policy. The
+	// empty default preserves existing behavior, where every challenge receives
+	// cmgr's embedded policy.
+	var seccompColumnCount int
+	err = db.QueryRow("SELECT COUNT(1) FROM pragma_table_info('containerOptions') WHERE name='seccomp';").Scan(&seccompColumnCount)
+	if err != nil {
+		m.log.errorf("could not inspect containerOptions schema: %s", err)
+		return err
+	}
+	if seccompColumnCount == 0 {
+		_, err = db.Exec("ALTER TABLE containerOptions ADD COLUMN seccomp TEXT NOT NULL DEFAULT '';")
+		if err != nil {
+			m.log.errorf("could not migrate containerOptions.seccomp column: %s", err)
 			return err
 		}
 	}
