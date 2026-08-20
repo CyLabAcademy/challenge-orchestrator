@@ -335,6 +335,13 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 			hostStr = fmt.Sprintf("host %s: ", host)
 		}
 
+		if opts.Seccomp != nil {
+			if err := opts.Seccomp.resolve(md.Path); err != nil {
+				lastErr = fmt.Errorf("%s%s", hostStr, err)
+				m.log.error(lastErr)
+			}
+		}
+
 		if opts.Cpus != "" {
 			_, err := parseNanoCPUs(opts.Cpus)
 			if err != nil {
