@@ -35,12 +35,19 @@ These instructions relate to manual setup and should be replaced with ansible/te
 
 ### Keygen
 
-Generate the keys using gen-docker-certs.sh. Make sure the zot IP is correct before running. You will receive several sets of keys:
+Generate the keys using gen-docker-certs.sh. Make sure the zot IP is correct before running. It mints **two CAs** and five leaf certs, splitting trust into two domains so a leak in one cannot forge into the other (a stolen worker registry cert can read zot but cannot control any worker's dockerd).
 
-- cork client certs -> Used by the orchestrator to talk to zot(registry) and the workers. Note: Has full admin control over the zot registry.
-- worker server certs -> Used by the workers to receive orchestrator commands and allow them to be manipulated by the orchestrator
-- worker client certs -> Used by the workers to pull images from the registry
-- zot server certs -> Used by zot to identify and authorize clients and assign them permissions
+Every file is named `<domain>-<role>-<kind>.pem`, where `domain` is `docker` or `zot`, `role` is `ca`/`server`/`client`/`worker`, and `kind` is `cert` or `key` (a CA is `<domain>-ca-cert` / `<domain>-ca-key`):
+
+- **docker** — the mTLS domain between cork and the worker dockerds. `docker-ca` signs:
+  - `docker-server-{cert,key}` — worker dockerd server cert (shared, SAN `academy-docker-worker`) -> workers present this to cork
+  - `docker-client-{cert,key}` — cork's client cert (`CN=cmgr`) -> cork presents this to workers
+- **zot** — the mTLS domain between registry clients and zot. `zot-ca` signs:
+  - `zot-server-{cert,key}` — zot server cert -> zot presents this to clients
+  - `zot-client-{cert,key}` — cork's client cert (`CN=cmgr`) -> orchestrator push + cork delete (read-write on zot)
+  - `zot-worker-{cert,key}` — worker registry client cert (`CN=worker`, shared) -> workers pull (read-only on zot)
+
+Both CA private keys (`docker-ca-key.pem`, `zot-ca-key.pem`) stay offline and are deployed to no box. The `cmgr` identity is two certs — `docker-client` and `zot-client`, one signed by each CA — because it acts in both domains; they deploy to different directories and are not interchangeable.
 
 ### Orchestrator
 
@@ -48,20 +55,21 @@ Generate the keys using gen-docker-certs.sh. Make sure the zot IP is correct bef
 2. Install docker on the server. Required to build images. https://docs.docker.com/engine/install/ubuntu/
 3. Install docker-reaper onto the server. This prevents stale containers and unused images from accumulating. https://github.com/picoCTF/docker-reaper. If you don't mind the orchestrator's local docker daemon, which is only used for building, being filled with build artifacts, then this can step can be skipped.
 4. Configure cork's environment variables
-5. Move the certificates over
-  ┌──────────┬───────────────────────────────────────┬─────────────┐
-  │   file   │ $DOCKER_CERT_PATH (/opt/docker-certs) │   CERTS.D   │
-  ├──────────┼───────────────────────────────────────┼─────────────┤
-  │ ca.pem   │ ca.pem                                │ ca.crt      │
-  ├──────────┼───────────────────────────────────────┼─────────────┤
-  │ cert.pem │ cert.pem                              │ client.cert │
-  ├──────────┼───────────────────────────────────────┼─────────────┤
-  │ key.pem  │ key.pem                               │ client.key  │
-  └──────────┴───────────────────────────────────────┴─────────────┘
-  
+5. Move the certificates over. The orchestrator holds two cert sets from different CAs: the **docker-ca** set (authenticates cork to the workers) in `$DOCKER_CERT_PATH`, and the **zot-ca** set (authenticates cork to the registry) in CERTS.D.
+  ┌────────────────────────┬────────────────────────────────────┐
+  │       bundle file      │             destination            │
+  ├────────────────────────┼────────────────────────────────────┤
+  │ docker-ca-cert.pem     │ $DOCKER_CERT_PATH/ca.pem           │
+  │ docker-client-cert.pem │ $DOCKER_CERT_PATH/cert.pem         │
+  │ docker-client-key.pem  │ $DOCKER_CERT_PATH/key.pem          │
+  │ zot-ca-cert.pem        │ CERTS.D/ca.crt                     │
+  │ zot-client-cert.pem    │ CERTS.D/client.cert                │
+  │ zot-client-key.pem     │ CERTS.D/client.key                 │
+  └────────────────────────┴────────────────────────────────────┘
+
   CERTS.D = /etc/docker/certs.d/<ZOT_IP:ZOT_PORT>
 
-Note that the same certificates are located in two different areas due to their different roles. One targets the workers, the other targets the registry
+The two sets have different trust roots and are not interchangeable: the `$DOCKER_CERT_PATH` set chains to docker-ca (workers), the CERTS.D set chains to zot-ca (registry). cork reads them independently (`workers.go` vs `registry.go`), so no code change is needed — the split is entirely in which CA's files land at each path.
   
 6. Pull the challenges repository (or any other repository holding challenges in cmgr's format)
 7. Add challenges that cork will serve either manually or using a schema file
@@ -74,27 +82,24 @@ Note that the same certificates are located in two different areas due to their 
 3. Install docker-reaper onto the server. This prevents stale containers and unused images from accumulating. https://github.com/picoCTF/docker-reaper
 4. Copy over config-examples/worker/daemon.json -> /etc/docker/daemon.json. Make sure the values are correct
 5. Copy over config-examples/worker/override.conf -> /etc/systemd/system/docker.service.d/override.conf. This fixes an issue where -H is used for both a file descriptor and in daemon.json. The FD is no longer necessary since we're binding to a tcp port anyways
-6. Copy over the relevant certificates
+6. Copy over the relevant certificates. The worker's dockerd uses the **docker-ca** set; its registry pull uses the **zot-ca** set.
 
-  ┌─────────────────┬──────────────────────────┬─────────────┐
-  │      file       │        DOCKER CERTS      │   CERTS.D   │
-  ├─────────────────┼──────────────────────────┼─────────────┤
-  │ ca.pem          │ ca.pem                   │ ca.crt      │
-  ├─────────────────┼──────────────────────────┼─────────────┤
-  │ server-cert.pem │ server-cert.pem          │ —           │
-  ├─────────────────┼──────────────────────────┼─────────────┤
-  │ server-key.pem  │ server-key.pem           │ —           │
-  ├─────────────────┼──────────────────────────┼─────────────┤
-  │ worker-cert.pem │ —                        │ client.cert │
-  ├─────────────────┼──────────────────────────┼─────────────┤
-  │ worker-key.pem  │ —                        │ client.key  │
-  └─────────────────┴──────────────────────────┴─────────────┘
-DOCKER CERTS location is defined by daemon.json, by default its /opt/docker-certs
+  ┌────────────────────────┬──────────────────────────────────┐
+  │       bundle file      │            destination           │
+  ├────────────────────────┼──────────────────────────────────┤
+  │ docker-ca-cert.pem     │ dockerd --tlscacert              │
+  │ docker-server-cert.pem │ dockerd --tlscert                │
+  │ docker-server-key.pem  │ dockerd --tlskey                 │
+  │ zot-ca-cert.pem        │ CERTS.D/ca.crt                   │
+  │ zot-worker-cert.pem    │ CERTS.D/client.cert              │
+  │ zot-worker-key.pem     │ CERTS.D/client.key               │
+  └────────────────────────┴──────────────────────────────────┘
+DOCKER CERTS location (dockerd --tlscacert/--tlscert/--tlskey) is defined by daemon.json, by default /root/.docker_certs
 CERTS.D location depends on the IP and Port of the registry from the perspective of the worker
-CERTS.D = /etc/docker/certs.d/<ZOT_IP/:ZOT_PORT>
+CERTS.D = /etc/docker/certs.d/<ZOT_IP:ZOT_PORT>
 
-server cert is SHARED across workers (signed against ServerName)
-workers NEVER get cert.pem/key.pem (that's registry write)
+server cert is SHARED across workers (signed against ServerName, by docker-ca)
+workers NEVER get a cmgr cert of either CA (that's the orchestrator's identity)
 
 ### Registry
 
@@ -104,15 +109,18 @@ workers NEVER get cert.pem/key.pem (that's registry write)
 4. Transfer the certificates over appropriately
 
   REGISTRY BOX — zot (server identity only; holds no client cert)
-  ┌──────────────┬────────────────────────────────────────────────┐
-  │     file     │                  destination                   │
-  ├──────────────┼────────────────────────────────────────────────┤
-  │ ca.pem       │ /etc/zot/ca.pem            (http.tls.cacert)   │
-  ├──────────────┼────────────────────────────────────────────────┤
-  │ zot-cert.pem │ /etc/zot/zot-cert.pem      (http.tls.cert)     │
-  ├──────────────┼────────────────────────────────────────────────┤
-  │ zot-key.pem  │ /etc/zot/zot-key.pem                           │
-  └──────────────┴────────────────────────────────────────────────┘
+  ┌─────────────────────┬───────────────────────────────────────────────────┐
+  │     bundle file     │                    destination                    │
+  ├─────────────────────┼───────────────────────────────────────────────────┤
+  │ zot-ca-cert.pem     │ /etc/zot/zot-ca-cert.pem       (http.tls.cacert)  │
+  ├─────────────────────┼───────────────────────────────────────────────────┤
+  │ zot-server-cert.pem │ /etc/zot/zot-server-cert.pem   (http.tls.cert)    │
+  ├─────────────────────┼───────────────────────────────────────────────────┤
+  │ zot-server-key.pem  │ /etc/zot/zot-server-key.pem                       │
+  └─────────────────────┴───────────────────────────────────────────────────┘
+  zot trusts ONLY zot-ca — place the zot CA (not the docker CA) at http.tls.cacert.
+  Note: zot-server-key.pem is delivered to the service via systemd `LoadCredential`
+  in zot.service, so config.json reads it from /run/credentials/zot.service/.
 
 
 ## Configuration/Usage
@@ -201,7 +209,7 @@ If you would like to run your challenges manually, use the start and stop comman
 | CMGR_REGISTRY_CERT_DIR   | Location of certificates used to communicate with registry                                                                         | /etc/docker/certs.d/\<registry\>                                         |
 | DOCKER_HOST              | Location of the LOCAL docker daemon                                                                                                | unset. Defaults to local daemon. Does not need modification              |
 | DOCKER_API_VERSION       | API version use                                                                                                                    | Automatically set, does not need modification                            |
-| DOCKER_CERT_PATH         | Used to set the location for client certs to worker                                                                                | Expects /opt/docker-certs by default, but any directory can work. unset. |
+| DOCKER_CERT_PATH         | Used to set the location for client certs to worker                                                                                | Expects /root/.docker_certs by default, but any directory can work. unset. |
 
 
 ## Issues/Improvements/Quirks

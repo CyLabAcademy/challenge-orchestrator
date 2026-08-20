@@ -8,9 +8,9 @@
     "port": "",
     "compat": ["docker2s2"],
     "tls": {
-      "cert": "/etc/zot/zot-cert.pem",
-      "key": "/run/credentials/zot.service/zot-key.pem",
-      "cacert": "/etc/zot/ca.pem"
+      "cert": "/etc/zot/zot-server-cert.pem",
+      "key": "/run/credentials/zot.service/zot-server-key.pem",
+      "cacert": "/etc/zot/zot-ca-cert.pem"
     },
     "auth": {
       "mtls": {

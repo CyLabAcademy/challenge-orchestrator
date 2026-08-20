@@ -22,7 +22,7 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 LockPersonality=yes
-LoadCredential=zot-key.pem:/etc/zot/zot-key.pem
+LoadCredential=zot-server-key.pem:/etc/zot/zot-server-key.pem
 
 [Install]
 WantedBy=multi-user.target
