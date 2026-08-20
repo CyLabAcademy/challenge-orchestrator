@@ -5,6 +5,9 @@ on:
 
 name: Upload Release Asset
 
+permissions:
+  contents: write
+
 jobs:
   create-release:
     name: Create Release
@@ -84,4 +87,3 @@ jobs:
           asset_path: ./bin/cmgr.tar.gz
           asset_name: cmgr_${{ steps.suffix.outputs.arch_suffix }}.tar.gz
           asset_content_type: application/octet-stream
-
