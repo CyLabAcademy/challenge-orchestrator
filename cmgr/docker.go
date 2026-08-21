@@ -759,6 +759,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	var hdr *tar.Header
 	var lookups map[string]string
 	var files []string
+	var stagedArtifactsPath string
 	var flag string
 	for hdr, err = cTar.Next(); err == nil; hdr, err = cTar.Next() {
 		m.log.debugf("found in tar: %s", hdr.Name)
@@ -786,13 +787,14 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 			delete(lookups, "flag")
 		} else if hdr.Name == "challenge/artifacts.tar.gz" {
-			// cacheArtifacts writes atomically, but to the final build-ID path,
-			// so a rebuild replaces the prior archive here before the rest of the
-			// build is validated. Preserving the previous artifact across a failed
-			// rebuild requires staging the whole build and promoting on success,
-			// which is deferred to the staged-build work.
-			artifactsPath := filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename())
-			files, err = m.cacheArtifacts(cTar, artifactsPath)
+			// Stage the new archive beside the final build-ID path and only
+			// promote it after validateBuild passes: a failed rebuild must leave
+			// the previous archive in place, because cmgrd keeps serving it (the
+			// build row is rolled back, not removed) and deleting it would turn
+			// every player download into a 500. The dot-prefixed name can never
+			// collide with a served "<id>.tar.gz" path.
+			stagedArtifactsPath = filepath.Join(m.artifactsDir, "."+bMeta.getArtifactsFilename()+".staged")
+			files, err = m.cacheArtifacts(cTar, stagedArtifactsPath)
 			if err != nil {
 				m.log.errorf("could not cache artifacts: %s", err)
 				return err
@@ -820,8 +822,23 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	bMeta.HasArtifacts = len(files) > 0
 
 	err = m.validateBuild(cMeta, bMeta, files)
+	if err == nil && stagedArtifactsPath != "" {
+		// Promote the validated archive into place; rename is atomic, so
+		// concurrent downloads see either the old or the new archive, never a
+		// partial one. The directory sync persists the swap across a crash.
+		finalArtifactsPath := filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename())
+		err = os.Rename(stagedArtifactsPath, finalArtifactsPath)
+		if err != nil {
+			m.log.errorf("could not promote artifact archive: %s", err)
+		} else if directory, dirErr := os.Open(m.artifactsDir); dirErr == nil {
+			_ = directory.Sync()
+			_ = directory.Close()
+		}
+	}
 	if err != nil {
-		os.Remove(filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename()))
+		if stagedArtifactsPath != "" {
+			os.Remove(stagedArtifactsPath)
+		}
 
 		// Free the build image now rather than waiting for the deferred
 		// container cleanup: while the extraction container exists it references

@@ -44,6 +44,21 @@ func (m *Manager) loadChallenge(path string, info os.FileInfo) (*ChallengeMetada
 		md.ChallengeOptions.Overrides = make(map[string]ContainerOptions)
 	}
 	md.ChallengeOptions.Overrides[""] = md.ChallengeOptions.ContainerOptions
+
+	// Canonicalize an empty seccomp block (e.g. "seccomp: {}") to nil: the DB
+	// round trip persists it as the empty string and loads it back as nil
+	// (marshalSeccompOptions/unmarshalSeccompOptions), so leaving a non-nil
+	// empty struct here would make safeToRefresh's DeepEqual fail forever and
+	// escalate every metadata-only edit into a full rebuild.
+	if md.ChallengeOptions.ContainerOptions.Seccomp != nil && md.ChallengeOptions.ContainerOptions.Seccomp.Profile == "" {
+		md.ChallengeOptions.ContainerOptions.Seccomp = nil
+	}
+	for host, opts := range md.ChallengeOptions.Overrides {
+		if opts.Seccomp != nil && opts.Seccomp.Profile == "" {
+			opts.Seccomp = nil
+			md.ChallengeOptions.Overrides[host] = opts
+		}
+	}
 	m.log.debugf("challenge options: %#v", md.ChallengeOptions)
 
 	err = m.processDockerfile(md)

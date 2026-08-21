@@ -116,7 +116,17 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 		metadataChanged := curr.MetadataChecksum != newMeta.MetadataChecksum
 		solvescriptChanged := curr.SolveScript != newMeta.SolveScript
 		if !sourceChanged && !metadataChanged && !solvescriptChanged {
-			cu.Unmodified = append(cu.Unmodified, curr)
+			if m.safeToRefresh(newMeta) {
+				cu.Unmodified = append(cu.Unmodified, curr)
+			} else {
+				// The checksums are unchanged but the persisted options disagree
+				// with what the current loader parses — e.g. a challenge that
+				// declared a seccomp profile before the binary understood the
+				// option, or a corrupt options row. Re-persist through the
+				// refresh path (no rebuild) so the declared options take effect.
+				m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
+				cu.Refreshed = append(cu.Refreshed, newMeta)
+			}
 		} else if !sourceChanged && m.safeToRefresh(newMeta) {
 			m.log.debugf("Marking %s as refresh", newMeta.Id)
 			cu.Refreshed = append(cu.Refreshed, newMeta)
