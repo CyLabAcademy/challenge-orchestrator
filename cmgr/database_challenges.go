@@ -119,7 +119,7 @@ func (m *Manager) lookupChallengeMetadata(challenge ChallengeId) (*ChallengeMeta
 
 	containerOptions := new([]dbContainerOptions)
 	if err == nil {
-		err = txn.Select(containerOptions, "SELECT host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable FROM containerOptions WHERE challenge=?", challenge)
+		err = txn.Select(containerOptions, "SELECT host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable, seccomp FROM containerOptions WHERE challenge=?", challenge)
 	}
 	for _, dbOpts := range *containerOptions {
 		cOpts, err := newFromDbContainerOptions(dbOpts)
@@ -304,7 +304,7 @@ func (m *Manager) addChallenges(addedChallenges []*ChallengeMetadata) []error {
 				break
 			}
 			m.log.debugf("%s%s: %v", metadata.Id, host_str, dbOpts)
-			_, err = txn.Exec("INSERT INTO containerOptions(challenge, host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+			_, err = txn.Exec("INSERT INTO containerOptions(challenge, host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable, seccomp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
 				metadata.Id,
 				host,
 				dbOpts.Init,
@@ -317,7 +317,8 @@ func (m *Manager) addChallenges(addedChallenges []*ChallengeMetadata) []error {
 				dbOpts.NoNewPrivileges,
 				dbOpts.DiskQuota,
 				dbOpts.CgroupParent,
-				dbOpts.CapImmutable)
+				dbOpts.CapImmutable,
+				dbOpts.Seccomp)
 			if err != nil {
 				m.log.error(err)
 				err = txn.Rollback()
@@ -591,7 +592,7 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 				}
 				break
 			}
-			_, err = txn.Exec("INSERT INTO containerOptions(challenge, host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+			_, err = txn.Exec("INSERT INTO containerOptions(challenge, host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable, seccomp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
 				metadata.Id,
 				host,
 				dbOpts.Init,
@@ -604,7 +605,8 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 				dbOpts.NoNewPrivileges,
 				dbOpts.DiskQuota,
 				dbOpts.CgroupParent,
-				dbOpts.CapImmutable)
+				dbOpts.CapImmutable,
+				dbOpts.Seccomp)
 			if err != nil {
 				m.log.error(err)
 				err = txn.Rollback()
@@ -801,6 +803,7 @@ type dbContainerOptions struct {
 	DiskQuota       string
 	CgroupParent    string
 	CapImmutable    bool
+	Seccomp         string
 }
 
 func newFromDbContainerOptions(dbOpts dbContainerOptions) (ContainerOptions, error) {
@@ -836,6 +839,11 @@ func newFromDbContainerOptions(dbOpts dbContainerOptions) (ContainerOptions, err
 
 	cOpts.CgroupParent = dbOpts.CgroupParent
 	cOpts.CapImmutable = dbOpts.CapImmutable
+
+	cOpts.Seccomp, err = unmarshalSeccompOptions(dbOpts.Seccomp)
+	if err != nil {
+		return cOpts, err
+	}
 
 	return cOpts, nil
 }
@@ -873,6 +881,11 @@ func (cOpts ContainerOptions) toDbContainerOptions() (dbContainerOptions, error)
 
 	dbOpts.CgroupParent = cOpts.CgroupParent
 	dbOpts.CapImmutable = cOpts.CapImmutable
+
+	dbOpts.Seccomp, err = marshalSeccompOptions(cOpts.Seccomp)
+	if err != nil {
+		return dbOpts, err
+	}
 
 	return dbOpts, nil
 }

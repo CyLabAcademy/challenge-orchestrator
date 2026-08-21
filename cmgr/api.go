@@ -33,6 +33,11 @@ func NewManager(logLevel LogLevel) *Manager {
 
 	mgr.log.infof("version: %s", Version())
 
+	if err := mgr.initPolicy(); err != nil {
+		mgr.log.error(err)
+		return nil
+	}
+
 	if err := mgr.setDirectories(); err != nil {
 		return nil
 	}

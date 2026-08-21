@@ -19,8 +19,8 @@ import (
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	goldmarktext "github.com/yuin/goldmark/text"
+	"go.yaml.in/yaml/v3"
 	"golang.org/x/net/html"
-	"gopkg.in/yaml.v2"
 )
 
 var (
