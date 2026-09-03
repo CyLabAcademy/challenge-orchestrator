@@ -79,6 +79,8 @@ func main() {
 		exitCode = workerAddCommand(c, cmdArgs)
 	case "worker-remove":
 		exitCode = workerRemoveCommand(c, cmdArgs)
+	case "worker-down":
+		exitCode = workerDownCommand(c, cmdArgs)
 	case "worker-list":
 		exitCode = workerListCommand(c, cmdArgs)
 	case "artifacts":
@@ -139,6 +141,8 @@ Workers:
       optional public address is what players are given for its instances
   worker-remove <ip>
       purge the worker and all of its instance records
+  worker-down <ip>
+      mark the worker down, taking it out of placement but keeping its records
   worker-list
 
 Other:

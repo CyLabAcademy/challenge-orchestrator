@@ -277,6 +277,25 @@ func (m *Manager) noteWorkerTransportError(worker string, err error) {
 	m.setWorkerHealth(w, workerDown)
 }
 
+// SetWorkerDown marks a worker down administratively, taking it out of
+// placement without touching its registry entry or instance records (unlike
+// RemoveWorker, which purges both). Intended for a box that is about to be
+// terminated: down is sticky — the poller treats it as terminal — so recovery
+// is AddWorker on the same IP, which rebuilds the connection and poller.
+//
+// Note this also switches that worker's instances to the DB-only stop path
+// (see stopInstance): their containers are no longer torn down over docker.
+func (m *Manager) SetWorkerDown(ip string) error {
+	m.workersMu.RLock()
+	w, ok := m.workers[ip]
+	m.workersMu.RUnlock()
+	if !ok {
+		return &UnknownIdentifierError{Type: "worker", Name: ip}
+	}
+	m.setWorkerHealth(w, workerDown)
+	return nil
+}
+
 // isTransportError reports whether err is a connection-level failure —
 // timeout, refused/reset connection, DNS — rather than a docker API error.
 // Detection is positive-only: transport failures from the HTTP client surface
