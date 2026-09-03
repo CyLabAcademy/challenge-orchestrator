@@ -134,7 +134,7 @@ HTTP API:
   GET /version reports the server version.
 
 Workers:
-  When docker workers are configured (POST/DELETE/GET on /workers or
+  When docker workers are configured (GET/POST/PATCH/DELETE on /workers or
   cmgrd-cli worker-*), new instances are placed on them round robin,
   skipping overloaded and down workers; with none configured, cmgrd behaves
   as a single-host daemon using DOCKER_HOST. Worker connections use the TLS
@@ -142,9 +142,9 @@ Workers:
   'academy-docker-worker' (the shared worker certificate), dockerd on port
   2376, and the telemetry agent on port 2136.
 
-  A worker goes down (sticky) after 30s of telemetry silence or a single
-  hung/refused docker control call; recovery is re-adding it (POST /workers
-  or cmgrd-cli worker-add). Stops for instances on a down worker clear the
+  A worker goes down (sticky) after 30s of telemetry silence, a single
+  hung/refused docker control call, or a PATCH of {"health": "down"};
+  recovery is re-adding it (POST /workers or cmgrd-cli worker-add). Stops for instances on a down worker clear the
   records and return success without touching docker. DELETE on /workers
   purges the worker and all of its instance records.
 

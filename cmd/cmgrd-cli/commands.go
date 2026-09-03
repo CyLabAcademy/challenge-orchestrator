@@ -388,6 +388,18 @@ func workerRemoveCommand(c *client, args []string) int {
 	return NO_ERROR
 }
 
+func workerDownCommand(c *client, args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: worker-down <ip>")
+		return USAGE_ERROR
+	}
+	body := map[string]string{"health": "down"}
+	if err := c.doJSON("PATCH", "/workers/"+url.PathEscape(args[0]), body, nil); err != nil {
+		return runtimeError(err)
+	}
+	return NO_ERROR
+}
+
 func workerListCommand(c *client, args []string) int {
 	var workers []WorkerInfo
 	if err := c.doJSON("GET", "/workers", nil, &workers); err != nil {

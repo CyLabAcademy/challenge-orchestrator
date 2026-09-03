@@ -53,11 +53,19 @@ func (s state) workersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// workerHandler serves one worker: DELETE /workers/<ip> purges it — the
+// WorkerUpdateRequest is the body of PATCH /workers/<ip>. Only "down" may be
+// set; the other health states are telemetry-derived.
+type WorkerUpdateRequest struct {
+	Health string `json:"health"`
+}
+
+// workerHandler serves one worker. DELETE /workers/<ip> purges it — the
 // registry entry and all of its instance records are deleted; containers
 // still running on a live worker are left for docker-reaper/manual cleanup.
+// PATCH /workers/<ip> with {"health": "down"} takes it out of placement while
+// keeping both, for a box that is about to be terminated.
 func (s state) workerHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "DELETE" {
+	if r.Method != "DELETE" && r.Method != "PATCH" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -68,7 +76,25 @@ func (s state) workerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.mgr.RemoveWorker(ip); err != nil {
+	var err error
+	if r.Method == "PATCH" {
+		var req WorkerUpdateRequest
+		if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("invalid request body: " + decodeErr.Error()))
+			return
+		}
+		if req.Health != "down" {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`only "down" may be set manually; recover a worker with POST /workers`))
+			return
+		}
+		err = s.mgr.SetWorkerDown(ip)
+	} else {
+		err = s.mgr.RemoveWorker(ip)
+	}
+
+	if err != nil {
 		code := http.StatusInternalServerError
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			code = http.StatusNotFound
