@@ -712,11 +712,19 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 							}
 							continue
 						}
+						// stopContainers releases the port assignments; the
+						// restart below reclaims them (same numbers when free)
+						// so the instance keeps its address across the rebuild.
+						var previousPorts map[string]int
 						if err == nil {
+							previousPorts = instance.Ports
 							err = m.stopContainers(instance)
 						}
 						if err == nil {
 							err = m.stopNetwork(instance)
+						}
+						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
+							err = m.reassignPorts(build, instance, revPortMap, previousPorts)
 						}
 						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
 							err = m.startNetwork(instance, cMeta.ChallengeOptions.NetworkOptions)

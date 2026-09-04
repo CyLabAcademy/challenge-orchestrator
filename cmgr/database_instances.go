@@ -41,21 +41,11 @@ func (m *Manager) reservePort(instance InstanceId, worker string, name string) (
 			return 0, fmt.Errorf("All ports between %d and %d are in use", m.portLow, m.portHigh)
 		}
 
-		// Atomic claim: INSERT ... SELECT ... WHERE NOT EXISTS
-		query := `INSERT INTO portAssignments(instance, name, port, worker)
-                  SELECT ?, ?, ?, ?
-                  WHERE NOT EXISTS (SELECT 1 FROM portAssignments WHERE port = ? AND worker = ?);`
-		res, err := m.db.Exec(query, instance, name, candidate, worker, candidate, worker)
+		claimed, err := m.claimPort(instance, worker, name, candidate)
 		if err != nil {
 			return 0, err
 		}
-
-		rowsAffected, err := res.RowsAffected()
-		if err != nil {
-			return 0, err
-		}
-
-		if rowsAffected == 1 {
+		if claimed {
 			return candidate, nil
 		}
 		// Collision — mark this port as used in the local bitset and retry
@@ -64,6 +54,66 @@ func (m *Manager) reservePort(instance InstanceId, worker string, name string) (
 	}
 
 	return 0, fmt.Errorf("failed to reserve a port after 50 attempts due to high contention")
+}
+
+// claimPort records the given host port for the instance on its worker if
+// nobody else holds it there. The INSERT ... WHERE NOT EXISTS is the atomic
+// check-and-claim reservePort relies on under concurrent launches.
+func (m *Manager) claimPort(instance InstanceId, worker string, name string, port int) (bool, error) {
+	query := `INSERT INTO portAssignments(instance, name, port, worker)
+              SELECT ?, ?, ?, ?
+              WHERE NOT EXISTS (SELECT 1 FROM portAssignments WHERE port = ? AND worker = ?);`
+	res, err := m.db.Exec(query, instance, name, port, worker, port, worker)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected == 1, nil
+}
+
+// reassignPorts reserves the published ports of an instance that is being
+// restarted in place (the rebuild path). stopContainers releases the previous
+// assignments along with the container records, and startContainers takes
+// the host port from instance.Ports; without a fresh reservation a restart
+// with CMGR_PORTS set would hand docker port 0, land on an ephemeral port
+// outside the range, and record no port at all (finalizeInstance persists
+// read-back ports only when no range is configured). Each port first tries
+// the number it had, so players keep the address they were given, and falls
+// back to a new reservation if a concurrent launch took it. No-op without a
+// port range: docker assigns the ports and the read-back records them.
+func (m *Manager) reassignPorts(build *BuildMetadata, instance *InstanceMetadata, revPortMap map[string]string, previous map[string]int) error {
+	if m.portLow == 0 {
+		return nil
+	}
+	instance.Ports = make(map[string]int)
+	for _, image := range build.Images {
+		if image.Host == "builder" {
+			continue
+		}
+		for _, portStr := range image.Ports {
+			name := revPortMap[portStr]
+			if prev, ok := previous[name]; ok && prev != 0 {
+				claimed, err := m.claimPort(instance.Id, instance.Worker, name, prev)
+				if err != nil {
+					return err
+				}
+				if claimed {
+					instance.Ports[name] = prev
+					continue
+				}
+				m.log.warnf("port %d of instance %d was taken during its restart; assigning a new one", prev, instance.Id)
+			}
+			port, err := m.reservePort(instance.Id, instance.Worker, name)
+			if err != nil {
+				return err
+			}
+			instance.Ports[name] = port
+		}
+	}
+	return nil
 }
 
 func (m *Manager) openInstance(meta *InstanceMetadata) error {

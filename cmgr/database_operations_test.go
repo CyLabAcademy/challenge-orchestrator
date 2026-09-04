@@ -1856,3 +1856,91 @@ func TestInitDatabaseRepairsStaleIsFinalizedDefault(t *testing.T) {
 		t.Errorf("expected new instance to default to is_finalized=0, got %d", fresh)
 	}
 }
+
+// TestReassignPortsKeepsAddressAcrossRestart covers the rebuild path with a
+// port range configured: after stopContainers released an instance's ports,
+// reassignPorts must claim them again (the same numbers while free, a fresh
+// one from the range otherwise) and persist them, so the restarted containers
+// bind inside CMGR_PORTS and the API keeps reporting the port.
+func TestReassignPortsKeepsAddressAcrossRestart(t *testing.T) {
+	mgr := setupTestManager(t)
+	defer mgr.db.Close()
+	mgr.portLow = 30000
+	mgr.portHigh = 30010
+
+	challenge := &ChallengeMetadata{
+		Id: "test/restart", Name: "Restart", Namespace: "t", ChallengeType: "custom", Description: "d", Path: "/t/p",
+		Hosts:            []HostInfo{{Name: "challenge"}},
+		PortMap:          map[string]PortInfo{"http": {Host: "challenge", Port: 8000}},
+		ChallengeOptions: ChallengeOptions{Overrides: map[string]ContainerOptions{"": {}}},
+	}
+	if errs := mgr.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
+		t.Fatalf("failed to add challenge: %v", errs)
+	}
+	build := &BuildMetadata{Seed: 1, Format: "flag{%s}", Challenge: challenge.Id, Schema: "s", InstanceCount: 1}
+	if err := mgr.openBuild(build); err != nil {
+		t.Fatalf("failed to open build: %v", err)
+	}
+	build.Images = []Image{{Host: "challenge", Ports: []string{"8000/tcp"}}}
+	revPortMap := map[string]string{"8000/tcp": "http"}
+
+	instance := &InstanceMetadata{Build: build.Id, Worker: "10.0.0.1", Ports: map[string]int{}}
+	if err := mgr.openInstance(instance); err != nil {
+		t.Fatalf("failed to open instance: %v", err)
+	}
+	port, err := mgr.reservePort(instance.Id, instance.Worker, "http")
+	if err != nil {
+		t.Fatalf("failed to reserve the initial port: %v", err)
+	}
+	instance.Ports["http"] = port
+
+	// The rebuild path: containers (and with them the port rows) go away,
+	// then the instance is restarted in place.
+	previous := instance.Ports
+	if err := mgr.removeContainersMetadata(instance); err != nil {
+		t.Fatalf("failed to release container metadata: %v", err)
+	}
+	if len(instance.Ports) != 0 {
+		t.Fatalf("expected the ports to be released, got %v", instance.Ports)
+	}
+	if err := mgr.reassignPorts(build, instance, revPortMap, previous); err != nil {
+		t.Fatalf("reassignPorts failed: %v", err)
+	}
+	if instance.Ports["http"] != port {
+		t.Errorf("expected the instance to keep port %d, got %d", port, instance.Ports["http"])
+	}
+	stored, err := mgr.lookupInstanceMetadata(instance.Id)
+	if err != nil {
+		t.Fatalf("failed to look up the instance: %v", err)
+	}
+	if stored.Ports["http"] != port {
+		t.Errorf("expected the reassigned port %d to be persisted, got %v", port, stored.Ports)
+	}
+
+	// If another launch grabbed the number meanwhile, a fresh one from the
+	// range is assigned instead of failing or colliding.
+	if err := mgr.removeContainersMetadata(instance); err != nil {
+		t.Fatalf("failed to release container metadata: %v", err)
+	}
+	other := &InstanceMetadata{Build: build.Id, Worker: instance.Worker, Ports: map[string]int{}}
+	if err := mgr.openInstance(other); err != nil {
+		t.Fatalf("failed to open the competing instance: %v", err)
+	}
+	if claimed, err := mgr.claimPort(other.Id, other.Worker, "http", port); err != nil || !claimed {
+		t.Fatalf("competing instance could not take port %d: claimed=%v err=%v", port, claimed, err)
+	}
+	if err := mgr.reassignPorts(build, instance, revPortMap, previous); err != nil {
+		t.Fatalf("reassignPorts after a collision failed: %v", err)
+	}
+	got := instance.Ports["http"]
+	if got == port || got < mgr.portLow || got > mgr.portHigh {
+		t.Errorf("expected a different port inside %d-%d, got %d", mgr.portLow, mgr.portHigh, got)
+	}
+
+	// Without a port range nothing is reserved: docker picks and the
+	// read-back records it.
+	mgr.portLow = 0
+	if err := mgr.reassignPorts(build, instance, revPortMap, previous); err != nil {
+		t.Fatalf("reassignPorts without a range failed: %v", err)
+	}
+}
