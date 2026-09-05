@@ -871,17 +871,17 @@ func (m *Manager) startNetwork(instance *InstanceMetadata, opts NetworkOptions) 
 	_, err = cli.NetworkCreate(ctx, netname, netSpec)
 	cancel()
 	if errdefs.IsConflict(err) {
-		// Instance ids are reused once their rows are deleted, so the network
-		// of an earlier instance with this id can still exist on the daemon
-		// when its removal was cut short (one that timed out client-side and
-		// finished on the daemon after its containers were gone). Nothing of
-		// ours is on it: remove it and create again, each call under its own
-		// control timeout. A network that still has endpoints, the leftovers
-		// of a DB-only stop that reconcileWorker clears when the box rejoins
-		// placement, refuses removal; that failure is reported alongside the
-		// original conflict, and stays in the error chain, so that a removal
-		// which timed out or found the daemon gone still marks the worker
-		// down below.
+		// A network of this name can still exist on the daemon: one whose
+		// removal was cut short (it timed out client-side and finished on the
+		// daemon after its containers were gone), or the network of an earlier
+		// instance with this id, from before ids stopped being reused. Nothing
+		// of ours is on it: remove it and create again, each call under its
+		// own control timeout. A network that still has endpoints, the
+		// leftovers of a DB-only stop that reconcileWorker clears when the box
+		// rejoins placement, refuses removal; that failure is reported
+		// alongside the original conflict, and stays in the error chain, so
+		// that a removal which timed out or found the daemon gone still marks
+		// the worker down below.
 		m.log.warnf("stale challenge network %s already exists; removing it and retrying", netname)
 		rmCtx, rmCancel := m.controlCtx()
 		_, rmErr := cli.NetworkRemove(rmCtx, netname, client.NetworkRemoveOptions{})
