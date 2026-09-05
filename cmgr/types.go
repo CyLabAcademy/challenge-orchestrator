@@ -46,6 +46,9 @@ type Manager struct {
 	challengeDockerfiles map[string][]byte
 	rand                 *rand.Rand
 	randMu               sync.Mutex
+	// updateMu serializes rebuilds (UpdateWithOptions): two of them would
+	// tear down and relaunch the same instances against each other.
+	updateMu sync.Mutex
 	// imageMu serializes the "is this content still referenced? if not, untag"
 	// critical sections (executeBuild cleanup, pruneReplacedImages,
 	// destroyImages) so a concurrent remover cannot delete a tag between

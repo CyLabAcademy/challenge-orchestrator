@@ -179,6 +179,14 @@ func (m *Manager) Update(fp string) *ChallengeUpdates {
 // UpdateWithOptions is identical to Update but takes explicit options; Update
 // is equivalent to calling this with the zero-value UpdateOptions.
 func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *ChallengeUpdates {
+	// One rebuild at a time. Two of them would work over the same instances:
+	// each tearing down what the other just started, reassigning the same
+	// ports twice, and taking the network the other had just created for a
+	// leftover of an earlier generation (startNetwork). An update is an
+	// operator action, so the second one waits rather than being refused.
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+
 	cu := m.DetectChanges(fp)
 	errs := m.addChallenges(cu.Added)
 	if len(errs) != 0 {
