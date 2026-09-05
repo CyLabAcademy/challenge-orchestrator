@@ -1,0 +1,23 @@
+# Schema the e2e scenario converges. One challenge per delivery shape so the
+# whole launch sequence is exercised; scenario.sh knows these ids.
+name: e2e
+flag_format: e2e{%s}
+challenges:
+  # custom Dockerfile, persistent instance: placed on a worker while the
+  # schema converges.
+  cmgr/examples/custom-socat:
+    seeds: [1]
+    instance_count: 1
+  # custom Dockerfile, on-demand: launched per user through POST /builds/<id>
+  # with user_id/env injection, checked over HTTP.
+  cmgr/examples/runtime-env-vars:
+    seeds: [7]
+    instance_count: -1
+  # remote-make (compiled, socat-wrapped stdin/stdout), on-demand.
+  cmgr/examples/binex101:
+    seeds: [3]
+    instance_count: -1
+  # flag-only: built (and pushed) but never launched.
+  cmgr/examples/layer-cake:
+    seeds: [5]
+    instance_count: -1

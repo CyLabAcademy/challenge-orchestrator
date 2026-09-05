@@ -1,0 +1,19 @@
+{
+    "hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2376"],
+    "tlsverify": true,
+    "tlscacert": "/root/.docker_certs/docker-ca-cert.pem",
+    "tlscert": "/root/.docker_certs/docker-server-cert.pem",
+    "tlskey": "/root/.docker_certs/docker-server-key.pem",
+
+    "storage-driver": "overlay2",
+
+    "default-address-pools": [
+        {"base": "10.201.0.0/16", "size": 29}
+    ],
+
+    "log-driver": "local",
+    "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+    }
+}
