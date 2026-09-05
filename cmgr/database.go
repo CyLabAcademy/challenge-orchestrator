@@ -206,6 +206,11 @@ const schemaQuery string = `
 	CREATE INDEX IF NOT EXISTS instanceBuildIndex ON instances(build);
 	CREATE INDEX IF NOT EXISTS portAssignmentInstanceIndex ON portAssignments(instance);
 	CREATE INDEX IF NOT EXISTS portAssignmentPortIndex ON portAssignments(port);
+	-- Port pools are per worker: reservePort reads one worker's assignments
+	-- in the range and claimPort checks one port on one worker, so both
+	-- want the worker first. The index on port alone stays for databases
+	-- that have it.
+	CREATE INDEX IF NOT EXISTS portAssignmentWorkerPortIndex ON portAssignments(worker, port);
 	CREATE INDEX IF NOT EXISTS containerInstanceIndex ON containers(instance);
 	CREATE INDEX IF NOT EXISTS imageBuildIndex ON images(build);
 	CREATE INDEX IF NOT EXISTS imagePortImageIndex ON imagePorts(image);
