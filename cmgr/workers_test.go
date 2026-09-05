@@ -90,6 +90,61 @@ func TestPollerSetHealthRacesWorkerDown(t *testing.T) {
 	}
 }
 
+func TestWorkerTimingDefaults(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED)}
+	if got := m.workerTimingFromEnv(); got != defaultWorkerTiming {
+		t.Fatalf("no overrides set, got %+v", got)
+	}
+	// A Manager not built by NewManager still gets real timeouts for its
+	// control-plane calls.
+	if got := (&Manager{}).timing(); got != defaultWorkerTiming {
+		t.Fatalf("zero-value fallback: %+v", got)
+	}
+}
+
+func TestWorkerTimingFromEnv(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED)}
+	t.Setenv(WORKER_POLL_INTERVAL_ENV, "100ms")
+	t.Setenv(WORKER_POLL_TIMEOUT_ENV, "40ms")
+	t.Setenv(WORKER_MAX_MISSES_ENV, "5")
+	t.Setenv(WORKER_CONTROL_TIMEOUT_ENV, "3s")
+	t.Setenv(WORKER_PULL_TIMEOUT_ENV, "1m")
+	want := workerTiming{
+		pollInterval:   100 * time.Millisecond,
+		pollTimeout:    40 * time.Millisecond,
+		maxMisses:      5,
+		controlTimeout: 3 * time.Second,
+		pullTimeout:    time.Minute,
+	}
+	if got := m.workerTimingFromEnv(); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestWorkerTimingFromEnvIgnoresBadValues(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED)}
+	t.Setenv(WORKER_POLL_INTERVAL_ENV, "soon")
+	t.Setenv(WORKER_MAX_MISSES_ENV, "0")
+	t.Setenv(WORKER_CONTROL_TIMEOUT_ENV, "-1s")
+	t.Setenv(WORKER_PULL_TIMEOUT_ENV, "0")
+	if got := m.workerTimingFromEnv(); got != defaultWorkerTiming {
+		t.Fatalf("bad overrides were not ignored: %+v", got)
+	}
+}
+
+func TestWorkerTimingClampsPollTimeout(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED)}
+	// Shortening only the interval leaves the default timeout too long.
+	t.Setenv(WORKER_POLL_INTERVAL_ENV, "100ms")
+	if got := m.workerTimingFromEnv(); got.pollTimeout != 50*time.Millisecond {
+		t.Fatalf("poll timeout not clamped to half the interval: %s", got.pollTimeout)
+	}
+	t.Setenv(WORKER_POLL_TIMEOUT_ENV, "100ms")
+	if got := m.workerTimingFromEnv(); got.pollTimeout != 50*time.Millisecond {
+		t.Fatalf("poll timeout equal to the interval not clamped: %s", got.pollTimeout)
+	}
+}
+
 // The docker client reports a refused connection with an error of its own that
 // wraps a message, not the net.Error. It must still count as a transport
 // failure, or a daemon that is down without hanging would never be noticed:

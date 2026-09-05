@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -28,26 +29,90 @@ const (
 
 	workerDockerPort    = 2376
 	workerTelemetryPort = 2136
-
-	// Every worker tunable lives in this block; retune by editing the value
-	// and rebuilding.
-	//
-	// workerPollInterval: telemetry poll cadence per worker.
-	// workerPollTimeout: per-poll timeout; must stay under workerPollInterval.
-	// workerMaxMisses: consecutive failed polls before the worker is marked
-	//   down (sticky): 60 * 500ms = 30s of telemetry silence.
-	// workerControlTimeout: ceiling for one container/network API call. These
-	//   normally finish in well under a second; a call that hangs this long
-	//   means a wedged daemon, so it doubles as the docker-side down trigger.
-	// workerPullTimeout: ceiling for one image pull from the registry. Slow
-	//   pulls are legitimate (cold multi-hundred-MB image), so a pull timeout
-	//   fails the launch but never marks the worker down.
-	workerPollInterval   = 500 * time.Millisecond
-	workerPollTimeout    = 250 * time.Millisecond
-	workerMaxMisses      = 60
-	workerControlTimeout = 30 * time.Second
-	workerPullTimeout    = 5 * time.Minute
 )
+
+// workerTiming holds every worker tunable. defaultWorkerTiming is the
+// production setting; each field can be overridden from the environment
+// (workerTimingFromEnv), mainly so a test fleet can detect failures faster.
+//
+//   - pollInterval: telemetry poll cadence per worker.
+//   - pollTimeout: per-poll timeout; must stay under pollInterval.
+//   - maxMisses: consecutive failed polls before the worker is marked down
+//     (sticky): 60 * 500ms = 30s of telemetry silence.
+//   - controlTimeout: ceiling for one container/network API call. These
+//     normally finish in well under a second; a call that hangs this long
+//     means a wedged daemon, so it doubles as the docker-side down trigger.
+//   - pullTimeout: ceiling for one image pull from the registry. Slow pulls
+//     are legitimate (cold multi-hundred-MB image), so a pull timeout fails
+//     the launch but never marks the worker down.
+type workerTiming struct {
+	pollInterval   time.Duration
+	pollTimeout    time.Duration
+	maxMisses      int
+	controlTimeout time.Duration
+	pullTimeout    time.Duration
+}
+
+var defaultWorkerTiming = workerTiming{
+	pollInterval:   500 * time.Millisecond,
+	pollTimeout:    250 * time.Millisecond,
+	maxMisses:      60,
+	controlTimeout: 30 * time.Second,
+	pullTimeout:    5 * time.Minute,
+}
+
+// workerTimingFromEnv returns defaultWorkerTiming with the CMGR_WORKER_*
+// overrides applied. A value that does not parse (or is not positive) is
+// logged and ignored; a poll timeout that does not fit inside the poll
+// interval is clamped to half of it, so no override can stall the poller.
+func (m *Manager) workerTimingFromEnv() workerTiming {
+	t := defaultWorkerTiming
+	m.envDuration(WORKER_POLL_INTERVAL_ENV, &t.pollInterval)
+	m.envDuration(WORKER_POLL_TIMEOUT_ENV, &t.pollTimeout)
+	m.envDuration(WORKER_CONTROL_TIMEOUT_ENV, &t.controlTimeout)
+	m.envDuration(WORKER_PULL_TIMEOUT_ENV, &t.pullTimeout)
+	if s, ok := os.LookupEnv(WORKER_MAX_MISSES_ENV); ok {
+		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
+			t.maxMisses = n
+		} else {
+			m.log.warnf("invalid %s value '%s' (want an integer >= 1), keeping %d", WORKER_MAX_MISSES_ENV, s, t.maxMisses)
+		}
+	}
+	if t.pollTimeout >= t.pollInterval {
+		clamped := t.pollInterval / 2
+		m.log.warnf("worker poll timeout %s does not fit under the poll interval %s; using %s", t.pollTimeout, t.pollInterval, clamped)
+		t.pollTimeout = clamped
+	}
+	if t != defaultWorkerTiming {
+		m.log.infof("worker timing: poll every %s (timeout %s), down after %d misses, control timeout %s, pull timeout %s",
+			t.pollInterval, t.pollTimeout, t.maxMisses, t.controlTimeout, t.pullTimeout)
+	}
+	return t
+}
+
+// envDuration overrides *d from the named variable when it holds a positive
+// duration; anything else is logged and leaves *d alone.
+func (m *Manager) envDuration(name string, d *time.Duration) {
+	s, ok := os.LookupEnv(name)
+	if !ok {
+		return
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil || v <= 0 {
+		m.log.warnf("invalid %s value '%s' (want a positive duration such as 30s), keeping %s", name, s, *d)
+		return
+	}
+	*d = v
+}
+
+// timing returns the worker tunables, falling back to the defaults for a
+// Manager that was not built by NewManager (tests).
+func (m *Manager) timing() workerTiming {
+	if m.workerTiming.pollInterval == 0 {
+		return defaultWorkerTiming
+	}
+	return m.workerTiming
+}
 
 // Selection failures, distinguished so cmgrd can map them to 503 vs 500.
 var (
@@ -163,12 +228,12 @@ func (m *Manager) newWorkerConn(ip, public string) (*workerConn, error) {
 		return nil, err
 	}
 
-	// The client-wide timeout is a transport-level backstop sized for the
-	// longest legitimate call (an image pull); control-plane calls carry
-	// their own tighter per-call deadline via controlCtx.
+	// The client-wide timeout is a transport-level backstop behind the
+	// per-call deadlines (controlCtx, pullCtx): the longest of them, so it
+	// cuts nothing short.
 	httpClient := &http.Client{
 		Transport:     &http.Transport{TLSClientConfig: tlsCfg},
-		Timeout:       workerPullTimeout,
+		Timeout:       m.transportTimeout(),
 		CheckRedirect: client.CheckRedirect,
 	}
 
@@ -201,12 +266,20 @@ func (m *Manager) newWorkerConn(ip, public string) (*workerConn, error) {
 // controlCtx bounds one docker control-plane call (container/network
 // create/start/inspect/remove). The caller must invoke cancel.
 func (m *Manager) controlCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(m.ctx, workerControlTimeout)
+	return context.WithTimeout(m.ctx, m.timing().controlTimeout)
 }
 
 // pullCtx bounds one image pull, including reading the pull stream.
 func (m *Manager) pullCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(m.ctx, workerPullTimeout)
+	return context.WithTimeout(m.ctx, m.timing().pullTimeout)
+}
+
+// transportTimeout is the ceiling the worker's HTTP client puts on any one
+// call: the longest of the per-call deadlines, so that it only ever catches
+// a call that carries none of its own.
+func (m *Manager) transportTimeout() time.Duration {
+	t := m.timing()
+	return max(t.pullTimeout, t.controlTimeout)
 }
 
 // pollWorker keeps the worker's health flag current from its telemetry agent.
@@ -218,8 +291,9 @@ func (m *Manager) pullCtx() (context.Context, context.CancelFunc) {
 // so the poller stores its verdict through pollerSetHealth, which never
 // overwrites down.
 func (m *Manager) pollWorker(w *workerConn) {
+	timing := m.timing()
 	url := fmt.Sprintf("http://%s:%d/health", w.ip, workerTelemetryPort)
-	httpClient := &http.Client{Timeout: workerPollTimeout}
+	httpClient := &http.Client{Timeout: timing.pollTimeout}
 	misses := 0
 
 	update := func() {
@@ -229,7 +303,7 @@ func (m *Manager) pollWorker(w *workerConn) {
 		overloaded, err := pollTelemetry(httpClient, url)
 		if err != nil {
 			misses++
-			if misses >= workerMaxMisses {
+			if misses >= timing.maxMisses {
 				m.markWorkerDown(w)
 			}
 			// Below the threshold: keep the last decision to ride out a blip.
@@ -244,7 +318,7 @@ func (m *Manager) pollWorker(w *workerConn) {
 	}
 
 	update()
-	ticker := time.NewTicker(workerPollInterval)
+	ticker := time.NewTicker(timing.pollInterval)
 	defer ticker.Stop()
 	for {
 		select {
