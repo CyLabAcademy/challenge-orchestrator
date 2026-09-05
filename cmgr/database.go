@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -131,8 +132,13 @@ const schemaQuery string = `
 			ON UPDATE RESTRICT ON DELETE CASCADE
 	);
 
+	-- An instance id is handed out once: the platform holds ids across a
+	-- rebuild (it re-issues POST /builds/<id> for the on-demand instances a
+	-- rebuild removed) and its stale DELETE or GET must not reach whoever
+	-- drew the id since. Without AUTOINCREMENT SQLite reuses the id of the
+	-- newest deleted row.
 	CREATE TABLE IF NOT EXISTS instances (
-		id INTEGER PRIMARY KEY,
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		lastsolved INTEGER,
 		build INTEGER NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -362,8 +368,29 @@ func (m *Manager) initDatabase() error {
 	}
 	staleIsFinalizedDefault := isFinalizedCols > 0 && isFinalizedDefault.String != "0"
 
-	if createdAtCols == 0 || isFinalizedCols == 0 || staleIsFinalizedDefault {
-		if err = rebuildInstancesTable(db, createdAtCols > 0, isFinalizedCols > 0); err != nil {
+	// Instance ids must never be reused (see the schema), which only
+	// AUTOINCREMENT guarantees, so a table declared without it is rebuilt
+	// too. SQLite keeps the declaration text, which is where the keyword
+	// shows.
+	var instancesSQL string
+	err = db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'instances';").Scan(&instancesSQL)
+	if err != nil {
+		m.log.errorf("could not read the instances table declaration: %s", err)
+		return err
+	}
+	hasAutoincrement := strings.Contains(strings.ToUpper(instancesSQL), "AUTOINCREMENT")
+
+	// The worker column is added further down for databases that predate it;
+	// a rebuild has to carry it over where it already exists.
+	var instanceWorkerCols int
+	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('instances') WHERE name = 'worker';").Scan(&instanceWorkerCols)
+	if err != nil {
+		m.log.errorf("could not check instances table schema for worker: %s", err)
+		return err
+	}
+
+	if createdAtCols == 0 || isFinalizedCols == 0 || staleIsFinalizedDefault || !hasAutoincrement {
+		if err = rebuildInstancesTable(db, createdAtCols > 0, isFinalizedCols > 0, instanceWorkerCols > 0); err != nil {
 			m.log.errorf("could not migrate instances table: %s", err)
 			return err
 		}
@@ -458,7 +485,10 @@ func (m *Manager) initDatabase() error {
 // schema and copies existing rows across. It migrates databases that predate
 // the created_at and/or is_finalized columns, which cannot simply be added via
 // ALTER TABLE ... ADD COLUMN because created_at's DEFAULT CURRENT_TIMESTAMP is a
-// non-constant default that SQLite rejects in ADD COLUMN.
+// non-constant default that SQLite rejects in ADD COLUMN, and databases whose
+// id column lacks AUTOINCREMENT, which no ALTER can add. The worker column is
+// carried over when the old table has it (hasWorker); the migration that adds
+// it to older tables runs after this one.
 //
 // `instances` is the target of ON DELETE CASCADE foreign keys (portAssignments,
 // containers), so the implicit DELETE that DROP TABLE performs would cascade and
@@ -467,7 +497,7 @@ func (m *Manager) initDatabase() error {
 // change inside a transaction, the whole operation is pinned to a single
 // connection: disable FKs, rebuild in a transaction, verify integrity with
 // foreign_key_check, commit, then re-enable FKs.
-func rebuildInstancesTable(db *sqlx.DB, hasCreatedAt, hasIsFinalized bool) (retErr error) {
+func rebuildInstancesTable(db *sqlx.DB, hasCreatedAt, hasIsFinalized, hasWorker bool) (retErr error) {
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -495,11 +525,12 @@ func rebuildInstancesTable(db *sqlx.DB, hasCreatedAt, hasIsFinalized bool) (retE
 	defer tx.Rollback()
 
 	const createNew = `CREATE TABLE instances_migrate_new (
-		id INTEGER PRIMARY KEY,
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		lastsolved INTEGER,
 		build INTEGER NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		is_finalized INTEGER NOT NULL DEFAULT 0 CHECK(is_finalized IN (0,1)),
+		worker TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (build) REFERENCES builds (id)
 			ON UPDATE RESTRICT ON DELETE RESTRICT
 	);`
@@ -521,10 +552,14 @@ func rebuildInstancesTable(db *sqlx.DB, hasCreatedAt, hasIsFinalized bool) (retE
 	if hasIsFinalized {
 		finalizedExpr = "is_finalized"
 	}
+	workerExpr := "''"
+	if hasWorker {
+		workerExpr = "worker"
+	}
 	copyStmt := fmt.Sprintf(
-		"INSERT INTO instances_migrate_new (id, lastsolved, build, created_at, is_finalized) "+
-			"SELECT id, lastsolved, build, %s, %s FROM instances;",
-		createdExpr, finalizedExpr,
+		"INSERT INTO instances_migrate_new (id, lastsolved, build, created_at, is_finalized, worker) "+
+			"SELECT id, lastsolved, build, %s, %s, %s FROM instances;",
+		createdExpr, finalizedExpr, workerExpr,
 	)
 	if _, err = tx.ExecContext(ctx, copyStmt); err != nil {
 		return err
@@ -534,6 +569,17 @@ func rebuildInstancesTable(db *sqlx.DB, hasCreatedAt, hasIsFinalized bool) (retE
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, "ALTER TABLE instances_migrate_new RENAME TO instances;"); err != nil {
+		return err
+	}
+
+	// AUTOINCREMENT hands out ids above the largest one sqlite_sequence
+	// records for the table. Record the largest id copied (0 for none) under
+	// the table's final name, so the numbering continues where it left off;
+	// the create and the rename may have left entries of their own.
+	if _, err = tx.ExecContext(ctx, "DELETE FROM sqlite_sequence WHERE name IN ('instances', 'instances_migrate_new');"); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO sqlite_sequence(name, seq) SELECT 'instances', COALESCE(MAX(id), 0) FROM instances;"); err != nil {
 		return err
 	}
 
