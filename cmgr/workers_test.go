@@ -67,15 +67,55 @@ func TestTransportErrorSparesAnUnreconciledWorker(t *testing.T) {
 	w := testWorkerConn(workerOverloaded)
 	m.workers = map[string]*workerConn{w.ip: w}
 
-	m.noteWorkerTransportError(w.ip, refused)
+	m.noteWorkerTransportError(w.ip, w.cli, refused)
 	if got := healthOf(w); got == workerDown {
 		t.Fatal("a transport error downed a worker whose first reconcile had not finished")
 	}
 
 	w.reconciled.Store(true)
-	m.noteWorkerTransportError(w.ip, refused)
+	m.noteWorkerTransportError(w.ip, w.cli, refused)
 	if got := healthOf(w); got != workerDown {
 		t.Fatalf("health %s after a transport error on a reconciled worker, want down", got)
+	}
+}
+
+// worker-remove then worker-add rebuilds a worker's connection. A call that
+// was already in flight on the old one can fail long afterwards — a hung call
+// runs to the transport timeout — and must not take down the box answering
+// now.
+func TestTransportErrorSparesAReplacedConnection(t *testing.T) {
+	socket := "unix://" + filepath.Join(t.TempDir(), "no-daemon.sock")
+	stale, err := client.NewClientWithOpts(client.WithHost(socket))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer stale.Close()
+	current, err := client.NewClientWithOpts(client.WithHost(socket))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer current.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, refused := stale.Ping(ctx, client.PingOptions{})
+	if refused == nil {
+		t.Fatal("a ping to a missing socket succeeded")
+	}
+
+	m := &Manager{log: newLogger(DISABLED)}
+	w := testWorkerConn(workerOk)
+	w.reconciled.Store(true)
+	w.cli = current
+	m.workers = map[string]*workerConn{w.ip: w}
+
+	m.noteWorkerTransportError(w.ip, stale, refused)
+	if got := healthOf(w); got == workerDown {
+		t.Fatal("a failure on a replaced connection downed the worker that replaced it")
+	}
+
+	m.noteWorkerTransportError(w.ip, current, refused)
+	if got := healthOf(w); got != workerDown {
+		t.Fatalf("health %s after a transport error on the live connection, want down", got)
 	}
 }
 
@@ -143,12 +183,14 @@ func TestWorkerTimingFromEnv(t *testing.T) {
 	t.Setenv(WORKER_MAX_MISSES_ENV, "5")
 	t.Setenv(WORKER_CONTROL_TIMEOUT_ENV, "3s")
 	t.Setenv(WORKER_PULL_TIMEOUT_ENV, "1m")
+	t.Setenv(WORKER_LAUNCH_WAIT_ENV, "2s")
 	want := workerTiming{
 		pollInterval:   100 * time.Millisecond,
 		pollTimeout:    40 * time.Millisecond,
 		maxMisses:      5,
 		controlTimeout: 3 * time.Second,
 		pullTimeout:    time.Minute,
+		launchWait:     2 * time.Second,
 	}
 	if got := m.workerTimingFromEnv(); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)

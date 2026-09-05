@@ -49,15 +49,23 @@ const (
 //   - controlTimeout: ceiling for one container/network API call. These
 //     normally finish in well under a second; a call that hangs this long
 //     means a wedged daemon, so it doubles as the docker-side down trigger.
-//   - pullTimeout: ceiling for one image pull from the registry. Slow pulls
-//     are legitimate (cold multi-hundred-MB image), so a pull timeout fails
-//     the launch but never marks the worker down.
+//   - pullTimeout: ceiling for one image pull before a request-driven
+//     launch. Challenge images are tens of MB over a fast private network,
+//     so a pull that takes longer than this is already an incident: it fails
+//     the launch as retryable but never marks the worker down, since the
+//     registry is the likelier culprit. A restart during a rebuild pulls
+//     under its own, longer ceiling (restartLimits in launch.go).
+//   - launchWait: how long a launch waits for a launch slot on its daemon
+//     before it is refused as busy, a retryable failure. That queue is
+//     cmgrd's own, no daemon involved, so it is kept short: under adverse
+//     load the platform's retry lands elsewhere (see launch.go).
 type workerTiming struct {
 	pollInterval   time.Duration
 	pollTimeout    time.Duration
 	maxMisses      int
 	controlTimeout time.Duration
 	pullTimeout    time.Duration
+	launchWait     time.Duration
 }
 
 var defaultWorkerTiming = workerTiming{
@@ -65,7 +73,8 @@ var defaultWorkerTiming = workerTiming{
 	pollTimeout:    250 * time.Millisecond,
 	maxMisses:      60,
 	controlTimeout: 30 * time.Second,
-	pullTimeout:    5 * time.Minute,
+	pullTimeout:    30 * time.Second,
+	launchWait:     10 * time.Second,
 }
 
 // workerTimingFromEnv returns defaultWorkerTiming with the CMGR_WORKER_*
@@ -79,6 +88,7 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 	m.envDuration(WORKER_POLL_TIMEOUT_ENV, &t.pollTimeout)
 	m.envDuration(WORKER_CONTROL_TIMEOUT_ENV, &t.controlTimeout)
 	m.envDuration(WORKER_PULL_TIMEOUT_ENV, &t.pullTimeout)
+	m.envDuration(WORKER_LAUNCH_WAIT_ENV, &t.launchWait)
 	if s, ok := os.LookupEnv(WORKER_MAX_MISSES_ENV); ok {
 		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
 			t.maxMisses = n
@@ -96,8 +106,8 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 		t.pollTimeout = clamped
 	}
 	if t != defaultWorkerTiming {
-		m.log.infof("worker timing: poll every %s (timeout %s), down after %d misses, control timeout %s, pull timeout %s",
-			t.pollInterval, t.pollTimeout, t.maxMisses, t.controlTimeout, t.pullTimeout)
+		m.log.infof("worker timing: poll every %s (timeout %s), down after %d misses, control timeout %s, pull timeout %s, launch wait %s",
+			t.pollInterval, t.pollTimeout, t.maxMisses, t.controlTimeout, t.pullTimeout, t.launchWait)
 	}
 	return t
 }
@@ -159,7 +169,8 @@ type workerConn struct {
 	ip     string
 	public string // player-facing address (IP or hostname); "" = use ip
 	cli    *client.Client
-	health atomic.Int32 // holds a workerHealth
+	health atomic.Int32  // holds a workerHealth
+	downCh chan struct{} // closed when the worker is marked down; waiters give up at once
 	// reconciled is set once the first reconcile pass has finished and the
 	// worker is about to be polled. Until then a control call that fails
 	// against it says nothing about the box: its daemon is expected to be
@@ -246,10 +257,15 @@ func (m *Manager) newWorkerConn(ip, public string) (*workerConn, error) {
 	}
 
 	// The client-wide timeout is a transport-level backstop behind the
-	// per-call deadlines (controlCtx, pullCtx): the longest of them, so it
-	// cuts nothing short.
+	// per-call deadlines (controlCtx and the pull timeouts of launchLimits):
+	// the longest of them, so it cuts nothing short.
+	//
+	// The transport keeps enough idle connections for a burst of launches:
+	// their image checks run concurrently, outside the launch slots, and with
+	// the default pool of two every later burst would pay an mTLS handshake
+	// per call.
 	httpClient := &http.Client{
-		Transport:     &http.Transport{TLSClientConfig: tlsCfg},
+		Transport:     &http.Transport{TLSClientConfig: tlsCfg, MaxIdleConnsPerHost: 32},
 		Timeout:       m.transportTimeout(),
 		CheckRedirect: client.CheckRedirect,
 	}
@@ -270,7 +286,8 @@ func (m *Manager) newWorkerConn(ip, public string) (*workerConn, error) {
 		ip:        ip,
 		public:    public,
 		cli:       cli,
-		launchSem: make(chan struct{}, m.launchConcurrency),
+		launchSem: make(chan struct{}, slots(m.launchConcurrency)),
+		downCh:    make(chan struct{}),
 		done:      make(chan struct{}),
 	}
 	// Fail closed for placement until the first successful poll — but as
@@ -344,17 +361,11 @@ func (m *Manager) controlCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(m.ctx, m.timing().controlTimeout)
 }
 
-// pullCtx bounds one image pull, including reading the pull stream.
-func (m *Manager) pullCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(m.ctx, m.timing().pullTimeout)
-}
-
 // transportTimeout is the ceiling the worker's HTTP client puts on any one
 // call: the longest of the per-call deadlines, so that it only ever catches
 // a call that carries none of its own.
 func (m *Manager) transportTimeout() time.Duration {
-	t := m.timing()
-	return max(t.pullTimeout, t.controlTimeout)
+	return max(m.restartLimits().pullTimeout, m.timing().controlTimeout)
 }
 
 // pollWorker keeps the worker's health flag current from its telemetry agent.
@@ -410,9 +421,14 @@ func (m *Manager) pollWorker(w *workerConn) {
 
 // markWorkerDown stores down, the terminal state, unconditionally. It is
 // reached from telemetry silence (the poller), a docker transport failure
-// and SetWorkerDown; only worker-add undoes it, by replacing the conn.
+// and SetWorkerDown; only worker-add undoes it, by replacing the conn. The
+// swap makes exactly one caller the one that moved the worker to down, which
+// is the one that closes downCh, waking whatever waits on the daemon.
 func (m *Manager) markWorkerDown(w *workerConn) {
 	if prev := workerHealth(w.health.Swap(int32(workerDown))); prev != workerDown {
+		if w.downCh != nil {
+			close(w.downCh)
+		}
 		m.log.infof("worker %s: %s -> down", w.ip, prev)
 	}
 }
@@ -436,11 +452,12 @@ func (m *Manager) pollerSetHealth(w *workerConn, h workerHealth) {
 }
 
 // noteWorkerTransportError marks a worker down after a connection-level
-// docker failure. A single hung or refused control-plane call is treated as
-// worker death: the dominant real failure is an OOMed box that never comes
-// back, and down being sticky means there is no flapping to guard against.
-// API-level errors pass through untouched (see isTransportError).
-func (m *Manager) noteWorkerTransportError(worker string, err error) {
+// docker failure on cli, the connection the call went out on. A single hung
+// or refused control-plane call is treated as worker death: the dominant real
+// failure is an OOMed box that never comes back, and down being sticky means
+// there is no flapping to guard against. API-level errors pass through
+// untouched (see isTransportError).
+func (m *Manager) noteWorkerTransportError(worker string, cli *client.Client, err error) {
 	if worker == "" || !isTransportError(err) {
 		return
 	}
@@ -448,6 +465,14 @@ func (m *Manager) noteWorkerTransportError(worker string, err error) {
 	w, ok := m.workers[worker]
 	m.workersMu.RUnlock()
 	if !ok {
+		return
+	}
+	if cli != nil && w.cli != cli {
+		// The call went out on a connection that has since been replaced:
+		// worker-remove then worker-add, on a box that was rebooted or
+		// recreated. A hung call outlives its connection by as much as the
+		// transport timeout, and the box answering now has failed at nothing.
+		m.log.debugf("worker %s: transport error on a replaced connection, ignoring: %s", worker, err)
 		return
 	}
 	if !w.reconciled.Load() {
@@ -728,6 +753,22 @@ func (m *Manager) workerIsDown(ip string) bool {
 	return workerHealth(w.health.Load()) == workerDown
 }
 
+// workerDownCh returns a channel closed once the worker is marked down, for
+// waiting on alongside something else. It is nil, and so never ready, for an
+// instance on the local daemon and for a worker that is already gone, whose
+// callers check workerIsDown instead.
+func (m *Manager) workerDownCh(worker string) <-chan struct{} {
+	if worker == "" {
+		return nil
+	}
+	m.workersMu.RLock()
+	defer m.workersMu.RUnlock()
+	if w, ok := m.workers[worker]; ok {
+		return w.downCh
+	}
+	return nil
+}
+
 // instanceClient resolves the docker client for the daemon hosting the
 // instance: the local env-configured client for instances with no worker,
 // otherwise the worker's client. Instances on purged workers are handled by
@@ -759,4 +800,13 @@ func (m *Manager) launchSem(instance *InstanceMetadata) chan struct{} {
 		return w.launchSem
 	}
 	return m.launchSemaphore
+}
+
+// slots guards a semaphore size against a Manager that skipped initDocker
+// (tests): an unbuffered channel would never admit anyone.
+func slots(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
 }
