@@ -162,12 +162,17 @@ Challenges and instances:
 
 Workers:
   worker-add <ip> [<public address>]
-      register a worker (or rebuild the connection of a down one); the
-      optional public address is what players are given for its instances;
-      containers and networks cmgr created on it for instances it no longer
-      records are removed first (as for every worker at cmgrd start)
+      register a worker, or bring a down one back once it is rebooted or
+      repaired (its instances come back with it: their containers restart on
+      their own); the optional public address is what players are given for
+      its instances; containers and networks cmgr created on it for instances
+      it no longer records are removed first (as for every worker at cmgrd
+      start)
   worker-remove <ip>
-      purge the worker and all of its instance records
+      purge the worker and all of its instance records, for a box that is
+      terminated and recreated rather than rebooted (nothing on the worker
+      itself is touched; re-adding it cleans up); a persistent instance it
+      hosted is only relaunched by the next update-schema
   worker-down <ip>
       mark the worker down, taking it out of placement but keeping its records
   worker-list

@@ -123,7 +123,7 @@ var (
 type workerHealth int32
 
 const (
-	workerDown       workerHealth = iota // dead box: sticky, cleared only by re-add
+	workerDown       workerHealth = iota // sticky; only re-add clears it, once the box is back or replaced
 	workerOverloaded                     // telemetry reports overloaded (or is not yet reachable)
 	workerOk                             // healthy: eligible for placement
 )
@@ -342,8 +342,11 @@ func (m *Manager) transportTimeout() time.Duration {
 // pollWorker keeps the worker's health flag current from its telemetry agent.
 // Runs until the conn is removed or replaced. Down is sticky: once set (by
 // telemetry silence, a docker transport failure or SetWorkerDown) only a
-// manual worker-add, which rebuilds the conn and poller, recovers the worker —
-// the usual fix for a dead box is replacing it with a clone, not repairing it.
+// manual worker-add, which rebuilds the conn and poller, recovers the worker.
+// That is the operator saying the box is back: rebooted or repaired, in which
+// case its instances come back with it (their containers restart on their
+// own), or terminated and recreated, in which case the old entry is removed
+// first (RemoveWorker) and the new box added.
 // Those other two sources can mark the worker down while a poll is in flight,
 // so the poller stores its verdict through pollerSetHealth, which never
 // overwrites down.
@@ -434,9 +437,11 @@ func (m *Manager) noteWorkerTransportError(worker string, err error) {
 
 // SetWorkerDown marks a worker down administratively, taking it out of
 // placement without touching its registry entry or instance records (unlike
-// RemoveWorker, which purges both). Intended for a box that is about to be
-// terminated: down is sticky — the poller treats it as terminal — so recovery
-// is AddWorker on the same IP, which rebuilds the connection and poller.
+// RemoveWorker, which purges both). Intended for a box about to be taken out
+// of service, for a reboot, a repair or its termination: down is sticky — the
+// poller treats it as terminal — so recovery is AddWorker on the same IP,
+// which rebuilds the connection and poller, or RemoveWorker and AddWorker of
+// the replacement.
 //
 // Note this also switches that worker's instances to the DB-only stop path
 // (see stopInstance): their containers are no longer torn down over docker.
@@ -545,8 +550,9 @@ func (m *Manager) AddWorker(ip, public string) error {
 // container assignments) and its registry entry are deleted, and its poller
 // is stopped. Containers still running on a live worker are not touched
 // now: the box is expected to be on its way out. Should it ever be re-added,
-// reconcileWorker removes them then. This is the recovery path for a dead
-// box: remove it, worker-add its replacement clone.
+// reconcileWorker removes them then. This is the path for a box that is
+// terminated and recreated rather than rebooted or repaired: remove the old
+// entry, worker-add the new box.
 func (m *Manager) RemoveWorker(ip string) error {
 	m.workersMu.Lock()
 	defer m.workersMu.Unlock()
