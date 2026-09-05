@@ -1,10 +1,16 @@
 package cmgr
 
 import (
+	"context"
+	"errors"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/moby/moby/client"
 )
 
 func testWorkerConn(h workerHealth) *workerConn {
@@ -81,5 +87,38 @@ func TestPollerSetHealthRacesWorkerDown(t *testing.T) {
 
 	if got := healthOf(w); got != workerDown {
 		t.Fatalf("concurrent poll verdicts took the worker out of down: %s", got)
+	}
+}
+
+// The docker client reports a refused connection with an error of its own that
+// wraps a message, not the net.Error. It must still count as a transport
+// failure, or a daemon that is down without hanging would never be noticed:
+// not marked down, not retried at reconcile, its launches answered 500. A
+// Unix socket that does not exist is classified by the client exactly like a
+// refused TCP connection and fails at once on every platform, where a closed
+// loopback port can hang behind a forwarder.
+func TestIsTransportErrorRefusedConnection(t *testing.T) {
+	cli, err := client.NewClientWithOpts(client.WithHost("unix://" + filepath.Join(t.TempDir(), "no-daemon.sock")))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer cli.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = cli.Ping(ctx, client.PingOptions{})
+	if err == nil {
+		t.Fatal("a ping to a missing socket succeeded")
+	}
+	if !client.IsErrConnectionFailed(err) {
+		t.Fatalf("the client did not classify the failure as a connection failure: %v", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the dial timed out instead of failing at once: %v", err)
+	}
+	if !isTransportError(err) {
+		t.Fatalf("a refused connection is not a transport error: %v", err)
+	}
+	if isTransportError(errors.New("network with name cmgr-7 already exists")) {
+		t.Fatal("a plain daemon error counted as a transport error")
 	}
 }
