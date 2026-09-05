@@ -405,11 +405,12 @@ In multi-container challenges, the `user_id` and all `env` variables are propaga
 equally to **every** container in the build — there is no per-container filtering.
 
 **Note:** When a build is rebuilt, its on-demand instances (those launched via
-`POST /builds/<id>`) are torn down but **not** restarted, since the original
-`user_id` and `env` payload are not retained. Front-ends that automate rebuilds
-must re-issue `POST /builds/<id>` with the appropriate runtime configuration to
-bring those instances back up. Persistent (schema-managed) instances are
-restarted automatically as before.
+`POST /builds/<id>`) are stopped and removed, **not** restarted, since the
+original `user_id` and `env` payload are not retained; a `GET` on one of them
+afterwards is a 404. Front-ends that automate rebuilds must re-issue
+`POST /builds/<id>` with the appropriate runtime configuration to bring those
+instances back up. Persistent (schema-managed) instances are restarted
+automatically as before.
 
 **Note:** Challenge metadata includes a derived `delivery_type` field
 (`"service"`, `"artifact_only"`, or `"flag_only"`) describing what competitors

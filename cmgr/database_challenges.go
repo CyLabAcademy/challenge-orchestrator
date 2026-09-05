@@ -682,12 +682,16 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 						continue
 					}
 
-					// Stop and tear down existing instances. For persistent (non-on-demand)
-					// instances also restart them with the new image. On-demand (dynamic)
-					// instances are started per-user with injected env vars, so they are
-					// only torn down here and not restarted. Non-service challenges never
-					// run instances, so any found here are placeholders left by older
-					// versions of cmgr and are removed entirely.
+					// Stop and tear down existing instances. Persistent (schema-managed)
+					// instances are restarted in place with the new image. On-demand
+					// (dynamic) instances are started per user with injected env vars
+					// that are not retained, so they cannot be restarted: they are
+					// removed entirely (containers, network and record), and the
+					// platform re-issues POST /builds/<id> for the ones it still wants,
+					// instead of being left as hollow records that only a later stop or
+					// the prune age would clear. Non-service challenges never run
+					// instances, so any found here are placeholders left by older
+					// versions of cmgr and are removed the same way.
 					revPortMap, err := m.getReversePortMap(build.Challenge)
 					if err != nil {
 						errs = append(errs, err)
@@ -700,7 +704,11 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 					}
 					for _, iid := range instances {
 						instance, err := m.lookupInstanceMetadata(iid)
-						if err == nil && !cMeta.NeedsInstance() {
+						if err != nil {
+							errs = append(errs, err)
+							continue
+						}
+						if build.InstanceCount == DYNAMIC_INSTANCES || !cMeta.NeedsInstance() {
 							if err = m.stopInstance(instance); err != nil {
 								errs = append(errs, err)
 							}
@@ -709,28 +717,23 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 						// stopContainers releases the port assignments; the
 						// restart below reclaims them (same numbers when free)
 						// so the instance keeps its address across the rebuild.
-						var previousPorts map[string]int
-						if err == nil {
-							previousPorts = instance.Ports
-							err = m.stopContainers(instance)
-						}
+						previousPorts := instance.Ports
+						err = m.stopContainers(instance)
 						if err == nil {
 							err = m.stopNetwork(instance)
 						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
+						if err == nil {
 							err = m.reassignPorts(build, instance, revPortMap, previousPorts)
 						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
+						if err == nil {
 							err = m.startNetwork(instance, cMeta.ChallengeOptions.NetworkOptions)
 						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
+						if err == nil {
 							err = m.startContainers(build, instance, cMeta.ChallengeOptions.Overrides, nil, revPortMap)
 						}
 						if err != nil {
 							errs = append(errs, err)
-							if build.InstanceCount != DYNAMIC_INSTANCES {
-								m.rollbackRestart(instance)
-							}
+							m.rollbackRestart(instance)
 						}
 					}
 
