@@ -265,6 +265,18 @@ func (m *Manager) Build(challenge ChallengeId, seeds []int, flagFormat string) (
 // additional environment variables are needed.
 func (m *Manager) Start(build BuildId, envVars map[string]string) (InstanceId, error) {
 	// Get build metadata
+	//
+	// This read is the launch's whole view of the build. A rebuild that
+	// stamps a new checksum after it, and takes its snapshot of the build's
+	// instances before this launch inserts its row, neither sees this
+	// instance nor is seen by it: the instance serves the generation that was
+	// current when it began, under a build that now records the next one. It
+	// is left to expire rather than torn down. The flag does not change with
+	// a rebuild, the superseded images stay in retention as the rollback
+	// target, and only update-schema creates persistent instances, so this is
+	// bounded to one on-demand instance and one TTL. Serializing against a
+	// rebuild is not an option: a rebuild runs for minutes and every caller
+	// blocks on its launch.
 	bMeta, err := m.lookupBuildMetadata(build)
 	if err != nil {
 		return 0, err
