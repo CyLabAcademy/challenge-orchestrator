@@ -38,6 +38,8 @@ func NewManager(logLevel LogLevel) *Manager {
 		return nil
 	}
 
+	mgr.workerTiming = mgr.workerTimingFromEnv()
+
 	if err := mgr.setDirectories(); err != nil {
 		return nil
 	}

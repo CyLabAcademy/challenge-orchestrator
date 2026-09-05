@@ -128,6 +128,21 @@ Relevant environment variables:
   CMGR_CONCURRENT_LAUNCHES - the maximum number of concurrent container
       launches allowed (defaults to 2); allowed values are 1 or 2.
 
+  CMGR_WORKER_POLL_INTERVAL, CMGR_WORKER_POLL_TIMEOUT, CMGR_WORKER_MAX_MISSES -
+      how often each worker's telemetry agent is polled (defaults to '500ms'),
+      the per-poll timeout (defaults to '250ms'; clamped to half the interval
+      when not under it)
+      and how many consecutive failed polls mark the worker down (defaults to
+      60, i.e. 30s of silence); down is sticky until the next worker-add.
+
+  CMGR_WORKER_CONTROL_TIMEOUT - ceiling for one container or network call to
+      a worker's docker daemon (defaults to '30s'); a call that hits it marks
+      the worker down.
+
+  CMGR_WORKER_PULL_TIMEOUT - ceiling for one image pull on a worker (defaults
+      to '5m'); a pull that hits it fails that launch but does not mark the
+      worker down.
+
   CMGR_REGISTRY - the docker registry holding built challenge images; when
       set, images are pulled from it before each instance start (must match
       the value used by cmgr when building).
@@ -151,11 +166,12 @@ Workers:
   'academy-docker-worker' (the shared worker certificate), dockerd on port
   2376, and the telemetry agent on port 2136.
 
-  A worker goes down (sticky) after 30s of telemetry silence, a single
-  hung/refused docker control call, or a PATCH of {"health": "down"};
-  recovery is re-adding it (POST /workers or cmgrd-cli worker-add). Stops for instances on a down worker clear the
-  records and return success without touching docker. DELETE on /workers
-  purges the worker and all of its instance records.
+  A worker goes down (sticky) after CMGR_WORKER_MAX_MISSES failed telemetry
+  polls (30s of silence by default), a single hung/refused docker control
+  call, or a PATCH of {"health": "down"}; recovery is re-adding it (POST
+  /workers or cmgrd-cli worker-add). Stops for instances on a down worker
+  clear the records and return success without touching docker. DELETE on
+  /workers purges the worker and all of its instance records.
 
   Workers have two addresses: the private IP cmgrd dials, and an optional
   player-facing public address ("public" in the POST /workers body).
