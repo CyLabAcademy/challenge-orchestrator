@@ -1937,6 +1937,53 @@ func TestReassignPortsKeepsAddressAcrossRestart(t *testing.T) {
 		t.Errorf("expected a different port inside %d-%d, got %d", mgr.portLow, mgr.portHigh, got)
 	}
 
+	rowsFor := func(id InstanceId) int {
+		var n int
+		if err := mgr.db.Get(&n, "SELECT COUNT(*) FROM portAssignments WHERE instance = ?", id); err != nil {
+			t.Fatalf("failed to count port assignments: %v", err)
+		}
+		return n
+	}
+
+	// A previous port outside the current range (an instance from before
+	// CMGR_PORTS was set) is not reclaimed; a fresh one from the range is.
+	if err := mgr.removeContainersMetadata(instance); err != nil {
+		t.Fatalf("failed to release container metadata: %v", err)
+	}
+	if err := mgr.reassignPorts(build, instance, revPortMap, map[string]int{"http": 45000}); err != nil {
+		t.Fatalf("reassignPorts with an out-of-range previous port failed: %v", err)
+	}
+	if got := instance.Ports["http"]; got < mgr.portLow || got > mgr.portHigh {
+		t.Errorf("expected a port inside %d-%d, got %d", mgr.portLow, mgr.portHigh, got)
+	}
+
+	// A published port with no name in the reverse map is an error, and
+	// nothing is left reserved under an empty name.
+	if err := mgr.removeContainersMetadata(instance); err != nil {
+		t.Fatalf("failed to release container metadata: %v", err)
+	}
+	if err := mgr.reassignPorts(build, instance, map[string]string{}, previous); err == nil {
+		t.Errorf("expected an error for a port missing from the reverse map")
+	}
+	if n := rowsFor(instance.Id); n != 0 {
+		t.Errorf("expected no port assignments after the failed reassignment, found %d", n)
+	}
+
+	// A failure part-way through (here: the range is exhausted after the
+	// first port) releases the ports already reserved for the instance.
+	twoPorts := &BuildMetadata{Id: build.Id, Images: []Image{{Host: "challenge", Ports: []string{"8000/tcp", "8001/tcp"}}}}
+	twoNames := map[string]string{"8000/tcp": "http", "8001/tcp": "ssh"}
+	mgr.portLow, mgr.portHigh = 31000, 31000
+	if err := mgr.reassignPorts(twoPorts, instance, twoNames, nil); err == nil {
+		t.Errorf("expected an error when the range cannot hold both ports")
+	}
+	if n := rowsFor(instance.Id); n != 0 {
+		t.Errorf("expected the partial reservation to be rolled back, found %d assignment(s)", n)
+	}
+	if len(instance.Ports) != 0 {
+		t.Errorf("expected instance.Ports to be cleared after the rollback, got %v", instance.Ports)
+	}
+
 	// Without a port range nothing is reserved: docker picks and the
 	// read-back records it.
 	mgr.portLow = 0

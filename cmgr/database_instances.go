@@ -82,20 +82,37 @@ func (m *Manager) claimPort(instance InstanceId, worker string, name string, por
 // outside the range, and record no port at all (finalizeInstance persists
 // read-back ports only when no range is configured). Each port first tries
 // the number it had, so players keep the address they were given, and falls
-// back to a new reservation if a concurrent launch took it. No-op without a
-// port range: docker assigns the ports and the read-back records them.
+// back to a new reservation if a concurrent launch took it or the old number
+// lies outside the current range (an instance from before CMGR_PORTS was
+// set). No-op without a port range: docker assigns the ports and the
+// read-back records them.
+//
+// Reservations are made one port at a time; on any failure the ones already
+// made for this instance are released again, so a failed restart does not
+// hold ports in the range for an instance that is not running.
 func (m *Manager) reassignPorts(build *BuildMetadata, instance *InstanceMetadata, revPortMap map[string]string, previous map[string]int) error {
 	if m.portLow == 0 {
 		return nil
 	}
 	instance.Ports = make(map[string]int)
+	err := m.reassignPortsUnchecked(build, instance, revPortMap, previous)
+	if err != nil {
+		m.releasePorts(instance)
+	}
+	return err
+}
+
+func (m *Manager) reassignPortsUnchecked(build *BuildMetadata, instance *InstanceMetadata, revPortMap map[string]string, previous map[string]int) error {
 	for _, image := range build.Images {
 		if image.Host == "builder" {
 			continue
 		}
 		for _, portStr := range image.Ports {
-			name := revPortMap[portStr]
-			if prev, ok := previous[name]; ok && prev != 0 {
+			name, ok := revPortMap[portStr]
+			if !ok || name == "" {
+				return fmt.Errorf("no published port name for %s of instance %d", portStr, instance.Id)
+			}
+			if prev, ok := previous[name]; ok && prev >= m.portLow && prev <= m.portHigh {
 				claimed, err := m.claimPort(instance.Id, instance.Worker, name, prev)
 				if err != nil {
 					return err
@@ -114,6 +131,15 @@ func (m *Manager) reassignPorts(build *BuildMetadata, instance *InstanceMetadata
 		}
 	}
 	return nil
+}
+
+// releasePorts drops every port assignment recorded for the instance, both
+// in the database and on the metadata.
+func (m *Manager) releasePorts(instance *InstanceMetadata) {
+	if _, err := m.db.Exec("DELETE FROM portAssignments WHERE instance=?;", instance.Id); err != nil {
+		m.log.errorf("failed to release the ports of instance %d: %s", instance.Id, err)
+	}
+	instance.Ports = make(map[string]int)
 }
 
 func (m *Manager) openInstance(meta *InstanceMetadata) error {
