@@ -133,6 +133,23 @@ func (m *Manager) reassignPortsUnchecked(build *BuildMetadata, instance *Instanc
 	return nil
 }
 
+// rollbackRestart undoes what a failed in-place restart (the rebuild path)
+// managed to bring up: any containers it created, its network, and the port
+// reservations made for them. The instance row itself stays, without live
+// resources or held ports, for the next update to retry; a fresh launch
+// removes its row instead (see newInstance), but a schema-managed instance
+// is expected to exist. Errors here are logged only: the restart's own
+// failure is the one reported.
+func (m *Manager) rollbackRestart(instance *InstanceMetadata) {
+	if err := m.stopContainers(instance); err != nil {
+		m.log.warnf("could not remove the containers of instance %d after its failed restart: %s", instance.Id, err)
+	}
+	if err := m.stopNetwork(instance); err != nil {
+		m.log.warnf("could not remove the network of instance %d after its failed restart: %s", instance.Id, err)
+	}
+	m.releasePorts(instance)
+}
+
 // releasePorts drops every port assignment recorded for the instance, both
 // in the database and on the metadata.
 func (m *Manager) releasePorts(instance *InstanceMetadata) {

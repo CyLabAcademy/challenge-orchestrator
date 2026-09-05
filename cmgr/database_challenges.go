@@ -734,6 +734,9 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 						}
 						if err != nil {
 							errs = append(errs, err)
+							if build.InstanceCount != DYNAMIC_INSTANCES {
+								m.rollbackRestart(instance)
+							}
 						}
 					}
 
