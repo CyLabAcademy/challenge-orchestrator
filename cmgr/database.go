@@ -425,6 +425,18 @@ func (m *Manager) initDatabase() error {
 		}
 	}
 
+	// Port pools are per worker: reservePort reads one worker's assignments in
+	// the range and claimPort checks one port on one worker, so both want the
+	// worker first. The index on port alone stays for databases that have it.
+	// It is created here rather than in schemaQuery, which runs before the
+	// migration above: on a database from before workers existed, the column
+	// it indexes does not exist yet.
+	_, err = db.Exec("CREATE INDEX IF NOT EXISTS portAssignmentWorkerPortIndex ON portAssignments(worker, port);")
+	if err != nil {
+		m.log.errorf("could not create portAssignmentWorkerPortIndex index: %s", err)
+		return err
+	}
+
 	// Migrate older DBs: add the workers.public column if it is not present.
 	var workerPublicCols int
 	err = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('workers') WHERE name = 'public';").Scan(&workerPublicCols)

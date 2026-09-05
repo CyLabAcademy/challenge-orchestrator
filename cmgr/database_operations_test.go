@@ -1934,6 +1934,65 @@ func TestInitDatabaseAddsAutoincrement(t *testing.T) {
 	}
 }
 
+// A database from before workers existed has no portAssignments.worker
+// column, and the index on (worker, port) can only be created once the
+// migration has added it. Startup must survive that upgrade path.
+func TestInitDatabaseIndexesLegacyPortAssignments(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "cmgr-legacy-ports-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %s", err)
+	}
+	dbFile.Close()
+	t.Cleanup(func() { removeDBFiles(dbFile.Name()) })
+
+	// The current schema without its worker columns is what a database from
+	// before workers looks like, and it stays in step with the schema.
+	legacy := strings.ReplaceAll(schemaQuery, "\t\tworker TEXT NOT NULL DEFAULT '',\n", "")
+	if legacy == schemaQuery {
+		t.Fatal("schemaQuery no longer declares the worker columns as expected")
+	}
+
+	// Seeded with foreign keys off: one instance with a port assignment for
+	// the migration to carry over, without the rows they reference.
+	seed, err := sqlx.Open("sqlite3", dbFile.Name()+"?_fk=false")
+	if err != nil {
+		t.Fatalf("failed to open db: %s", err)
+	}
+	if _, err := seed.Exec(legacy); err != nil {
+		t.Fatalf("failed to create the pre-worker schema (does schemaQuery index a worker column?): %s", err)
+	}
+	rows := `
+	INSERT INTO builds(id, flag, format, seed, hasartifacts, challenge, schema, instancecount) VALUES (1, 'f', 'fmt', 1, 0, 'ch', 's', -1);
+	INSERT INTO instances(id, build) VALUES (1, 1);
+	INSERT INTO portAssignments(instance, name, port) VALUES (1, 'challenge', 12345);`
+	if _, err := seed.Exec(rows); err != nil {
+		t.Fatalf("failed to seed the pre-worker rows: %s", err)
+	}
+	seed.Close()
+
+	t.Setenv(DB_ENV, dbFile.Name())
+	m := &Manager{log: newLogger(DISABLED)}
+	if err := m.initDatabase(); err != nil {
+		t.Fatalf("initDatabase on a pre-worker database: %s", err)
+	}
+	defer m.db.Close()
+
+	var indexes int
+	if err := m.db.Get(&indexes, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'portAssignmentWorkerPortIndex';"); err != nil {
+		t.Fatalf("index check: %s", err)
+	}
+	if indexes != 1 {
+		t.Error("the (worker, port) index was not created after the migration")
+	}
+	var worker string
+	if err := m.db.Get(&worker, "SELECT worker FROM portAssignments WHERE instance = 1;"); err != nil {
+		t.Fatalf("the migrated port assignment: %s", err)
+	}
+	if worker != "" {
+		t.Errorf("a migrated port assignment got worker %q, want the local daemon", worker)
+	}
+}
+
 // TestInitDatabaseRepairsStaleIsFinalizedDefault drives initDatabase against a
 // database in the buggy intermediate state: created_at and is_finalized both
 // exist, but is_finalized was added by the old ALTER ... DEFAULT 1 migration.
