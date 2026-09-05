@@ -334,6 +334,12 @@ func isTransportError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	// The docker client reports a refused connection (dockerd not listening
+	// while the box is up) with an error type of its own that wraps a
+	// message rather than the net.Error, so it has to be asked by name.
+	if client.IsErrConnectionFailed(err) {
+		return true
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return true
