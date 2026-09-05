@@ -154,7 +154,10 @@ Relevant environment variables:
 
   CMGR_WORKER_LAUNCH_WAIT - how long a launch waits for a launch slot on its
       daemon (defaults to '10s'); past that it fails as retryable (503 with
-      Retry-After) instead of queueing behind a saturated daemon.
+      Retry-After) instead of queueing behind a saturated daemon. A launch
+      that would evidently wait longer, judging by the launches already
+      waiting there and the daemon's recent pace, is refused the same way at
+      once, before anything is recorded.
 
   CMGR_REGISTRY - the docker registry holding built challenge images; when
       set, images are pulled from it before each instance start (must match
@@ -205,10 +208,12 @@ Workers:
   removes the containers. The alternative, holding a whole box out of the
   fleet over one container its daemon will not remove, costs more.
 
-  Under load a launch fails fast rather than queueing: it waits at most
-  CMGR_WORKER_LAUNCH_WAIT for a slot on its worker and is refused as soon as
-  that worker goes down; both answer 503 with Retry-After so the platform's
-  retry is placed afresh. A stop whose worker hangs mid-way clears the
+  Under load a launch fails fast rather than queueing: it is refused at once
+  when the launches already waiting on its worker would keep it waiting
+  longer than CMGR_WORKER_LAUNCH_WAIT, waits at most that long otherwise, and
+  is refused as soon as its worker goes down; all three answer 503 with
+  Retry-After so the platform's retry is placed afresh. A stop whose worker
+  hangs mid-way clears the
   records once the worker is marked down and returns success. Stops wait
   for a teardown slot on their worker as long as it takes, since a stop must
   go through, so a deluge of them queues in cmgrd, bounded, rather than
