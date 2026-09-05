@@ -58,15 +58,12 @@ func (m *Manager) setDirectories() error {
 
 	m.log.infof("artifacts directory: %s", m.artifactsDir)
 
-	info, err = os.Stat(m.artifactsDir)
-	if err != nil {
-		m.log.errorf("could not stat the artifacts directory: %s", err)
+	// Created on demand: it only ever holds bundles cmgr writes, so unlike
+	// the challenge directory an absent one is not a misconfiguration. A
+	// path that exists as a file fails here too.
+	if err = os.MkdirAll(m.artifactsDir, 0o755); err != nil {
+		m.log.errorf("could not create the artifacts directory: %s", err)
 		return err
-	}
-
-	if !info.IsDir() {
-		m.log.error("artifacts directory must be a directory")
-		return errors.New(m.artifactsDir + " is not a directory")
 	}
 
 	return nil

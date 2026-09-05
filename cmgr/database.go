@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"time"
@@ -212,6 +213,15 @@ func (m *Manager) initDatabase() error {
 	dbPath, isSet := os.LookupEnv(DB_ENV)
 	if !isSet {
 		dbPath = "cmgr.db"
+	}
+
+	// SQLite creates the file but not its directory; a fresh box points
+	// CMGR_DB somewhere like /var/lib/cork that may not exist yet.
+	if dir := filepath.Dir(dbPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			m.log.errorf("could not create the database directory %s: %s", dir, err)
+			return err
+		}
 	}
 
 	// _busy_timeout=50 gives SQLite up to 50ms to retry acquiring a lock before
