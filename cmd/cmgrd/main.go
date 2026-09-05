@@ -173,6 +173,13 @@ Workers:
   clear the records and return success without touching docker. DELETE on
   /workers purges the worker and all of its instance records.
 
+  Whenever a worker is added, and for every worker at startup, the containers
+  and cmgr-<id> networks cmgr created on it for instances it no longer records
+  there (left behind by those stops, or by DELETE) are removed before it takes
+  placements, so their host ports and network names are free again. A daemon
+  that cannot be reached at that point (still starting, say) is retried for
+  as long as telemetry silence is tolerated before the worker is marked down.
+
   Workers have two addresses: the private IP cmgrd dials, and an optional
   player-facing public address ("public" in the POST /workers body).
   Instance metadata reports the public one as "worker_public" (falling back

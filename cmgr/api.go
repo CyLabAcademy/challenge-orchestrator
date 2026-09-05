@@ -376,7 +376,8 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 	// A down (or purged) worker cannot be reached: clear our records and
 	// report success so callers (the platform's stop/restart/TTL flows) are
 	// never wedged behind a dead box. Any containers actually left running
-	// are docker-reaper's or manual cleanup's problem.
+	// are removed if the box rejoins placement (reconcileWorker, on
+	// worker-add and at startup); until then they are docker-reaper's.
 	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
 		m.log.warnf("worker %s down: clearing instance %d records without docker teardown", instance.Worker, instance.Id)
 		return m.removeInstanceMetadata(instance.Id)
