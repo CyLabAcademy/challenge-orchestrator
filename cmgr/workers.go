@@ -154,13 +154,13 @@ func (h workerHealth) String() string {
 // the local one. Health only gates placement of new instances; operations on
 // existing instances route through cli regardless.
 type workerConn struct {
-	ip        string
-	public    string // player-facing address (IP or hostname); "" = use ip
-	cli       *client.Client
-	health    atomic.Int32  // holds a workerHealth
-	downCh    chan struct{} // closed when the worker is marked down; waiters give up at once
-	launchSem chan struct{}
-	done      chan struct{} // closed on removal/replacement to stop the poller
+	ip     string
+	public string // player-facing address (IP or hostname); "" = use ip
+	cli    *client.Client
+	health atomic.Int32  // holds a workerHealth
+	downCh chan struct{} // closed when the worker is marked down; waiters give up at once
+	queue  *daemonQueue
+	done   chan struct{} // closed on removal/replacement to stop the poller
 }
 
 type WorkerInfo struct {
@@ -266,12 +266,12 @@ func (m *Manager) newWorkerConn(ip, public string) (*workerConn, error) {
 	}
 
 	w := &workerConn{
-		ip:        ip,
-		public:    public,
-		cli:       cli,
-		launchSem: make(chan struct{}, slots(m.launchConcurrency)),
-		downCh:    make(chan struct{}),
-		done:      make(chan struct{}),
+		ip:     ip,
+		public: public,
+		cli:    cli,
+		queue:  newDaemonQueue(slots(m.launchConcurrency)),
+		downCh: make(chan struct{}),
+		done:   make(chan struct{}),
 	}
 	// Fail closed for placement until the first successful poll — but as
 	// overloaded, not down: down is sticky and would never recover. The
@@ -750,18 +750,38 @@ func (m *Manager) instanceClient(instance *InstanceMetadata) (*client.Client, er
 	return w.cli, nil
 }
 
-// launchSem returns the launch semaphore for the daemon hosting the instance;
-// each worker has its own so launch throughput scales with the fleet.
-func (m *Manager) launchSem(instance *InstanceMetadata) chan struct{} {
+// daemonQueue holds one daemon's slots: launches (see launch.go) and
+// teardowns, as many of each as CMGR_CONCURRENT_LAUNCHES. Teardowns have
+// slots of their own so that a deluge of stops queues here, bounded, rather
+// than inside dockerd, which serializes the network side of each removal:
+// left to queue there, a mass stop made the daemon slow, then unresponsive,
+// and a launch's network create behind it ran into the control timeout and
+// marked the healthy worker down. Two pools rather than one so that stops and
+// launches do not starve each other.
+type daemonQueue struct {
+	launchSem   chan struct{}
+	teardownSem chan struct{}
+}
+
+func newDaemonQueue(slots int) *daemonQueue {
+	return &daemonQueue{
+		launchSem:   make(chan struct{}, slots),
+		teardownSem: make(chan struct{}, slots),
+	}
+}
+
+// daemonQueue returns the queue of the daemon hosting the instance; each
+// worker has its own so throughput scales with the fleet.
+func (m *Manager) daemonQueue(instance *InstanceMetadata) *daemonQueue {
 	if instance.Worker == "" {
-		return m.launchSemaphore
+		return m.localQueue
 	}
 	m.workersMu.RLock()
 	defer m.workersMu.RUnlock()
 	if w, ok := m.workers[instance.Worker]; ok {
-		return w.launchSem
+		return w.queue
 	}
-	return m.launchSemaphore
+	return m.localQueue
 }
 
 // slots guards a semaphore size against a Manager that skipped initDocker

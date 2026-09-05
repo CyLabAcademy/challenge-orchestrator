@@ -130,7 +130,10 @@ Relevant environment variables:
       starts, which dockerd serializes internally on either firewall
       backend: 2 measured as the optimum on iptables, and nftables showed no
       gain past 2 either (it makes each launch faster, not more parallel).
-      The range is open for re-measuring, not for tuning.
+      The range is open for re-measuring, not for tuning. As many teardown
+      slots bound the stops in flight on a daemon: a deluge of stops queues
+      in cmgrd instead of inside dockerd, which it used to make slow, then
+      unresponsive.
 
   CMGR_WORKER_POLL_INTERVAL, CMGR_WORKER_POLL_TIMEOUT, CMGR_WORKER_MAX_MISSES -
       how often each worker's telemetry agent is polled (defaults to '500ms'),
@@ -195,7 +198,10 @@ Workers:
   CMGR_WORKER_LAUNCH_WAIT for a slot on its worker and is refused as soon as
   that worker goes down; both answer 503 with Retry-After so the platform's
   retry is placed afresh. A stop whose worker hangs mid-way clears the
-  records once the worker is marked down and returns success.
+  records once the worker is marked down and returns success. Stops wait
+  for a teardown slot on their worker as long as it takes, since a stop must
+  go through, so a deluge of them queues in cmgrd, bounded, rather than
+  inside dockerd.
 
   The restart of a persistent instance during an update is exempt, since
   nothing retries it: it pulls the new image under a five-minute ceiling

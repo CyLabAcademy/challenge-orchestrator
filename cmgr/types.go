@@ -70,7 +70,7 @@ type Manager struct {
 	lastPruneUnix      atomic.Int64 // atomic UnixNano timestamp used as CAS gate for prune interval
 	pruneInterval      time.Duration
 	pruneAge           time.Duration
-	launchSemaphore    chan struct{}
+	localQueue         *daemonQueue // slots of the local daemon (instances with no worker)
 	policy             managerPolicy
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
@@ -81,7 +81,7 @@ type Manager struct {
 	workerOrder       []string // round-robin iteration order over workers
 	rrCursor          int      // guarded by workersMu
 	placementEnabled  bool
-	launchConcurrency int          // per-daemon launch slots from CMGR_CONCURRENT_LAUNCHES
+	launchConcurrency int          // per-daemon launch (and teardown) slots from CMGR_CONCURRENT_LAUNCHES
 	workerTiming      workerTiming // poll/timeout tunables, from the environment (see timing())
 }
 

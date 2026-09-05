@@ -399,14 +399,12 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 		return m.removeInstanceMetadata(instance.Id)
 	}
 
-	err := m.stopContainers(instance)
-	if err == nil {
-		err = m.stopNetwork(instance)
-	}
+	err := m.teardown(instance)
 	if err != nil {
-		// The teardown itself took the worker down (a control call hung):
-		// finish the way a stop on a down worker does, so the caller gets
-		// its success now rather than from a second attempt.
+		// The teardown itself took the worker down (a control call hung), or
+		// the worker went down while it waited for its slot: finish the way a
+		// stop on a down worker does, so the caller gets its success now
+		// rather than from a second attempt.
 		if instance.Worker != "" && m.workerIsDown(instance.Worker) {
 			m.log.warnf("worker %s went down during the stop of instance %d: clearing its records without further docker teardown", instance.Worker, instance.Id)
 			return m.removeInstanceMetadata(instance.Id)

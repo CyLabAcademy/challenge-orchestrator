@@ -82,8 +82,8 @@ func (m *Manager) initDocker() error {
 	// backend, so two slots measured best on iptables and nftables showed
 	// no gain past two either; the range is open for re-measuring.
 	m.launchConcurrency = m.envSlots("CMGR_CONCURRENT_LAUNCHES", 2)
-	m.launchSemaphore = make(chan struct{}, m.launchConcurrency)
-	m.log.infof("launch slots per daemon: %d", m.launchConcurrency)
+	m.localQueue = newDaemonQueue(m.launchConcurrency)
+	m.log.infof("launch and teardown slots per daemon: %d", m.launchConcurrency)
 
 	chalInterface, isSet := os.LookupEnv(IFACE_ENV)
 	if !isSet {
@@ -920,6 +920,23 @@ func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
 		}
 	}
 	return err
+}
+
+// teardown removes an instance's containers and network from its daemon
+// under a teardown slot (daemonQueue), waiting for one as long as it takes: a
+// stop must go through, and the queue is cmgrd's own. It is refused with
+// ErrWorkerDown once the instance's worker is down, which the callers treat
+// as the DB-only case.
+func (m *Manager) teardown(instance *InstanceMetadata) error {
+	release, err := m.acquireSlot(m.daemonQueue(instance).teardownSem, instance, "teardown", 0)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := m.stopContainers(instance); err != nil {
+		return err
+	}
+	return m.stopNetwork(instance)
 }
 
 // portsAlreadyKnown reports whether every published port for an image already has
