@@ -91,8 +91,8 @@ func TestLaunchSemaphoreEnforcesConcurrencyLimit(t *testing.T) {
 		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
 			t.Parallel()
 			mgr := &Manager{
-				log:             newLogger(DISABLED),
-				launchSemaphore: make(chan struct{}, limit),
+				log:        newLogger(DISABLED),
+				localQueue: newDaemonQueue(limit),
 			}
 
 			const workers = 8
@@ -105,8 +105,8 @@ func TestLaunchSemaphoreEnforcesConcurrencyLimit(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					// mirrors the exact pattern in startContainers
-					mgr.launchSemaphore <- struct{}{}
-					defer func() { <-mgr.launchSemaphore }()
+					mgr.localQueue.launchSem <- struct{}{}
+					defer func() { <-mgr.localQueue.launchSem }()
 
 					cur := inFlight.Add(1)
 					for {
@@ -133,19 +133,19 @@ func TestLaunchSemaphoreEnforcesConcurrencyLimit(t *testing.T) {
 // startContainers actually frees the slot so subsequent callers can proceed.
 func TestLaunchSemaphoreReleasedOnReturn(t *testing.T) {
 	mgr := &Manager{
-		log:             newLogger(DISABLED),
-		launchSemaphore: make(chan struct{}, 1),
+		log:        newLogger(DISABLED),
+		localQueue: newDaemonQueue(1),
 	}
 
 	acquire := func() func() {
-		mgr.launchSemaphore <- struct{}{}
-		return func() { <-mgr.launchSemaphore }
+		mgr.localQueue.launchSem <- struct{}{}
+		return func() { <-mgr.localQueue.launchSem }
 	}
 
 	release := acquire()
 	// slot is held — a non-blocking send should fail
 	select {
-	case mgr.launchSemaphore <- struct{}{}:
+	case mgr.localQueue.launchSem <- struct{}{}:
 		t.Fatal("acquired semaphore while it should be full")
 	default:
 	}
@@ -154,8 +154,8 @@ func TestLaunchSemaphoreReleasedOnReturn(t *testing.T) {
 	// slot is free — the next acquire must not block
 	done := make(chan struct{})
 	go func() {
-		mgr.launchSemaphore <- struct{}{}
-		<-mgr.launchSemaphore
+		mgr.localQueue.launchSem <- struct{}{}
+		<-mgr.localQueue.launchSem
 		close(done)
 	}()
 	select {

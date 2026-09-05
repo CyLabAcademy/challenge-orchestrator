@@ -106,7 +106,7 @@ func (m *Manager) launchStages(build *BuildMetadata, instance *InstanceMetadata,
 	if err := m.ensureImages(cli, build, instance, limits); err != nil {
 		return false, err
 	}
-	release, err := m.acquireSlot(m.launchSem(instance), instance, "launch", limits.slotWait)
+	release, err := m.acquireSlot(m.daemonQueue(instance).launchSem, instance, "launch", limits.slotWait)
 	if err != nil {
 		return false, err
 	}
