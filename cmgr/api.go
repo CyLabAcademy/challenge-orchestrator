@@ -310,6 +310,11 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string, l
 		iMeta.Worker = worker
 	}
 
+	// Refuse at once what would only be refused after the wait (admit).
+	if err := m.admit(iMeta, limits); err != nil {
+		return 0, err
+	}
+
 	err = m.openInstance(iMeta)
 	if err != nil {
 		return 0, err

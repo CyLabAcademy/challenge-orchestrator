@@ -32,7 +32,9 @@ import (
 // outright once the worker is down: under adverse load a request fails
 // fast, and the platform retries onto another worker instead of queueing
 // behind a wedged or saturated daemon. The bounds are a launchLimits; a
-// restart during a rebuild gets looser ones.
+// restart during a rebuild gets looser ones. A launch that would evidently
+// outwait its bound, judging by the launches already waiting on the daemon
+// and its recent pace, is refused before anything is recorded (admit).
 
 var (
 	// ErrWorkerBusy: no slot on the instance's daemon within the wait.
@@ -106,7 +108,7 @@ func (m *Manager) launchStages(build *BuildMetadata, instance *InstanceMetadata,
 	if err := m.ensureImages(cli, build, instance, limits); err != nil {
 		return false, err
 	}
-	release, err := m.acquireSlot(m.daemonQueue(instance).launchSem, instance, "launch", limits.slotWait)
+	release, err := m.acquireLaunchSlot(m.daemonQueue(instance), instance, limits.slotWait)
 	if err != nil {
 		return false, err
 	}
@@ -171,6 +173,47 @@ func (m *Manager) imagePresent(cli *client.Client, worker string, imageName stri
 	m.log.errorf("failed to inspect image '%s': %s", imageName, err)
 	m.noteWorkerTransportError(worker, err)
 	return false, err
+}
+
+// admit refuses a launch outright, before anything is recorded or the daemon
+// is called, when the launches already waiting on its daemon would keep it
+// waiting longer than its slot wait allows (expectedWait). The platform
+// launches through a bounded pool of workers, each blocked until its request
+// is answered, so a refusal that arrives only after the wait holds one of
+// them for the whole wait, and under load the pool drains into waiting; the
+// refusal also cost three write transactions, a docker round trip and a
+// goroutine parked here. Refusing at once costs nothing and hands the worker
+// its retry straight away. A launch with no bounded wait (a restart) is
+// always admitted, as is any launch until a hold time has been measured, and
+// any launch on an idle daemon, whatever its hold time.
+func (m *Manager) admit(instance *InstanceMetadata, limits launchLimits) error {
+	if limits.slotWait <= 0 {
+		return nil
+	}
+	expected, waiting := m.daemonQueue(instance).expectedWait()
+	if expected <= limits.slotWait {
+		return nil
+	}
+	return fmt.Errorf("%w: %d launches already waiting on %s, an expected wait of %s against a launch wait of %s",
+		ErrWorkerBusy, waiting, daemonLabel(instance), expected.Round(time.Millisecond), limits.slotWait)
+}
+
+// acquireLaunchSlot takes a launch slot on the daemon, counting the launch
+// among the waiting meanwhile and, once the slot is released, folding how
+// long it was held into the daemon's estimate (recordHold), which admit
+// reads.
+func (m *Manager) acquireLaunchSlot(q *daemonQueue, instance *InstanceMetadata, wait time.Duration) (func(), error) {
+	q.waiting.Add(1)
+	release, err := m.acquireSlot(q.launchSem, instance, "launch", wait)
+	q.waiting.Add(-1)
+	if err != nil {
+		return nil, err
+	}
+	acquired := time.Now()
+	return func() {
+		release()
+		q.recordHold(time.Since(acquired))
+	}, nil
 }
 
 // acquireSlot takes a slot on the instance's daemon, waiting at most wait

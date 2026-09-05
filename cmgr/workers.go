@@ -758,9 +758,15 @@ func (m *Manager) instanceClient(instance *InstanceMetadata) (*client.Client, er
 // and a launch's network create behind it ran into the control timeout and
 // marked the healthy worker down. Two pools rather than one so that stops and
 // launches do not starve each other.
+//
+// The queue also keeps what admission (admit in launch.go) reads: how many
+// launches are waiting for a launch slot, and a running estimate of how long
+// a launch slot is held.
 type daemonQueue struct {
 	launchSem   chan struct{}
 	teardownSem chan struct{}
+	waiting     atomic.Int32 // launches waiting for a launch slot
+	holdNanos   atomic.Int64 // recent hold time of a launch slot (recordHold)
 }
 
 func newDaemonQueue(slots int) *daemonQueue {
@@ -768,6 +774,46 @@ func newDaemonQueue(slots int) *daemonQueue {
 		launchSem:   make(chan struct{}, slots),
 		teardownSem: make(chan struct{}, slots),
 	}
+}
+
+// recordHold folds one launch slot's hold time into the running estimate: a
+// quarter of the new sample and three quarters of the old, so the estimate
+// follows the daemon's current pace within a handful of launches, and a
+// daemon coming out of a wedge sheds its inflated estimate as quickly.
+// Concurrent updates may lose one another's sample; an estimate can afford
+// that.
+func (q *daemonQueue) recordHold(d time.Duration) {
+	old := time.Duration(q.holdNanos.Load())
+	if old == 0 {
+		q.holdNanos.Store(int64(d))
+		return
+	}
+	q.holdNanos.Store(int64(old*3/4 + d/4))
+}
+
+// expectedWait estimates how long a launch placed on the daemon now would
+// wait for a launch slot. A launch waits for nobody while a slot is free, so
+// only the launches ahead of it beyond the slots count: each of those has to
+// finish first, at the recent hold time, and the slots work through them
+// together.
+//
+// A daemon with room therefore estimates zero whatever its hold time, which
+// is what keeps a slow spell from outliving itself: the launches after it go
+// through, and their samples bring the estimate down. The estimate is zero as
+// well until a hold time has been measured, and for the nil queue of a
+// Manager without a daemon (tests).
+func (q *daemonQueue) expectedWait() (expected time.Duration, waiting int) {
+	if q == nil {
+		return 0, 0
+	}
+	hold := time.Duration(q.holdNanos.Load())
+	waiting = int(q.waiting.Load())
+	slots := cap(q.launchSem)
+	ahead := waiting + len(q.launchSem)
+	if hold == 0 || ahead < slots {
+		return 0, waiting
+	}
+	return hold * time.Duration(ahead-slots+1) / time.Duration(slots), waiting
 }
 
 // daemonQueue returns the queue of the daemon hosting the instance; each
