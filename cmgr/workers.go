@@ -211,9 +211,12 @@ func (m *Manager) pullCtx() (context.Context, context.CancelFunc) {
 
 // pollWorker keeps the worker's health flag current from its telemetry agent.
 // Runs until the conn is removed or replaced. Down is sticky: once set (by
-// telemetry silence or a docker transport failure) only a manual worker-add,
-// which rebuilds the conn and poller, recovers the worker — the usual fix for
-// a dead box is replacing it with a clone, not repairing it.
+// telemetry silence, a docker transport failure or SetWorkerDown) only a
+// manual worker-add, which rebuilds the conn and poller, recovers the worker —
+// the usual fix for a dead box is replacing it with a clone, not repairing it.
+// Those other two sources can mark the worker down while a poll is in flight,
+// so the poller stores its verdict through pollerSetHealth, which never
+// overwrites down.
 func (m *Manager) pollWorker(w *workerConn) {
 	url := fmt.Sprintf("http://%s:%d/health", w.ip, workerTelemetryPort)
 	httpClient := &http.Client{Timeout: workerPollTimeout}
@@ -227,16 +230,16 @@ func (m *Manager) pollWorker(w *workerConn) {
 		if err != nil {
 			misses++
 			if misses >= workerMaxMisses {
-				m.setWorkerHealth(w, workerDown)
+				m.markWorkerDown(w)
 			}
 			// Below the threshold: keep the last decision to ride out a blip.
 			return
 		}
 		misses = 0
 		if overloaded {
-			m.setWorkerHealth(w, workerOverloaded)
+			m.pollerSetHealth(w, workerOverloaded)
 		} else {
-			m.setWorkerHealth(w, workerOk)
+			m.pollerSetHealth(w, workerOk)
 		}
 	}
 
@@ -253,9 +256,30 @@ func (m *Manager) pollWorker(w *workerConn) {
 	}
 }
 
-func (m *Manager) setWorkerHealth(w *workerConn, h workerHealth) {
-	if prev := workerHealth(w.health.Swap(int32(h))); prev != h {
-		m.log.infof("worker %s: %s -> %s", w.ip, prev, h)
+// markWorkerDown stores down, the terminal state, unconditionally. It is
+// reached from telemetry silence (the poller), a docker transport failure
+// and SetWorkerDown; only worker-add undoes it, by replacing the conn.
+func (m *Manager) markWorkerDown(w *workerConn) {
+	if prev := workerHealth(w.health.Swap(int32(workerDown))); prev != workerDown {
+		m.log.infof("worker %s: %s -> down", w.ip, prev)
+	}
+}
+
+// pollerSetHealth stores the poller's verdict (ok or overloaded) unless the
+// worker is down. A plain swap would let a poll that started before a
+// worker-down or transport error land after it and flip the worker back to
+// ok, so the store is a compare-and-swap against the state the poller last
+// saw, retried until it either lands or finds the worker down.
+func (m *Manager) pollerSetHealth(w *workerConn, h workerHealth) {
+	for {
+		prev := workerHealth(w.health.Load())
+		if prev == workerDown || prev == h {
+			return
+		}
+		if w.health.CompareAndSwap(int32(prev), int32(h)) {
+			m.log.infof("worker %s: %s -> %s", w.ip, prev, h)
+			return
+		}
 	}
 }
 
@@ -274,7 +298,7 @@ func (m *Manager) noteWorkerTransportError(worker string, err error) {
 	if !ok {
 		return
 	}
-	m.setWorkerHealth(w, workerDown)
+	m.markWorkerDown(w)
 }
 
 // SetWorkerDown marks a worker down administratively, taking it out of
@@ -292,7 +316,7 @@ func (m *Manager) SetWorkerDown(ip string) error {
 	if !ok {
 		return &UnknownIdentifierError{Type: "worker", Name: ip}
 	}
-	m.setWorkerHealth(w, workerDown)
+	m.markWorkerDown(w)
 	return nil
 }
 
