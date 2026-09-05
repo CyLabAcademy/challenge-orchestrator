@@ -168,10 +168,13 @@ Workers:
 
   A worker goes down (sticky) after CMGR_WORKER_MAX_MISSES failed telemetry
   polls (30s of silence by default), a single hung/refused docker control
-  call, or a PATCH of {"health": "down"}; recovery is re-adding it (POST
-  /workers or cmgrd-cli worker-add). Stops for instances on a down worker
-  clear the records and return success without touching docker. DELETE on
-  /workers purges the worker and all of its instance records.
+  call, or a PATCH of {"health": "down"}. Recovery is the operator's call:
+  re-add it (POST /workers or cmgrd-cli worker-add) once the box is rebooted
+  or repaired, and its instances come back with it (their containers restart
+  on their own); or, when the box is terminated and recreated, DELETE it from
+  /workers, which purges the worker and all of its instance records, and add
+  the new one. Stops for instances on a down worker clear the records and
+  return success without touching docker.
 
   Whenever a worker is added, and for every worker at startup, the containers
   and cmgr-<id> networks cmgr created on it for instances it no longer records
