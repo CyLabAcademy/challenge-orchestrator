@@ -163,7 +163,9 @@ Challenges and instances:
 Workers:
   worker-add <ip> [<public address>]
       register a worker (or rebuild the connection of a down one); the
-      optional public address is what players are given for its instances
+      optional public address is what players are given for its instances;
+      containers and networks cmgr created on it for instances it no longer
+      records are removed first (as for every worker at cmgrd start)
   worker-remove <ip>
       purge the worker and all of its instance records
   worker-down <ip>

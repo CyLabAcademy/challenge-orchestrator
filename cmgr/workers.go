@@ -156,12 +156,17 @@ func (h workerHealth) String() string {
 // the local one. Health only gates placement of new instances; operations on
 // existing instances route through cli regardless.
 type workerConn struct {
-	ip        string
-	public    string // player-facing address (IP or hostname); "" = use ip
-	cli       *client.Client
-	health    atomic.Int32 // holds a workerHealth
-	launchSem chan struct{}
-	done      chan struct{} // closed on removal/replacement to stop the poller
+	ip     string
+	public string // player-facing address (IP or hostname); "" = use ip
+	cli    *client.Client
+	health atomic.Int32 // holds a workerHealth
+	// reconciled is set once the first reconcile pass has finished and the
+	// worker is about to be polled. Until then a control call that fails
+	// against it says nothing about the box: its daemon is expected to be
+	// unreachable while it starts, which is exactly what the pass waits out.
+	reconciled atomic.Bool
+	launchSem  chan struct{}
+	done       chan struct{} // closed on removal/replacement to stop the poller
 }
 
 type WorkerInfo struct {
@@ -269,10 +274,68 @@ func (m *Manager) newWorkerConn(ip, public string) (*workerConn, error) {
 		done:      make(chan struct{}),
 	}
 	// Fail closed for placement until the first successful poll — but as
-	// overloaded, not down: down is sticky and would never recover.
+	// overloaded, not down: down is sticky and would never recover. The
+	// poller only starts once the leftovers of instances cmgr no longer
+	// records on the box are gone (runWorker), so nothing is placed there
+	// before their ports and network names are free.
 	w.health.Store(int32(workerOverloaded))
-	go m.pollWorker(w)
+	go m.runWorker(w)
 	return w, nil
+}
+
+// runWorker reconciles the worker (reconcileWorker), then polls it
+// (pollWorker). A pass that does not finish is retried at the poll cadence,
+// the worker staying out of placement meanwhile, for as long as the poller
+// tolerates telemetry silence (maxMisses polls). A daemon that is merely
+// still starting when cmgrd starts or the worker is added therefore costs
+// seconds, not a worker-add.
+func (m *Manager) runWorker(w *workerConn) {
+	t := m.timing()
+	if m.reconcileWithRetries(w, m.reconcileWorker, time.Duration(t.maxMisses)*t.pollInterval, t.pollInterval) {
+		w.reconciled.Store(true)
+		m.pollWorker(w)
+	}
+}
+
+// reconcileWithRetries runs reconcile until it comes back done, waiting
+// interval between attempts, for at most budget. It reports whether the
+// worker is to be polled.
+//
+// Past the budget the two ways of not finishing part company. A daemon that
+// stayed unreachable marks the worker down, as a hung control call would.
+// A pass that reached the daemon but could not finish (a database read
+// failed, or the daemon refused a removal) lets the worker join placement
+// anyway, loudly: its leftovers hold host ports, so some launches there will
+// fail and be retried elsewhere, which is a smaller loss than holding a whole
+// box out of the fleet over one container the daemon will not remove.
+func (m *Manager) reconcileWithRetries(w *workerConn, reconcile func(*workerConn) reconcileResult, budget, interval time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for attempt := 1; ; attempt++ {
+		result := reconcile(w)
+		if result == reconcileDone {
+			return !w.gone()
+		}
+		if w.gone() {
+			return false
+		}
+		if attempt == 1 {
+			m.log.warnf("worker %s: reconcile %s; retrying for up to %s before it takes placements", w.ip, result, budget)
+		}
+		if !time.Now().Before(deadline) {
+			if result == reconcileUnreachable {
+				m.log.errorf("worker %s: its daemon stayed unreachable for %s; marking the worker down", w.ip, budget)
+				m.markWorkerDown(w)
+				return false
+			}
+			m.log.errorf("worker %s: could not be fully reconciled within %s; it takes placements with leftovers that may still hold host ports", w.ip, budget)
+			return true
+		}
+		select {
+		case <-w.done:
+			return false
+		case <-time.After(interval):
+		}
+	}
 }
 
 // controlCtx bounds one docker control-plane call (container/network
@@ -384,6 +447,17 @@ func (m *Manager) noteWorkerTransportError(worker string, err error) {
 	if !ok {
 		return
 	}
+	if !w.reconciled.Load() {
+		// The worker's first reconcile pass has not finished, and that pass
+		// is allowed to find the daemon unreachable for its whole budget: a
+		// box that is merely still booting is the case it exists for. A stop
+		// or a rebuild's restart that runs into the same daemon meanwhile
+		// must not pre-empt its verdict, because this one is terminal — the
+		// poller never starts after it, so a worker downed here needs another
+		// worker-add even once its daemon is up and the pass has finished.
+		m.log.debugf("worker %s: transport error before its first reconcile finished, leaving the verdict to the reconcile: %s", worker, err)
+		return
+	}
 	m.markWorkerDown(w)
 }
 
@@ -395,6 +469,7 @@ func (m *Manager) noteWorkerTransportError(worker string, err error) {
 //
 // Note this also switches that worker's instances to the DB-only stop path
 // (see stopInstance): their containers are no longer torn down over docker.
+// The worker-add that recovers the box removes what those stops left behind.
 func (m *Manager) SetWorkerDown(ip string) error {
 	m.workersMu.RLock()
 	w, ok := m.workers[ip]
@@ -457,6 +532,8 @@ func pollTelemetry(httpClient *http.Client, url string) (bool, error) {
 // the private IP). Workers are keyed by private IP; re-adding an existing one
 // (e.g. to recover a sticky-down worker) tears down its old connection and
 // poller, starts fresh, and replaces the public address with the one given.
+// Either way the box is reconciled before it takes placements: see
+// reconcileWorker.
 func (m *Manager) AddWorker(ip, public string) error {
 	if _, err := netip.ParseAddr(ip); err != nil {
 		return fmt.Errorf("invalid worker IP %q: %w", ip, err)
@@ -495,9 +572,10 @@ func (m *Manager) AddWorker(ip, public string) error {
 
 // RemoveWorker purges the worker: its instance rows (cascading port and
 // container assignments) and its registry entry are deleted, and its poller
-// is stopped. Containers still running on a live worker are not touched —
-// they are docker-reaper's or manual cleanup's problem. This is the recovery
-// path for a dead box: remove it, worker-add its replacement clone.
+// is stopped. Containers still running on a live worker are not touched
+// now: the box is expected to be on its way out. Should it ever be re-added,
+// reconcileWorker removes them then. This is the recovery path for a dead
+// box: remove it, worker-add its replacement clone.
 func (m *Manager) RemoveWorker(ip string) error {
 	m.workersMu.Lock()
 	defer m.workersMu.Unlock()

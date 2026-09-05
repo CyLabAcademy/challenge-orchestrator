@@ -890,10 +890,12 @@ func (m *Manager) startNetwork(instance *InstanceMetadata, opts NetworkOptions) 
 		// one another launch is about to use: the one path that relaunches an
 		// existing id, a rebuild's restart, runs under updateMu. Nothing of
 		// ours is on it: remove it and create again, each call under its own
-		// control timeout. A network that still has endpoints refuses removal;
-		// that failure is reported alongside the original conflict, and stays in the error chain,
-		// so that a removal which timed out or found the daemon gone still
-		// marks the worker down below.
+		// control timeout. A network that still has endpoints, the leftovers
+		// of a DB-only stop that reconcileWorker clears when the box rejoins
+		// placement, refuses removal; that failure is reported alongside the
+		// original conflict, and stays in the error chain, so that a removal
+		// which timed out or found the daemon gone still marks the worker
+		// down below.
 		m.log.warnf("stale challenge network %s already exists; removing it and retrying", netname)
 		rmCtx, rmCancel := m.controlCtx()
 		_, rmErr := cli.NetworkRemove(rmCtx, netname, client.NetworkRemoveOptions{})

@@ -173,6 +173,22 @@ Workers:
   clear the records and return success without touching docker. DELETE on
   /workers purges the worker and all of its instance records.
 
+  Whenever a worker is added, and for every worker at startup, the containers
+  and cmgr-<id> networks cmgr created on it for instances it no longer records
+  there (left behind by those stops, or by DELETE) are removed before it takes
+  placements, so their host ports are free again. A daemon that cannot be
+  reached at that point (still starting, say) is retried for as long as
+  telemetry silence is tolerated before the worker is marked down.
+
+  That cleanup is not guaranteed. When it reaches the daemon but cannot
+  finish, because a database read failed or the daemon refused a removal, it
+  is retried for the same span and the worker then takes placements anyway,
+  with an error naming it in the log. What is left holds its host ports, so a
+  launch there may fail on a bind and be retried elsewhere until the next
+  worker-add or cmgrd start reconciles the box again, or docker-reaper
+  removes the containers. The alternative, holding a whole box out of the
+  fleet over one container its daemon will not remove, costs more.
+
   Workers have two addresses: the private IP cmgrd dials, and an optional
   player-facing public address ("public" in the POST /workers body).
   Instance metadata reports the public one as "worker_public" (falling back

@@ -45,6 +45,40 @@ func TestPollerSetHealthNeverLeavesDown(t *testing.T) {
 	}
 }
 
+// A control call that fails while a worker's first reconcile pass is still
+// running says nothing about the box: the pass is deliberately waiting out a
+// daemon that is still starting. Downing it there is terminal — the poller
+// never starts — so one stop racing a rebooting worker would cost a
+// worker-add to undo.
+func TestTransportErrorSparesAnUnreconciledWorker(t *testing.T) {
+	cli, err := client.NewClientWithOpts(client.WithHost("unix://" + filepath.Join(t.TempDir(), "no-daemon.sock")))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer cli.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, refused := cli.Ping(ctx, client.PingOptions{})
+	if refused == nil {
+		t.Fatal("a ping to a missing socket succeeded")
+	}
+
+	m := &Manager{log: newLogger(DISABLED)}
+	w := testWorkerConn(workerOverloaded)
+	m.workers = map[string]*workerConn{w.ip: w}
+
+	m.noteWorkerTransportError(w.ip, refused)
+	if got := healthOf(w); got == workerDown {
+		t.Fatal("a transport error downed a worker whose first reconcile had not finished")
+	}
+
+	w.reconciled.Store(true)
+	m.noteWorkerTransportError(w.ip, refused)
+	if got := healthOf(w); got != workerDown {
+		t.Fatalf("health %s after a transport error on a reconciled worker, want down", got)
+	}
+}
+
 // A worker-down that lands while polls are in flight stays down. With the
 // old swap store, a poll that started before the worker-down could land
 // after it and flip the worker back to ok (seen by the e2e all-down step).

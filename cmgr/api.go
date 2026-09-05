@@ -396,7 +396,8 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 	// A down (or purged) worker cannot be reached: clear our records and
 	// report success so callers (the platform's stop/restart/TTL flows) are
 	// never wedged behind a dead box. Any containers actually left running
-	// are docker-reaper's or manual cleanup's problem.
+	// are removed if the box rejoins placement (reconcileWorker, on
+	// worker-add and at startup); until then they are docker-reaper's.
 	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
 		m.log.warnf("worker %s down: clearing instance %d records without docker teardown", instance.Worker, instance.Id)
 		return m.removeInstanceMetadata(instance.Id)
@@ -806,13 +807,29 @@ func (m *Manager) Prune() error {
 		m.log.infof("pruned %d old instances", count)
 	}
 
-	// Clean up unfinalized instances (crashed launches) older than 5 minutes
+	// Clean up unfinalized instances (crashed launches) older than 5 minutes.
+	//
+	// Their workers are read first, because deleting the rows is what makes
+	// their leftovers findable. A launch killed mid-flight leaves containers
+	// running (RestartPolicy "always"), and reconcileWorker spares them for
+	// exactly as long as a row still names them: the pass at cmgrd start
+	// walks straight past them. Once these rows are gone they are orphans,
+	// which is the state that pass exists to clear — so run it again, for
+	// just those workers, rather than leaving them to hold their published
+	// ports until the next worker-add or cmgrd start.
+	var gcWorkers []string
+	gcWorkerQuery := `SELECT DISTINCT worker FROM instances WHERE is_finalized = 0 AND created_at < datetime('now', '-5 minutes') AND worker != '';`
+	if err := m.db.Select(&gcWorkers, gcWorkerQuery); err != nil {
+		m.log.errorf("failed to list the workers of unfinalized instances: %s", err)
+	}
+
 	gcQuery := `DELETE FROM instances WHERE is_finalized = 0 AND created_at < datetime('now', '-5 minutes');`
 	gcRes, err := m.db.Exec(gcQuery)
 	if err == nil {
 		gcCount, _ := gcRes.RowsAffected()
 		if gcCount > 0 {
 			m.log.infof("garbage collected %d unfinalized instances", gcCount)
+			m.reclaimAfterGC(gcWorkers)
 		}
 	} else {
 		m.log.errorf("failed to garbage collect unfinalized instances: %s", err)
