@@ -162,10 +162,17 @@ Challenges and instances:
 
 Workers:
   worker-add <ip> [<public address>]
-      register a worker (or rebuild the connection of a down one); the
-      optional public address is what players are given for its instances
+      register a worker, or bring a down one back once it is rebooted or
+      repaired (its instances come back with it: their containers restart on
+      their own); the optional public address is what players are given for
+      its instances; containers and networks cmgr created on it for instances
+      it no longer records are removed first (as for every worker at cmgrd
+      start)
   worker-remove <ip>
-      purge the worker and all of its instance records
+      purge the worker and all of its instance records, for a box that is
+      terminated and recreated rather than rebooted (nothing on the worker
+      itself is touched; re-adding it cleans up); a persistent instance it
+      hosted is only relaunched by the next update-schema
   worker-down <ip>
       mark the worker down, taking it out of placement but keeping its records
   worker-list
@@ -204,7 +211,13 @@ If you would like to run your challenges manually, use the start and stop comman
 | CMGR_ENABLE_DISK_QUOTAS  | Enable disk quotas                                                                                                                 | unset (off)                                                              |
 | CMGR_PRUNE_AGE           | Maximum age of an on-demand instance (schema-managed instances are never pruned). Only affects the database, NOT the actual containers; docker-reaper cleans those | 1h                                                                       |
 | CMGR_DB_WAL              | Enable WAL journaling for SQLite                                                                                                   | on                                                                       |
-| CMGR_CONCURRENT_LAUNCHES | Max concurrent container launches per daemon. Accepted values are 1 or 2                                   | 2                                                                        |
+| CMGR_CONCURRENT_LAUNCHES | Launch slots per daemon (1-16), and as many teardown slots: network creation plus container starts, which dockerd serializes internally on either firewall backend; no gain measured past 2 | 2                                                                        |
+| CMGR_WORKER_POLL_INTERVAL | How often each worker's telemetry agent is polled                                                                                  | 500ms                                                                    |
+| CMGR_WORKER_POLL_TIMEOUT | Per-poll timeout; must be under the poll interval (clamped to half of it otherwise)                                                | 250ms                                                                    |
+| CMGR_WORKER_MAX_MISSES   | Consecutive failed polls before a worker is marked down (sticky until worker-add)                                                  | 60 (30s of silence)                                                      |
+| CMGR_WORKER_CONTROL_TIMEOUT | Ceiling for one container/network call to a worker's dockerd; hitting it marks the worker down                                     | 30s                                                                      |
+| CMGR_WORKER_PULL_TIMEOUT | Ceiling for one image pull before a launch; hitting it fails the launch as retryable (503) only. A restart during an update pulls under a 5m ceiling instead | 30s                                                                      |
+| CMGR_WORKER_LAUNCH_WAIT  | How long a launch waits for a launch slot before failing as retryable (503 with Retry-After); one that would evidently wait longer is refused at once | 10s                                                                      |
 | CMGR_REGISTRY            | Registry host location                                                                                                             | unset, set with an IP                                                    |
 | CMGR_REGISTRY_USER       | Unused                                                                                                                             | unset                                                                    |
 | CMGR_REGISTRY_TOKEN      | Unused, identity set by TLS cert                                                                                                   | unset                                                                    |
@@ -405,11 +418,15 @@ In multi-container challenges, the `user_id` and all `env` variables are propaga
 equally to **every** container in the build — there is no per-container filtering.
 
 **Note:** When a build is rebuilt, its on-demand instances (those launched via
-`POST /builds/<id>`) are torn down but **not** restarted, since the original
-`user_id` and `env` payload are not retained. Front-ends that automate rebuilds
-must re-issue `POST /builds/<id>` with the appropriate runtime configuration to
-bring those instances back up. Persistent (schema-managed) instances are
-restarted automatically as before.
+`POST /builds/<id>`) are stopped and removed, **not** restarted, since the
+original `user_id` and `env` payload are not retained; a `GET` on one of them
+afterwards is a 404. Front-ends that automate rebuilds must re-issue
+`POST /builds/<id>` with the appropriate runtime configuration to bring those
+instances back up. Persistent (schema-managed) instances are restarted
+automatically as before, pulling the new image before the old containers go;
+one that cannot be restarted (its worker down, the pull or the start failing)
+is removed like any stop on a down worker, and the next `update-schema`
+relaunches it.
 
 **Note:** Challenge metadata includes a derived `delivery_type` field
 (`"service"`, `"artifact_only"`, or `"flag_only"`) describing what competitors

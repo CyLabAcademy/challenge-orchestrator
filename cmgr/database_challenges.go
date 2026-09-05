@@ -682,12 +682,16 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 						continue
 					}
 
-					// Stop and tear down existing instances. For persistent (non-on-demand)
-					// instances also restart them with the new image. On-demand (dynamic)
-					// instances are started per-user with injected env vars, so they are
-					// only torn down here and not restarted. Non-service challenges never
-					// run instances, so any found here are placeholders left by older
-					// versions of cmgr and are removed entirely.
+					// Stop and tear down existing instances. Persistent (schema-managed)
+					// instances are restarted in place with the new image. On-demand
+					// (dynamic) instances are started per user with injected env vars
+					// that are not retained, so they cannot be restarted: they are
+					// removed entirely (containers, network and record), and the
+					// platform re-issues POST /builds/<id> for the ones it still wants,
+					// instead of being left as hollow records that only a later stop or
+					// the prune age would clear. Non-service challenges never run
+					// instances, so any found here are placeholders left by older
+					// versions of cmgr and are removed the same way.
 					revPortMap, err := m.getReversePortMap(build.Challenge)
 					if err != nil {
 						errs = append(errs, err)
@@ -700,36 +704,35 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 					}
 					for _, iid := range instances {
 						instance, err := m.lookupInstanceMetadata(iid)
-						if err == nil && !cMeta.NeedsInstance() {
+						if err != nil {
+							errs = append(errs, err)
+							continue
+						}
+						if build.InstanceCount == DYNAMIC_INSTANCES || !cMeta.NeedsInstance() {
 							if err = m.stopInstance(instance); err != nil {
 								errs = append(errs, err)
 							}
 							continue
 						}
-						// stopContainers releases the port assignments; the
-						// restart below reclaims them (same numbers when free)
-						// so the instance keeps its address across the rebuild.
-						var previousPorts map[string]int
-						if err == nil {
-							previousPorts = instance.Ports
-							err = m.stopContainers(instance)
-						}
-						if err == nil {
-							err = m.stopNetwork(instance)
-						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
-							err = m.reassignPorts(build, instance, revPortMap, previousPorts)
-						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
-							err = m.startNetwork(instance, cMeta.ChallengeOptions.NetworkOptions)
-						}
-						if err == nil && build.InstanceCount != DYNAMIC_INSTANCES {
-							err = m.startContainers(build, instance, cMeta.ChallengeOptions.Overrides, nil, revPortMap)
+						// Restart in place, or remove. The restart pulls the new generation
+						// first, while the old one keeps serving, then swaps. One that cannot
+						// happen (its worker down: every docker call to it would only time
+						// out) or that fails at any point removes the instance instead, like
+						// any stop on a down worker, and reports it: the next update-schema
+						// relaunches it fresh. Left in place it would either count as present
+						// while dead, or come back serving the old image once its box rejoins,
+						// since a later update finds nothing to rebuild.
+						if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+							err = fmt.Errorf("worker %s is down", instance.Worker)
+						} else {
+							err = m.restartInstance(build, cMeta, instance, revPortMap)
 						}
 						if err != nil {
+							err = fmt.Errorf("instance %d of %s removed instead of restarted (%v); the next update-schema relaunches it", instance.Id, build.Challenge, err)
+							m.log.warn(err)
 							errs = append(errs, err)
-							if build.InstanceCount != DYNAMIC_INSTANCES {
-								m.rollbackRestart(instance)
+							if err = m.stopInstance(instance); err != nil {
+								errs = append(errs, err)
 							}
 						}
 					}

@@ -125,8 +125,37 @@ Relevant environment variables:
       filesystems (NFS, SMB) as this may cause corruption; set to 'false'
       to disable.
 
-  CMGR_CONCURRENT_LAUNCHES - the maximum number of concurrent container
-      launches allowed (defaults to 2); allowed values are 1 or 2.
+  CMGR_CONCURRENT_LAUNCHES - launch slots per docker daemon (defaults to 2;
+      1 to 16). A slot covers an instance's network creation and container
+      starts, which dockerd serializes internally on either firewall
+      backend: 2 measured as the optimum on iptables, and nftables showed no
+      gain past 2 either (it makes each launch faster, not more parallel).
+      The range is open for re-measuring, not for tuning. As many teardown
+      slots bound the stops in flight on a daemon: a deluge of stops queues
+      in cmgrd instead of inside dockerd, which it used to make slow, then
+      unresponsive.
+
+  CMGR_WORKER_POLL_INTERVAL, CMGR_WORKER_POLL_TIMEOUT, CMGR_WORKER_MAX_MISSES -
+      how often each worker's telemetry agent is polled (defaults to '500ms'),
+      the per-poll timeout (defaults to '250ms'; clamped to half the interval
+      when not under it)
+      and how many consecutive failed polls mark the worker down (defaults to
+      60, i.e. 30s of silence); down is sticky until the next worker-add.
+
+  CMGR_WORKER_CONTROL_TIMEOUT - ceiling for one container or network call to
+      a worker's docker daemon (defaults to '30s'); a call that hits it marks
+      the worker down.
+
+  CMGR_WORKER_PULL_TIMEOUT - ceiling for one image pull before a launch
+      (defaults to '30s'); a pull that hits it fails that launch as
+      retryable (503) but does not mark the worker down.
+
+  CMGR_WORKER_LAUNCH_WAIT - how long a launch waits for a launch slot on its
+      daemon (defaults to '10s'); past that it fails as retryable (503 with
+      Retry-After) instead of queueing behind a saturated daemon. A launch
+      that would evidently wait longer, judging by the launches already
+      waiting there and the daemon's recent pace, is refused the same way at
+      once, before anything is recorded.
 
   CMGR_REGISTRY - the docker registry holding built challenge images; when
       set, images are pulled from it before each instance start (must match
@@ -151,11 +180,42 @@ Workers:
   'academy-docker-worker' (the shared worker certificate), dockerd on port
   2376, and the telemetry agent on port 2136.
 
-  A worker goes down (sticky) after 30s of telemetry silence, a single
-  hung/refused docker control call, or a PATCH of {"health": "down"};
-  recovery is re-adding it (POST /workers or cmgrd-cli worker-add). Stops for instances on a down worker clear the
-  records and return success without touching docker. DELETE on /workers
-  purges the worker and all of its instance records.
+  A worker goes down (sticky) after CMGR_WORKER_MAX_MISSES failed telemetry
+  polls (30s of silence by default), a single hung/refused docker control
+  call, or a PATCH of {"health": "down"}. Recovery is the operator's call:
+  re-add it (POST /workers or cmgrd-cli worker-add) once the box is rebooted
+  or repaired, and its instances come back with it (their containers restart
+  on their own); or, when the box is terminated and recreated, DELETE it from
+  /workers, which purges the worker and all of its instance records, and add
+  the new one. Stops for instances on a down worker clear the records and
+  return success without touching docker.
+
+  Whenever a worker is added, and for every worker at startup, the containers
+  and cmgr-<id> networks cmgr created on it for instances it no longer records
+  there (left behind by those stops, or by DELETE) are removed before it takes
+  placements, so their host ports and network names are free again. A daemon
+  that cannot be reached at that point (still starting, say) is retried for
+  as long as telemetry silence is tolerated before the worker is marked down.
+
+  Under load a launch fails fast rather than queueing: it is refused at once
+  when the launches already waiting on its worker would keep it waiting
+  longer than CMGR_WORKER_LAUNCH_WAIT, waits at most that long otherwise, and
+  is refused as soon as its worker goes down; all three answer 503 with
+  Retry-After so the platform's retry is placed afresh. A stop whose worker
+  hangs mid-way clears the
+  records once the worker is marked down and returns success. Stops wait
+  for a teardown slot on their worker as long as it takes, since a stop must
+  go through, so a deluge of them queues in cmgrd, bounded, rather than
+  inside dockerd.
+
+  The restart of a persistent instance during an update is exempt, since
+  nothing retries it: it pulls the new image under a five-minute ceiling
+  while the old containers keep serving, then swaps them, waiting for its
+  slot as long as it takes. One that cannot be restarted (its worker down,
+  the pull or the start failed) is removed instead, like any stop on a down
+  worker, reported as an error of the update, and relaunched by the next
+  update-schema. The schema converge (add-schema, update-schema) launches
+  persistent instances under the same limits.
 
   Workers have two addresses: the private IP cmgrd dials, and an optional
   player-facing public address ("public" in the POST /workers body).
@@ -368,8 +428,13 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 			respCode = http.StatusNotFound
 		}
 		// Every worker was skipped: overloaded somewhere means retryable,
-		// everything down means a real failure.
-		if errors.Is(err, cmgr.ErrAllWorkersOverloaded) {
+		// everything down means a real failure. A launch refused by its own
+		// worker (no slot in time, the worker went down under it, or its
+		// image pull timed out) is retryable too, as is one that lost the
+		// race for the database's write lock: the retry is placed afresh.
+		if errors.Is(err, cmgr.ErrAllWorkersOverloaded) || errors.Is(err, cmgr.ErrWorkerBusy) ||
+			errors.Is(err, cmgr.ErrWorkerDown) || errors.Is(err, cmgr.ErrPullTimeout) ||
+			errors.Is(err, cmgr.ErrDatabaseBusy) {
 			respCode = http.StatusServiceUnavailable
 			w.Header().Set("Retry-After", "1")
 		}
@@ -488,6 +553,12 @@ func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {
 		respCode = http.StatusInternalServerError
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
+		}
+		// A stop that lost the race for the database's write lock is
+		// retryable, like a launch that did.
+		if errors.Is(err, cmgr.ErrDatabaseBusy) {
+			respCode = http.StatusServiceUnavailable
+			w.Header().Set("Retry-After", "1")
 		}
 		body = []byte(err.Error())
 	}

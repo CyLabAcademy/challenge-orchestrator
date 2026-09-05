@@ -77,17 +77,13 @@ func (m *Manager) initDocker() error {
 	}
 	m.hostOSType = info.Info.OSType
 
-	concurrencyLimit := 2
-	if envStr, isSet := os.LookupEnv("CMGR_CONCURRENT_LAUNCHES"); isSet {
-		if parsed, err := strconv.Atoi(envStr); err == nil && (parsed == 1 || parsed == 2) {
-			concurrencyLimit = parsed
-		} else {
-			m.log.warnf("invalid CMGR_CONCURRENT_LAUNCHES value '%s' (only 1 or 2 allowed), defaulting to %d", envStr, concurrencyLimit)
-		}
-	}
-	m.log.infof("setting launch concurrency limit to %d", concurrencyLimit)
-	m.launchConcurrency = concurrencyLimit
-	m.launchSemaphore = make(chan struct{}, concurrencyLimit)
+	// Per-daemon slots (see launch.go). dockerd serializes an instance's
+	// network creation and container starts internally on either firewall
+	// backend, so two slots measured best on iptables and nftables showed
+	// no gain past two either; the range is open for re-measuring.
+	m.launchConcurrency = m.envSlots("CMGR_CONCURRENT_LAUNCHES", 2)
+	m.localQueue = newDaemonQueue(m.launchConcurrency)
+	m.log.infof("launch and teardown slots per daemon: %d", m.launchConcurrency)
 
 	chalInterface, isSet := os.LookupEnv(IFACE_ENV)
 	if !isSet {
@@ -440,7 +436,8 @@ func (m *Manager) retagLegacyImages(db *sqlx.DB, id BuildId, challenge string, s
 			// interrupted run already produced the new tag, fall through so the
 			// registry push below still happens; otherwise nothing to recover —
 			// the next rebuild recreates the image under the new name.
-			if !needsPush || !m.workerHasTag(m.cli, newRef) {
+			newPresent, _ := m.imagePresent(m.cli, "", newRef)
+			if !needsPush || !newPresent {
 				m.log.debugf("legacy image %s not present; skipping retag", oldRef)
 				continue
 			}
@@ -506,23 +503,30 @@ func (m *Manager) pushImage(imageName string) error {
 }
 
 // pullImage pulls on the given daemon (workers pull with their own registry
-// certs via certs.d, so no credentials travel with the request). A pull that
-// exceeds workerPullTimeout fails the launch but never marks the worker down:
-// slow pulls are legitimate.
-func (m *Manager) pullImage(cli *client.Client, imageName string) error {
-	ctx, cancel := m.pullCtx()
+// certs via certs.d, so no credentials travel with the request), including
+// reading the pull stream, within timeout. A pull that exceeds it fails the
+// launch as retryable (ErrPullTimeout) but never marks the worker down: the
+// registry, not the worker, is the likelier culprit.
+func (m *Manager) pullImage(cli *client.Client, imageName string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(m.ctx, timeout)
 	defer cancel()
+	timedOut := func(err error) error {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %s after %s: %v", ErrPullTimeout, imageName, timeout, err)
+		}
+		return err
+	}
 	pullOpts := client.ImagePullOptions{RegistryAuth: m.authString}
 	pullResp, err := cli.ImagePull(ctx, imageName, pullOpts)
 	if err != nil {
 		m.log.errorf("failed to pull image '%s': %s", imageName, err)
-		return err
+		return timedOut(err)
 	}
 	messages, err := ioutil.ReadAll(pullResp)
 	pullResp.Close()
 	if err != nil {
 		m.log.errorf("failed to read pull response from docker: %s", err)
-		return err
+		return timedOut(err)
 	}
 	if streamErr := dockerStreamError(messages); streamErr != nil {
 		err = fmt.Errorf("failed to pull image '%s': %s", imageName, streamErr)
@@ -530,22 +534,6 @@ func (m *Manager) pullImage(cli *client.Client, imageName string) error {
 		return err
 	}
 	return nil
-}
-
-// workerHasTag reports whether the daemon already holds an image under the
-// given tag, in which case the pull before launch can be skipped. Tags are
-// content-addressed (see dockerId) and cmgrd is their sole writer, so a
-// present tag always names the right content. Any uncertainty (image missing,
-// inspect failure) returns false so the caller falls back to pulling.
-func (m *Manager) workerHasTag(cli *client.Client, imageName string) bool {
-	_, err := cli.ImageInspect(m.ctx, imageName)
-	if err != nil {
-		if !errdefs.IsNotFound(err) {
-			m.log.warnf("failed to inspect image '%s': %s", imageName, err)
-		}
-		return false
-	}
-	return true
 }
 
 func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
@@ -880,8 +868,32 @@ func (m *Manager) startNetwork(instance *InstanceMetadata, opts NetworkOptions) 
 	}
 	netname := instance.getNetworkName()
 	ctx, cancel := m.controlCtx()
-	defer cancel()
 	_, err = cli.NetworkCreate(ctx, netname, netSpec)
+	cancel()
+	if errdefs.IsConflict(err) {
+		// A network of this name can still exist on the daemon: one whose
+		// removal was cut short (it timed out client-side and finished on the
+		// daemon after its containers were gone), or the network of an earlier
+		// instance with this id, from before ids stopped being reused. Nothing
+		// of ours is on it: remove it and create again, each call under its
+		// own control timeout. A network that still has endpoints, the
+		// leftovers of a DB-only stop that reconcileWorker clears when the box
+		// rejoins placement, refuses removal; that failure is reported
+		// alongside the original conflict, and stays in the error chain, so
+		// that a removal which timed out or found the daemon gone still marks
+		// the worker down below.
+		m.log.warnf("stale challenge network %s already exists; removing it and retrying", netname)
+		rmCtx, rmCancel := m.controlCtx()
+		_, rmErr := cli.NetworkRemove(rmCtx, netname, client.NetworkRemoveOptions{})
+		rmCancel()
+		if rmErr != nil {
+			err = fmt.Errorf("%w (stale network not removed: %w)", err, rmErr)
+		} else {
+			retryCtx, retryCancel := m.controlCtx()
+			_, err = cli.NetworkCreate(retryCtx, netname, netSpec)
+			retryCancel()
+		}
+	}
 	if err != nil {
 		m.log.errorf("could not create challenge network (%s): %s", netname, err)
 		m.noteWorkerTransportError(instance.Worker, err)
@@ -910,6 +922,23 @@ func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
 	return err
 }
 
+// teardown removes an instance's containers and network from its daemon
+// under a teardown slot (daemonQueue), waiting for one as long as it takes: a
+// stop must go through, and the queue is cmgrd's own. It is refused with
+// ErrWorkerDown once the instance's worker is down, which the callers treat
+// as the DB-only case.
+func (m *Manager) teardown(instance *InstanceMetadata) error {
+	release, err := m.acquireSlot(m.daemonQueue(instance).teardownSem, instance, "teardown", 0)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := m.stopContainers(instance); err != nil {
+		return err
+	}
+	return m.stopNetwork(instance)
+}
+
 // portsAlreadyKnown reports whether every published port for an image already has
 // a non-zero host port reserved in ports, so the post-start read-back in
 // startContainers can be safely skipped. It is false when explicit ports are
@@ -931,41 +960,13 @@ func portsAlreadyKnown(portLow int, imagePorts []string, ports map[string]int, r
 	return true
 }
 
-func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetadata, opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string) error {
+func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetadata, opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string, limits launchLimits) error {
 	// Everything below runs against the daemon hosting this instance: the
 	// local one, or the recorded worker's.
 	cli, err := m.instanceClient(instance)
 	if err != nil {
 		return err
 	}
-
-	// Registry mode: make sure this daemon has the build's images before
-	// launching. Tags are content-addressed, so if the tag is already present
-	// the content is right and the pull is skipped entirely: a local inspect
-	// is cheap and doesn't serialize inside dockerd, while concurrent pulls
-	// of the same image convoy on shared metadata even when fully cached.
-	// Kept outside the launch semaphore: a cold pull must not stall the
-	// serialized launch section.
-	if m.challengeRegistry != "" {
-		for _, image := range build.Images {
-			if image.Host == "builder" {
-				continue
-			}
-			imageName := m.instanceImageName(build.Challenge, build, image)
-			if m.workerHasTag(cli, imageName) {
-				continue
-			}
-			if err := m.pullImage(cli, imageName); err != nil {
-				return err
-			}
-		}
-	}
-
-	// Each worker has its own launch semaphore so one busy daemon does not
-	// serialize launches on the others.
-	sem := m.launchSem(instance)
-	sem <- struct{}{}
-	defer func() { <-sem }()
 
 	// Call create in docker
 	netname := instance.getNetworkName()
@@ -1132,7 +1133,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			// The image vanished between the pre-launch digest check and the
 			// create (e.g. an image reaper on the worker). Pull and retry once.
 			m.log.warnf("image '%s' disappeared before create; pulling and retrying", cConfig.Image)
-			if err = m.pullImage(cli, cConfig.Image); err == nil {
+			if err = m.pullImage(cli, cConfig.Image, limits.pullTimeout); err == nil {
 				ccCtx, ccCancel = m.controlCtx()
 				respCC, err = cli.ContainerCreate(ccCtx, client.ContainerCreateOptions{
 					Config:           &cConfig,
@@ -1217,7 +1218,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 		}
 	}
 
-	return m.finalizeInstance(instance)
+	return retryableDB(m.finalizeInstance(instance))
 }
 
 func (m *Manager) stopContainers(instance *InstanceMetadata) error {
@@ -1237,13 +1238,18 @@ func (m *Manager) stopContainers(instance *InstanceMetadata) error {
 			} else {
 				m.log.errorf("failed to remove container: %s", err)
 				m.noteWorkerTransportError(instance.Worker, err)
+				if isTransportError(err) {
+					// The daemon is unreachable and the worker is down now;
+					// the remaining removals would only repeat the timeout.
+					break
+				}
 			}
 		}
 	}
 
 	mdErr := m.removeContainersMetadata(instance)
 	if mdErr != nil {
-		err = mdErr
+		err = retryableDB(mdErr)
 	}
 
 	return err
