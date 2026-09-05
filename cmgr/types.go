@@ -32,6 +32,7 @@ const (
 	WORKER_MAX_MISSES_ENV      string = "CMGR_WORKER_MAX_MISSES"
 	WORKER_CONTROL_TIMEOUT_ENV string = "CMGR_WORKER_CONTROL_TIMEOUT"
 	WORKER_PULL_TIMEOUT_ENV    string = "CMGR_WORKER_PULL_TIMEOUT"
+	WORKER_LAUNCH_WAIT_ENV     string = "CMGR_WORKER_LAUNCH_WAIT"
 
 	DYNAMIC_INSTANCES int = -1
 	LOCKED            int = -2
@@ -80,7 +81,7 @@ type Manager struct {
 	workerOrder       []string // round-robin iteration order over workers
 	rrCursor          int      // guarded by workersMu
 	placementEnabled  bool
-	launchConcurrency int          // per-daemon launch cap from CMGR_CONCURRENT_LAUNCHES
+	launchConcurrency int          // per-daemon launch slots from CMGR_CONCURRENT_LAUNCHES
 	workerTiming      workerTiming // poll/timeout tunables, from the environment (see timing())
 }
 

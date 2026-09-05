@@ -224,14 +224,22 @@ func (m *Manager) initDatabase() error {
 		}
 	}
 
-	// _busy_timeout=50 gives SQLite up to 50ms to retry acquiring a lock before
-	// returning SQLITE_BUSY; avoids instant failures under concurrent access.
+	// _busy_timeout=100 gives SQLite up to 100ms to acquire the write lock
+	// before returning SQLITE_BUSY. Commits take well under a millisecond and
+	// the platform has at most a few dozen requests in flight (each of its
+	// launch workers waits for its response), so launches contend for the
+	// lock for tens of milliseconds at worst, even now that each records its
+	// placement and per-worker ports. The ceiling leaves room for a bulk
+	// write (a prune, a worker-remove, a build finalizing) to overlap a
+	// burst, and is reached only by a stalled database, which a launch
+	// reports as retryable (see ErrDatabaseBusy). The previous 50ms left
+	// little margin over the contention itself.
 	// In WAL mode, _synchronous=NORMAL preserves database consistency but can lose
 	// the most recent committed transactions on a crash or power loss (potentially
 	// more than one), in exchange for better performance than FULL.
-	dsn := dbPath + "?_fk=true&_journal_mode=WAL&_busy_timeout=50&_synchronous=NORMAL"
+	dsn := dbPath + "?_fk=true&_journal_mode=WAL&_busy_timeout=100&_synchronous=NORMAL"
 	if walEnv, ok := os.LookupEnv(DB_WAL_ENV); ok && (walEnv == "false" || walEnv == "0" || walEnv == "off") {
-		dsn = dbPath + "?_fk=true&_busy_timeout=50"
+		dsn = dbPath + "?_fk=true&_busy_timeout=100"
 	}
 
 	db, err := sqlx.Open("sqlite3", dsn)

@@ -211,12 +211,13 @@ If you would like to run your challenges manually, use the start and stop comman
 | CMGR_ENABLE_DISK_QUOTAS  | Enable disk quotas                                                                                                                 | unset (off)                                                              |
 | CMGR_PRUNE_AGE           | Maximum age of an on-demand instance (schema-managed instances are never pruned). Only affects the database, NOT the actual containers; docker-reaper cleans those | 1h                                                                       |
 | CMGR_DB_WAL              | Enable WAL journaling for SQLite                                                                                                   | on                                                                       |
-| CMGR_CONCURRENT_LAUNCHES | Max concurrent container launches per daemon. Accepted values are 1 or 2                                   | 2                                                                        |
+| CMGR_CONCURRENT_LAUNCHES | Launch slots per daemon (1-16): network creation plus container starts, which dockerd serializes internally on either firewall backend; no gain measured past 2 | 2                                                                        |
 | CMGR_WORKER_POLL_INTERVAL | How often each worker's telemetry agent is polled                                                                                  | 500ms                                                                    |
 | CMGR_WORKER_POLL_TIMEOUT | Per-poll timeout; must be under the poll interval (clamped to half of it otherwise)                                                | 250ms                                                                    |
 | CMGR_WORKER_MAX_MISSES   | Consecutive failed polls before a worker is marked down (sticky until worker-add)                                                  | 60 (30s of silence)                                                      |
 | CMGR_WORKER_CONTROL_TIMEOUT | Ceiling for one container/network call to a worker's dockerd; hitting it marks the worker down                                     | 30s                                                                      |
-| CMGR_WORKER_PULL_TIMEOUT | Ceiling for one image pull on a worker; hitting it fails the launch but does not mark the worker down                              | 5m                                                                       |
+| CMGR_WORKER_PULL_TIMEOUT | Ceiling for one image pull before a launch; hitting it fails the launch as retryable (503) only. A restart during an update pulls under a 5m ceiling instead | 30s                                                                      |
+| CMGR_WORKER_LAUNCH_WAIT  | How long a launch waits for a launch slot before failing as retryable (503 with Retry-After)                                       | 10s                                                                      |
 | CMGR_REGISTRY            | Registry host location                                                                                                             | unset, set with an IP                                                    |
 | CMGR_REGISTRY_USER       | Unused                                                                                                                             | unset                                                                    |
 | CMGR_REGISTRY_TOKEN      | Unused, identity set by TLS cert                                                                                                   | unset                                                                    |
@@ -422,7 +423,10 @@ original `user_id` and `env` payload are not retained; a `GET` on one of them
 afterwards is a 404. Front-ends that automate rebuilds must re-issue
 `POST /builds/<id>` with the appropriate runtime configuration to bring those
 instances back up. Persistent (schema-managed) instances are restarted
-automatically as before.
+automatically as before, pulling the new image before the old containers go;
+one that cannot be restarted (its worker down, the pull or the start failing)
+is removed like any stop on a down worker, and the next `update-schema`
+relaunches it.
 
 **Note:** Challenge metadata includes a derived `delivery_type` field
 (`"service"`, `"artifact_only"`, or `"flag_only"`) describing what competitors

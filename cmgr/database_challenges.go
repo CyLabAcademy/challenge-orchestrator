@@ -714,26 +714,26 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 							}
 							continue
 						}
-						// stopContainers releases the port assignments; the
-						// restart below reclaims them (same numbers when free)
-						// so the instance keeps its address across the rebuild.
-						previousPorts := instance.Ports
-						err = m.stopContainers(instance)
-						if err == nil {
-							err = m.stopNetwork(instance)
-						}
-						if err == nil {
-							err = m.reassignPorts(build, instance, revPortMap, previousPorts)
-						}
-						if err == nil {
-							err = m.startNetwork(instance, cMeta.ChallengeOptions.NetworkOptions)
-						}
-						if err == nil {
-							err = m.startContainers(build, instance, cMeta.ChallengeOptions.Overrides, nil, revPortMap)
+						// Restart in place, or remove. The restart pulls the new generation
+						// first, while the old one keeps serving, then swaps. One that cannot
+						// happen (its worker down: every docker call to it would only time
+						// out) or that fails at any point removes the instance instead, like
+						// any stop on a down worker, and reports it: the next update-schema
+						// relaunches it fresh. Left in place it would either count as present
+						// while dead, or come back serving the old image once its box rejoins,
+						// since a later update finds nothing to rebuild.
+						if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+							err = fmt.Errorf("worker %s is down", instance.Worker)
+						} else {
+							err = m.restartInstance(build, cMeta, instance, revPortMap)
 						}
 						if err != nil {
+							err = fmt.Errorf("instance %d of %s removed instead of restarted (%v); the next update-schema relaunches it", instance.Id, build.Challenge, err)
+							m.log.warn(err)
 							errs = append(errs, err)
-							m.rollbackRestart(instance)
+							if err = m.stopInstance(instance); err != nil {
+								errs = append(errs, err)
+							}
 						}
 					}
 

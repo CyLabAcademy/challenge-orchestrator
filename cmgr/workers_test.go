@@ -109,12 +109,14 @@ func TestWorkerTimingFromEnv(t *testing.T) {
 	t.Setenv(WORKER_MAX_MISSES_ENV, "5")
 	t.Setenv(WORKER_CONTROL_TIMEOUT_ENV, "3s")
 	t.Setenv(WORKER_PULL_TIMEOUT_ENV, "1m")
+	t.Setenv(WORKER_LAUNCH_WAIT_ENV, "2s")
 	want := workerTiming{
 		pollInterval:   100 * time.Millisecond,
 		pollTimeout:    40 * time.Millisecond,
 		maxMisses:      5,
 		controlTimeout: 3 * time.Second,
 		pullTimeout:    time.Minute,
+		launchWait:     2 * time.Second,
 	}
 	if got := m.workerTimingFromEnv(); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)

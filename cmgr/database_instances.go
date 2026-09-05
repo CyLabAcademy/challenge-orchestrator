@@ -1,8 +1,29 @@
 package cmgr
 
 import (
+	"errors"
 	"fmt"
+
+	"github.com/mattn/go-sqlite3"
 )
+
+// ErrDatabaseBusy: SQLite's write lock was not obtained within its busy
+// timeout, which only a burst of concurrent launches brings about.
+// Retryable (cmgrd answers 503 with Retry-After): the same request goes
+// through moments later.
+var ErrDatabaseBusy = errors.New("database busy")
+
+// retryableDB marks a SQLite busy or locked error as ErrDatabaseBusy and
+// passes any other error through. Every write on the launch and stop paths
+// goes through it, so a request that loses the race for the write lock is
+// answered 503 whichever write it lost.
+func retryableDB(err error) error {
+	var se sqlite3.Error
+	if errors.As(err, &se) && (se.Code == sqlite3.ErrBusy || se.Code == sqlite3.ErrLocked) {
+		return fmt.Errorf("%w: %w", ErrDatabaseBusy, err)
+	}
+	return err
+}
 
 // reservePort claims a free host port for the instance on the daemon that
 // will run it. Pools are per worker (” = local daemon): the same port number
@@ -65,7 +86,7 @@ func (m *Manager) claimPort(instance InstanceId, worker string, name string, por
               WHERE NOT EXISTS (SELECT 1 FROM portAssignments WHERE port = ? AND worker = ?);`
 	res, err := m.db.Exec(query, instance, name, port, worker, port, worker)
 	if err != nil {
-		return false, err
+		return false, retryableDB(err)
 	}
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
@@ -133,21 +154,37 @@ func (m *Manager) reassignPortsUnchecked(build *BuildMetadata, instance *Instanc
 	return nil
 }
 
-// rollbackRestart undoes what a failed in-place restart (the rebuild path)
-// managed to bring up: any containers it created, its network, and the port
-// reservations made for them. The instance row itself stays, without live
-// resources or held ports, for the next update to retry; a fresh launch
-// removes its row instead (see newInstance), but a schema-managed instance
-// is expected to exist. Errors here are logged only: the restart's own
-// failure is the one reported.
-func (m *Manager) rollbackRestart(instance *InstanceMetadata) {
+// restartInstance moves a persistent instance onto its build's new images
+// during a rebuild: the pull first, while the old containers keep serving, so
+// that the downtime is the swap alone and a pull that fails leaves the old
+// generation running; then the teardown, the same ports (reassignPorts) and
+// the launch, under the restart limits and without a second image check. The
+// caller removes the instance on any failure.
+func (m *Manager) restartInstance(build *BuildMetadata, cMeta *ChallengeMetadata, instance *InstanceMetadata, revPortMap map[string]string) error {
+	cli, err := m.instanceClient(instance)
+	if err != nil {
+		return err
+	}
+	limits := m.restartLimits()
+	if err := m.ensureImages(cli, build, instance, limits); err != nil {
+		return err
+	}
+	limits.imagesEnsured = true
+	// stopContainers releases the port assignments; reassignPorts reclaims
+	// them (same numbers when free) so the instance keeps its address across
+	// the rebuild.
+	previousPorts := instance.Ports
 	if err := m.stopContainers(instance); err != nil {
-		m.log.warnf("could not remove the containers of instance %d after its failed restart: %s", instance.Id, err)
+		return err
 	}
 	if err := m.stopNetwork(instance); err != nil {
-		m.log.warnf("could not remove the network of instance %d after its failed restart: %s", instance.Id, err)
+		return err
 	}
-	m.releasePorts(instance)
+	if err := m.reassignPorts(build, instance, revPortMap, previousPorts); err != nil {
+		return err
+	}
+	_, err = m.launch(build, instance, cMeta.ChallengeOptions.NetworkOptions, cMeta.ChallengeOptions.Overrides, nil, revPortMap, limits)
+	return err
 }
 
 // releasePorts drops every port assignment recorded for the instance, both
@@ -164,7 +201,7 @@ func (m *Manager) openInstance(meta *InstanceMetadata) error {
 
 	if err != nil {
 		m.log.errorf("failed to create instance entry: %s", err)
-		return err
+		return retryableDB(err)
 	}
 
 	id, err := res.LastInsertId()
@@ -306,7 +343,7 @@ func (m *Manager) removeContainersMetadata(instance *InstanceMetadata) error {
 
 func (m *Manager) removeInstanceMetadata(instance InstanceId) error {
 	_, err := m.db.Exec("DELETE FROM instances WHERE id=?", instance)
-	return err
+	return retryableDB(err)
 }
 
 const removedSchemaInstancesQuery = `

@@ -276,10 +276,14 @@ func (m *Manager) Start(build BuildId, envVars map[string]string) (InstanceId, e
 		return 0, errors.New("locked build: change the schema definition to start more instances")
 	}
 
-	return m.newInstance(bMeta, envVars)
+	return m.newInstance(bMeta, envVars, m.requestLimits())
 }
 
-func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (InstanceId, error) {
+// newInstance records and launches an instance of the build on the daemon
+// placement picks, within limits: the request limits for a launch the
+// platform asked for, the restart limits for one the schema converge creates,
+// since nothing retries the latter.
+func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string, limits launchLimits) (InstanceId, error) {
 	cMeta, err := m.GetChallengeMetadata(build.Challenge)
 	if err != nil {
 		return 0, err
@@ -315,7 +319,7 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 
 	revPortMap, err := m.getReversePortMap(build.Challenge)
 	if err != nil {
-		m.removeInstanceMetadata(iMeta.Id)
+		m.clearInstanceRecords(iMeta.Id, "its port map could not be read")
 		return 0, err
 	}
 
@@ -328,7 +332,9 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 				portName := revPortMap[portStr]
 				hostPort, err := m.reservePort(iMeta.Id, iMeta.Worker, portName)
 				if err != nil {
-					m.stopInstance(iMeta)
+					// Nothing has reached the daemon: clear the records (port
+					// rows cascade) without a docker round trip.
+					m.clearInstanceRecords(iMeta.Id, "a port could not be reserved")
 					return 0, err
 				}
 				iMeta.Ports[portName] = hostPort
@@ -336,20 +342,30 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 		}
 	}
 
-	err = m.startNetwork(iMeta, cMeta.ChallengeOptions.NetworkOptions)
-	if err != nil {
-		m.stopInstance(iMeta)
-		return 0, err
-	}
-
-	err = m.startContainers(build, iMeta, cMeta.ChallengeOptions.Overrides, envVars, revPortMap)
-	if err != nil {
+	started, err := m.launch(build, iMeta, cMeta.ChallengeOptions.NetworkOptions, cMeta.ChallengeOptions.Overrides, envVars, revPortMap, limits)
+	if err != nil && started {
 		// It is possible we are in a partially deployed state.  Make sure
 		// we are torn down, but ignore the returned error.
 		m.stopInstance(iMeta)
+	} else if err != nil {
+		// Nothing reached the daemon: clear the records (port and container
+		// rows cascade) without a docker round trip, which against a wedged
+		// daemon would hold the retryable answer for another control timeout.
+		m.clearInstanceRecords(iMeta.Id, "its launch was refused before it reached the daemon")
 	}
 
 	return iMeta.Id, err
+}
+
+// clearInstanceRecords removes the records of an instance whose launch failed
+// before anything of it reached a daemon; its port and container rows cascade.
+// A failure here is logged rather than returned: the request is already
+// failing, and the row, never finalized, is reclaimed by the sweep in Prune a
+// few minutes later, so it holds its ports until then but not for good.
+func (m *Manager) clearInstanceRecords(id InstanceId, why string) {
+	if err := m.removeInstanceMetadata(id); err != nil {
+		m.log.errorf("could not clear the records of instance %d after %s: %s; the unfinalized-instance sweep reclaims them", id, why, err)
+	}
 }
 
 // Stops the running "instance".
@@ -384,12 +400,17 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 	}
 
 	err := m.stopContainers(instance)
-	if err != nil {
-		return err
+	if err == nil {
+		err = m.stopNetwork(instance)
 	}
-
-	err = m.stopNetwork(instance)
 	if err != nil {
+		// The teardown itself took the worker down (a control call hung):
+		// finish the way a stop on a down worker does, so the caller gets
+		// its success now rather than from a second attempt.
+		if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+			m.log.warnf("worker %s went down during the stop of instance %d: clearing its records without further docker teardown", instance.Worker, instance.Id)
+			return m.removeInstanceMetadata(instance.Id)
+		}
 		return err
 	}
 
@@ -558,7 +579,7 @@ func (m *Manager) convergeSchema(schema *Schema) []error {
 						break
 					}
 				}
-				_, err = m.newInstance(buildMeta, nil)
+				_, err = m.newInstance(buildMeta, nil, m.restartLimits())
 				if err != nil {
 					errs = append(errs, err)
 					break
