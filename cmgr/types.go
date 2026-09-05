@@ -63,6 +63,7 @@ type Manager struct {
 	pruneInterval      time.Duration
 	pruneAge           time.Duration
 	launchSemaphore    chan struct{}
+	policy             managerPolicy
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
 	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run
@@ -87,18 +88,28 @@ type HostInfo struct {
 
 type NetworkOptions struct{}
 
+// SeccompOptions selects the seccomp policy applied to a challenge's runtime
+// containers. A challenge that sets no profile keeps cmgr's embedded policy.
+type SeccompOptions struct {
+	Profile     string `json:"profile,omitempty"      yaml:"profile"`
+	ProfileHash string `json:"profile_hash,omitempty" yaml:"-"`
+
+	effectiveProfile string
+}
+
 type ContainerOptions struct {
-	Init            bool     `json:"init,omitempty"            yaml:"init"`
-	Cpus            string   `json:"cpus,omitempty"            yaml:"cpus"`
-	Memory          string   `json:"memory,omitempty"          yaml:"memory"`
-	Ulimits         []string `json:"ulimits,omitempty"         yaml:"ulimits"`
-	PidsLimit       int64    `json:"pidslimit,omitempty"       yaml:"pidslimit"`
-	ReadonlyRootfs  bool     `json:"readonlyrootfs,omitempty"  yaml:"readonlyrootfs"`
-	DroppedCaps     []string `json:"droppedcaps,omitempty"     yaml:"droppedcaps"`
-	NoNewPrivileges bool     `json:"nonewprivileges,omitempty" yaml:"nonewprivileges"`
-	DiskQuota       string   `json:"diskquota,omitempty"       yaml:"diskquota"`
-	CgroupParent    string   `json:"cgroupparent,omitempty"    yaml:"cgroupparent"`
-	CapImmutable    bool     `json:"capimmutable,omitempty"    yaml:"cap_immutable"`
+	Init            bool            `json:"init,omitempty"            yaml:"init"`
+	Cpus            string          `json:"cpus,omitempty"            yaml:"cpus"`
+	Memory          string          `json:"memory,omitempty"          yaml:"memory"`
+	Ulimits         []string        `json:"ulimits,omitempty"         yaml:"ulimits"`
+	PidsLimit       int64           `json:"pidslimit,omitempty"       yaml:"pidslimit"`
+	ReadonlyRootfs  bool            `json:"readonlyrootfs,omitempty"  yaml:"readonlyrootfs"`
+	DroppedCaps     []string        `json:"droppedcaps,omitempty"     yaml:"droppedcaps"`
+	NoNewPrivileges bool            `json:"nonewprivileges,omitempty" yaml:"nonewprivileges"`
+	DiskQuota       string          `json:"diskquota,omitempty"       yaml:"diskquota"`
+	CgroupParent    string          `json:"cgroupparent,omitempty"    yaml:"cgroupparent"`
+	CapImmutable    bool            `json:"capimmutable,omitempty"    yaml:"cap_immutable"`
+	Seccomp         *SeccompOptions `json:"seccomp,omitempty"    yaml:"seccomp,omitempty"`
 }
 
 type ChallengeOptions struct {

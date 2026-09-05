@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	dockeropts "github.com/docker/cli/opts"
 	"github.com/docker/go-units"
 )
 
@@ -45,6 +44,21 @@ func (m *Manager) loadChallenge(path string, info os.FileInfo) (*ChallengeMetada
 		md.ChallengeOptions.Overrides = make(map[string]ContainerOptions)
 	}
 	md.ChallengeOptions.Overrides[""] = md.ChallengeOptions.ContainerOptions
+
+	// Canonicalize an empty seccomp block (e.g. "seccomp: {}") to nil: the DB
+	// round trip persists it as the empty string and loads it back as nil
+	// (marshalSeccompOptions/unmarshalSeccompOptions), so leaving a non-nil
+	// empty struct here would make safeToRefresh's DeepEqual fail forever and
+	// escalate every metadata-only edit into a full rebuild.
+	if md.ChallengeOptions.ContainerOptions.Seccomp != nil && md.ChallengeOptions.ContainerOptions.Seccomp.Profile == "" {
+		md.ChallengeOptions.ContainerOptions.Seccomp = nil
+	}
+	for host, opts := range md.ChallengeOptions.Overrides {
+		if opts.Seccomp != nil && opts.Seccomp.Profile == "" {
+			opts.Seccomp = nil
+			md.ChallengeOptions.Overrides[host] = opts
+		}
+	}
 	m.log.debugf("challenge options: %#v", md.ChallengeOptions)
 
 	err = m.processDockerfile(md)
@@ -336,8 +350,15 @@ func (m *Manager) validateMetadata(md *ChallengeMetadata) error {
 			hostStr = fmt.Sprintf("host %s: ", host)
 		}
 
+		if opts.Seccomp != nil {
+			if err := opts.Seccomp.resolve(md.Path); err != nil {
+				lastErr = fmt.Errorf("%s%s", hostStr, err)
+				m.log.error(lastErr)
+			}
+		}
+
 		if opts.Cpus != "" {
-			_, err := dockeropts.ParseCPUs(opts.Cpus)
+			_, err := parseNanoCPUs(opts.Cpus)
 			if err != nil {
 				lastErr = fmt.Errorf("%serror parsing cpus container option: %v", hostStr, err)
 				m.log.error(lastErr)

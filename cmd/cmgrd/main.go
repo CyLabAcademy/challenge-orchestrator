@@ -93,6 +93,15 @@ Relevant environment variables:
 
   CMGR_ARTIFACT_DIR - directory for storing artifact bundles (defaults to '.')
 
+  CMGR_MAX_ARTIFACT_FILES - maximum number of entries permitted in a
+      challenge's artifact archive (defaults to 10000)
+
+  CMGR_MAX_ARTIFACT_BYTES - maximum total uncompressed size of a challenge's
+      artifact archive (defaults to '5g')
+
+  CMGR_MAX_ARTIFACT_FILE_BYTES - maximum uncompressed size of any single file
+      within a challenge's artifact archive (defaults to '1g')
+
   CMGR_LOGGING - controls the verbosity of the internal logging infrastructure
       and should be one of the following: debug, info, warn, error, or disabled
       (defaults to 'info')

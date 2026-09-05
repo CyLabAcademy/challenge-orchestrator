@@ -119,11 +119,13 @@ func (m *Manager) lookupChallengeMetadata(challenge ChallengeId) (*ChallengeMeta
 
 	containerOptions := new([]dbContainerOptions)
 	if err == nil {
-		err = txn.Select(containerOptions, "SELECT host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable FROM containerOptions WHERE challenge=?", challenge)
+		err = txn.Select(containerOptions, "SELECT host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable, seccomp FROM containerOptions WHERE challenge=?", challenge)
 	}
 	for _, dbOpts := range *containerOptions {
-		cOpts, err := newFromDbContainerOptions(dbOpts)
+		var cOpts ContainerOptions
+		cOpts, err = newFromDbContainerOptions(dbOpts)
 		if err != nil {
+			m.log.errorf("could not decode container options for '%s' (host '%s'): %s", challenge, dbOpts.Host, err)
 			break
 		}
 		if metadata.ChallengeOptions.Overrides == nil {
@@ -288,47 +290,43 @@ func (m *Manager) addChallenges(addedChallenges []*ChallengeMetadata) []error {
 		// 	continue
 		// }
 
+		optsFailed := false
 		for host, opts := range metadata.ChallengeOptions.Overrides {
 			host_str := ""
 			if host != "" {
 				host_str = fmt.Sprintf(" (%s)", host)
 			}
-			dbOpts, err := opts.toDbContainerOptions()
-			if err != nil {
-				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
-				}
-				break
+			dbOpts, optErr := opts.toDbContainerOptions()
+			if optErr == nil {
+				m.log.debugf("%s%s: %v", metadata.Id, host_str, dbOpts)
+				_, optErr = txn.Exec("INSERT INTO containerOptions(challenge, host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable, seccomp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+					metadata.Id,
+					host,
+					dbOpts.Init,
+					dbOpts.Cpus,
+					dbOpts.Memory,
+					dbOpts.Ulimits,
+					dbOpts.PidsLimit,
+					dbOpts.ReadonlyRootfs,
+					dbOpts.DroppedCaps,
+					dbOpts.NoNewPrivileges,
+					dbOpts.DiskQuota,
+					dbOpts.CgroupParent,
+					dbOpts.CapImmutable,
+					dbOpts.Seccomp)
 			}
-			m.log.debugf("%s%s: %v", metadata.Id, host_str, dbOpts)
-			_, err = txn.Exec("INSERT INTO containerOptions(challenge, host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-				metadata.Id,
-				host,
-				dbOpts.Init,
-				dbOpts.Cpus,
-				dbOpts.Memory,
-				dbOpts.Ulimits,
-				dbOpts.PidsLimit,
-				dbOpts.ReadonlyRootfs,
-				dbOpts.DroppedCaps,
-				dbOpts.NoNewPrivileges,
-				dbOpts.DiskQuota,
-				dbOpts.CgroupParent,
-				dbOpts.CapImmutable)
-			if err != nil {
-				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
+			if optErr != nil {
+				m.log.error(optErr)
+				errs = append(errs, optErr)
+				if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+					m.log.error(rbErr)
+					return append(errs, rbErr)
 				}
+				optsFailed = true
 				break
 			}
 		}
-		if err != nil {
+		if optsFailed {
 			continue
 		}
 
@@ -580,42 +578,38 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 			continue
 		}
 
+		optsFailed := false
 		for host, opts := range metadata.ChallengeOptions.Overrides {
-			dbOpts, err := opts.toDbContainerOptions()
-			if err != nil {
-				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
-				}
-				break
+			dbOpts, optErr := opts.toDbContainerOptions()
+			if optErr == nil {
+				_, optErr = txn.Exec("INSERT INTO containerOptions(challenge, host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable, seccomp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+					metadata.Id,
+					host,
+					dbOpts.Init,
+					dbOpts.Cpus,
+					dbOpts.Memory,
+					dbOpts.Ulimits,
+					dbOpts.PidsLimit,
+					dbOpts.ReadonlyRootfs,
+					dbOpts.DroppedCaps,
+					dbOpts.NoNewPrivileges,
+					dbOpts.DiskQuota,
+					dbOpts.CgroupParent,
+					dbOpts.CapImmutable,
+					dbOpts.Seccomp)
 			}
-			_, err = txn.Exec("INSERT INTO containerOptions(challenge, host, init, cpus, memory, ulimits, pidslimit, readonlyrootfs, droppedcaps, nonewprivileges, diskquota, cgroupparent, capimmutable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-				metadata.Id,
-				host,
-				dbOpts.Init,
-				dbOpts.Cpus,
-				dbOpts.Memory,
-				dbOpts.Ulimits,
-				dbOpts.PidsLimit,
-				dbOpts.ReadonlyRootfs,
-				dbOpts.DroppedCaps,
-				dbOpts.NoNewPrivileges,
-				dbOpts.DiskQuota,
-				dbOpts.CgroupParent,
-				dbOpts.CapImmutable)
-			if err != nil {
-				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
+			if optErr != nil {
+				m.log.error(optErr)
+				errs = append(errs, optErr)
+				if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+					m.log.error(rbErr)
+					return append(errs, rbErr)
 				}
+				optsFailed = true
 				break
 			}
 		}
-		if err != nil {
+		if optsFailed {
 			continue
 		}
 
@@ -812,6 +806,7 @@ type dbContainerOptions struct {
 	DiskQuota       string
 	CgroupParent    string
 	CapImmutable    bool
+	Seccomp         string
 }
 
 func newFromDbContainerOptions(dbOpts dbContainerOptions) (ContainerOptions, error) {
@@ -847,6 +842,11 @@ func newFromDbContainerOptions(dbOpts dbContainerOptions) (ContainerOptions, err
 
 	cOpts.CgroupParent = dbOpts.CgroupParent
 	cOpts.CapImmutable = dbOpts.CapImmutable
+
+	cOpts.Seccomp, err = unmarshalSeccompOptions(dbOpts.Seccomp)
+	if err != nil {
+		return cOpts, err
+	}
 
 	return cOpts, nil
 }
@@ -884,6 +884,11 @@ func (cOpts ContainerOptions) toDbContainerOptions() (dbContainerOptions, error)
 
 	dbOpts.CgroupParent = cOpts.CgroupParent
 	dbOpts.CapImmutable = cOpts.CapImmutable
+
+	dbOpts.Seccomp, err = marshalSeccompOptions(cOpts.Seccomp)
+	if err != nil {
+		return dbOpts, err
+	}
 
 	return dbOpts, nil
 }

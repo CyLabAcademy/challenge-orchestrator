@@ -196,6 +196,58 @@ containers.
   challenges that explicitly require immutable file attribute management. Specify a boolean value,
   as shown in the example below. Defaults to `false`.
 
+- The `seccomp` option replaces the seccomp policy applied to the challenge's runtime containers.
+  By default every Linux container receives cmgr's embedded policy; set `seccomp.profile` to the
+  filename of a JSON seccomp profile to use that instead.
+
+  The profile must be a regular file sitting directly beside `problem.md` or `problem.json`. It
+  cannot be a symbolic link, live in a subdirectory, start with `.`, or reuse a challenge metadata
+  filename, and its name may contain only letters, digits, `_`, `-`, and `.`. Profiles are capped
+  at 1MB and are validated as seccomp documents before the challenge is accepted.
+
+  Because the profile sits in the challenge directory it contributes to the challenge's source
+  checksum, so editing it causes `cmgr update` to rebuild the challenge. (This is why profile
+  filenames may not begin with `.` -- hidden files are excluded from that checksum, so edits to
+  them would go unnoticed.)
+
+  A complete profile replaces cmgr's policy rather than extending it, so the usual starting point
+  is a copy of `cmgr/seccomp.json` with the specific rules a challenge needs. For example, a
+  legacy challenge that calls `personality(READ_IMPLIES_EXEC)` -- directly or via `setarch -X` --
+  needs cmgr's `personality` rule widened, since neither cmgr's policy nor Docker's default
+  permits that bit:
+
+  ```json
+  {
+    "names": ["personality"],
+    "action": "SCMP_ACT_ALLOW",
+    "args": [
+      {"index": 0, "value": 18446744073704964087, "op": "SCMP_CMP_MASKED_EQ"}
+    ]
+  }
+  ```
+
+  That mask is the bitwise complement of `0x460008`, permitting any combination of `UNAME26`,
+  `ADDR_NO_RANDOMIZE`, `PER_LINUX32`, and `READ_IMPLIES_EXEC`. It covers `setarch -R -X`, whereas
+  an exact-match rule on `READ_IMPLIES_EXEC` alone would not. Granting `READ_IMPLIES_EXEC` makes
+  readable pages executable and so defeats NX for that container; scope it to the challenges that
+  require it rather than applying it broadly.
+
+  The policy applies to runtime containers only. Build, artifact, and solver containers keep
+  cmgr's embedded policy. Unset by default.
+
+  Because per-host `overrides` are fully distinct and are not merged with the
+  top-level options, a host that has its own `overrides.<host>` block does not
+  inherit a top-level `seccomp` profile: that container falls back to cmgr's
+  embedded policy unless the override sets `seccomp` itself. Set the profile
+  under each host that needs it, or keep the challenge single-container.
+
+  Ready-to-copy profiles for common cases, including the one above, are in
+  [examples/seccomp/](seccomp/). Its README also records which syscalls the default policy
+  already denies, and why a restrictive "seccomp jail" cannot be built as a container profile.
+
+  A complete worked challenge using one is in [examples/execstack/](execstack/).
+
+
 ```yaml
 # sample challenge options:
 init: true
@@ -215,6 +267,8 @@ nonewprivileges: true
 diskquota: 256m
 cgroupparent: customcgroup.slice
 cap_immutable: true
+seccomp:
+    profile: execstack.json
 
 # only relevant for multi-container challenges:
 overrides:

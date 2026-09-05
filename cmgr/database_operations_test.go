@@ -1857,6 +1857,43 @@ func TestInitDatabaseRepairsStaleIsFinalizedDefault(t *testing.T) {
 	}
 }
 
+// TestLookupChallengeMetadataSurfacesOptionsDecodeError verifies that a
+// containerOptions row that fails to decode (e.g. a corrupt seccomp column)
+// causes lookupChallengeMetadata to return an error instead of silently
+// returning the challenge with no container options — which would launch
+// instances without any of their declared hardening.
+func TestLookupChallengeMetadataSurfacesOptionsDecodeError(t *testing.T) {
+	mgr := setupTestManager(t)
+	defer mgr.db.Close()
+
+	challenge := &ChallengeMetadata{
+		Id:            "test/corrupt-options",
+		Name:          "Corrupt Options",
+		Namespace:     "test",
+		ChallengeType: "custom",
+		Hosts:         []HostInfo{{Name: "challenge", Target: ""}},
+		PortMap:       map[string]PortInfo{},
+		Path:          "/tmp/test/problem.md",
+		ChallengeOptions: ChallengeOptions{
+			Overrides: map[string]ContainerOptions{
+				"": {ReadonlyRootfs: true},
+			},
+		},
+	}
+
+	if errs := mgr.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
+		t.Fatalf("addChallenges failed: %v", errs)
+	}
+
+	if _, err := mgr.db.Exec("UPDATE containerOptions SET seccomp='{not json' WHERE challenge=?", challenge.Id); err != nil {
+		t.Fatalf("failed to corrupt seccomp column: %s", err)
+	}
+
+	if _, err := mgr.lookupChallengeMetadata(challenge.Id); err == nil {
+		t.Fatal("expected lookupChallengeMetadata to fail on a corrupt seccomp column, got nil error")
+	}
+}
+
 // TestReassignPortsKeepsAddressAcrossRestart covers the rebuild path with a
 // port range configured: after stopContainers released an instance's ports,
 // reassignPorts must claim them again (the same numbers while free, a fresh

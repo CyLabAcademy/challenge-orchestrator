@@ -618,3 +618,45 @@ func TestTagLineRegex(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadMarkdownChallengeFailsOnSectionError verifies that an error while
+// processing a markdown section — here a duplicate mapping key, which yaml v3
+// rejects — fails the whole load rather than being logged and swallowed. A
+// swallowed error would load the challenge with zeroed container options and
+// deploy it without its declared hardening.
+func TestLoadMarkdownChallengeFailsOnSectionError(t *testing.T) {
+	mgr := newTestManager()
+
+	content := `# Dup Key Challenge
+
+- Namespace: cmgr/test
+- Type: custom
+- Category: test
+- Points: 1
+
+## Description
+
+A challenge.
+
+## Challenge Options
+
+` + "```yaml" + `
+memory: 512m
+memory: 1g
+` + "```" + `
+`
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "problem.md")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write problem.md: %s", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("failed to stat problem.md: %s", err)
+	}
+
+	if _, err := mgr.loadMarkdownChallenge(path, info); err == nil {
+		t.Fatal("expected loadMarkdownChallenge to fail on duplicate challenge-options key, got nil error")
+	}
+}

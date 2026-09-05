@@ -285,6 +285,15 @@ currently uses the following variables:
 
 - *CMGR\_ARTIFACT\_DIR*: directory for storing artifact bundles (defaults to '.')
 
+- *CMGR\_MAX\_ARTIFACT\_FILES*: maximum number of entries permitted in a
+  challenge's artifact archive (defaults to 10000)
+
+- *CMGR\_MAX\_ARTIFACT\_BYTES*: maximum total uncompressed size of a
+  challenge's artifact archive (defaults to '5g')
+
+- *CMGR\_MAX\_ARTIFACT\_FILE\_BYTES*: maximum uncompressed size of any single
+  file within a challenge's artifact archive (defaults to '1g')
+
 - *CMGR\_LOGGING*: logging verbosity for command clients (defaults to
 'disabled' for `cmgr` and 'warn' for `cmgrd`; valid options are `debug`,
 `info`, `warn`, `error`, and `disabled`)

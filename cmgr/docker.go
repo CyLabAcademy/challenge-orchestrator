@@ -2,7 +2,6 @@ package cmgr
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -23,7 +22,6 @@ import (
 	"time"
 
 	"github.com/containerd/errdefs"
-	dockeropts "github.com/docker/cli/opts"
 	"github.com/docker/go-units"
 	"github.com/jmoiron/sqlx"
 	"github.com/moby/moby/api/types/container"
@@ -761,6 +759,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	var hdr *tar.Header
 	var lookups map[string]string
 	var files []string
+	var stagedArtifactsPath string
 	var flag string
 	for hdr, err = cTar.Next(); err == nil; hdr, err = cTar.Next() {
 		m.log.debugf("found in tar: %s", hdr.Name)
@@ -788,71 +787,20 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 			delete(lookups, "flag")
 		} else if hdr.Name == "challenge/artifacts.tar.gz" {
-			artifactsFileName := bMeta.getArtifactsFilename()
-			// Iterate through reading filenames and copying over the tarball
-			artifactsFile, err := os.Create(filepath.Join(m.artifactsDir, artifactsFileName))
+			// Stage the new archive beside the final build-ID path and only
+			// promote it after validateBuild passes: a failed rebuild must leave
+			// the previous archive in place, because cmgrd keeps serving it (the
+			// build row is rolled back, not removed) and deleting it would turn
+			// every player download into a 500. The dot-prefixed name can never
+			// collide with a served "<id>.tar.gz" path.
+			stagedArtifactsPath = filepath.Join(m.artifactsDir, "."+bMeta.getArtifactsFilename()+".staged")
+			files, err = m.cacheArtifacts(cTar, stagedArtifactsPath)
 			if err != nil {
-				m.log.errorf("could not create cached artifacts archive: %s", err)
+				m.log.errorf("could not cache artifacts: %s", err)
 				return err
 			}
-			defer artifactsFile.Close()
-
-			srcGz, err := gzip.NewReader(cTar)
-			if err != nil {
-				m.log.errorf("could not gzip read artifacts file: %s", err)
-				return err
-			}
-
-			dstGz := gzip.NewWriter(artifactsFile)
-			srcTar := tar.NewReader(srcGz)
-			dstTar := tar.NewWriter(dstGz)
-
-			var h *tar.Header
-			for h, err = srcTar.Next(); err == nil; h, err = srcTar.Next() {
-				files = append(files, h.Name)
-				m.log.debugf("artifact found: %s", h.Name)
-				err = dstTar.WriteHeader(h)
-				if err != nil {
-					m.log.errorf("could not write header to artifacts file: %s", err)
-					return err
-				}
-
-				if h.Typeflag != tar.TypeDir {
-					_, err = io.Copy(dstTar, srcTar)
-					if err != nil {
-						m.log.errorf("could not write body to artifacts file: %s", err)
-						return err
-					}
-				}
-			}
-
-			if err != io.EOF {
-				m.log.errorf("error occurred during copy of artifacts: %s", err)
-				return err
-			}
-
-			err = dstTar.Close()
-			if err != nil {
-				m.log.errorf("error closing artifacts tar file: %s", err)
-				return err
-			}
-
-			err = srcGz.Close()
-			if err != nil {
-				m.log.errorf("error closing GZIP decoder: %s", err)
-				return err
-			}
-
-			err = dstGz.Close()
-			if err != nil {
-				m.log.errorf("error closing GZIP encoder: %s", err)
-				return err
-			}
-
-			err = artifactsFile.Close()
-			if err != nil {
-				m.log.errorf("error occurred when closing artifacts: %s", err)
-				return err
+			for _, name := range files {
+				m.log.debugf("artifact found: %s", name)
 			}
 		}
 	}
@@ -874,8 +822,23 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	bMeta.HasArtifacts = len(files) > 0
 
 	err = m.validateBuild(cMeta, bMeta, files)
+	if err == nil && stagedArtifactsPath != "" {
+		// Promote the validated archive into place; rename is atomic, so
+		// concurrent downloads see either the old or the new archive, never a
+		// partial one. The directory sync persists the swap across a crash.
+		finalArtifactsPath := filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename())
+		err = os.Rename(stagedArtifactsPath, finalArtifactsPath)
+		if err != nil {
+			m.log.errorf("could not promote artifact archive: %s", err)
+		} else if directory, dirErr := os.Open(m.artifactsDir); dirErr == nil {
+			_ = directory.Sync()
+			_ = directory.Close()
+		}
+	}
 	if err != nil {
-		os.Remove(bMeta.getArtifactsFilename())
+		if stagedArtifactsPath != "" {
+			os.Remove(stagedArtifactsPath)
+		}
 
 		// Free the build image now rather than waiting for the deferred
 		// container cleanup: while the extraction container exists it references
@@ -1082,7 +1045,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 		if hasContainerOpts {
 			hConfig.Init = &cOpts.Init
 			if cOpts.Cpus != "" {
-				nanoCpus, err := dockeropts.ParseCPUs(cOpts.Cpus)
+				nanoCpus, err := parseNanoCPUs(cOpts.Cpus)
 				if err != nil {
 					return err
 				}
@@ -1134,8 +1097,19 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			if hasContainerOpts && cOpts.CapImmutable {
 				hConfig.CapAdd = append(hConfig.CapAdd, "LINUX_IMMUTABLE")
 			}
-			m.log.debug("inserting custom seccomp profile")
-			hConfig.SecurityOpt = append(hConfig.SecurityOpt, "seccomp:"+seccompPolicy)
+			profile := seccompPolicy
+			if hasContainerOpts && cOpts.Seccomp != nil &&
+				cOpts.Seccomp.effectiveProfile != "" {
+				profile = cOpts.Seccomp.effectiveProfile
+				m.log.debugf(
+					"inserting challenge seccomp profile %s (%s)",
+					cOpts.Seccomp.Profile,
+					cOpts.Seccomp.ProfileHash,
+				)
+			} else {
+				m.log.debug("inserting custom seccomp profile")
+			}
+			hConfig.SecurityOpt = append(hConfig.SecurityOpt, "seccomp:"+profile)
 		}
 
 		nConfig := network.NetworkingConfig{

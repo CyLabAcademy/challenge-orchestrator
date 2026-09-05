@@ -19,8 +19,8 @@ import (
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	goldmarktext "github.com/yuin/goldmark/text"
+	"go.yaml.in/yaml/v3"
 	"golang.org/x/net/html"
-	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -159,13 +159,19 @@ func (m *Manager) loadMarkdownChallenge(path string, info os.FileInfo) (*Challen
 		}
 	}
 
+	// Section errors must fail the load: a swallowed error here (e.g. a YAML
+	// problem in "challenge options") would otherwise load the challenge with
+	// zeroed container options and deploy it without its declared hardening.
+	var sectionErr error
 	section := ""
 	startIdx := 0
 	for idx < len(lines) {
 		line = strings.TrimSpace(lines[idx])
 		match := sectionRe.FindStringSubmatch(line)
 		if match != nil && section != "" {
-			err = m.processMarkdownSection(md, section, lines, startIdx, idx)
+			if tmpErr := m.processMarkdownSection(md, section, lines, startIdx, idx); tmpErr != nil && sectionErr == nil {
+				sectionErr = tmpErr
+			}
 		}
 		if match != nil {
 			section = match[1]
@@ -175,7 +181,13 @@ func (m *Manager) loadMarkdownChallenge(path string, info os.FileInfo) (*Challen
 	}
 
 	if section != "" {
-		err = m.processMarkdownSection(md, section, lines, startIdx, idx)
+		if tmpErr := m.processMarkdownSection(md, section, lines, startIdx, idx); tmpErr != nil && sectionErr == nil {
+			sectionErr = tmpErr
+		}
+	}
+
+	if sectionErr != nil {
+		return nil, sectionErr
 	}
 
 	h := crc32.NewIEEE()
