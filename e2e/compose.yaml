@@ -24,7 +24,7 @@
 name: cork-e2e
 
 x-dind: &dind
-  image: docker:28.5.2-dind
+  image: docker:29.6.0-dind
   privileged: true
   environment:
     # Never let dind mint its own certificates: TLS is either configured from
@@ -126,6 +126,9 @@ services:
       # Long enough that a slow run cannot prune the scenario's own
       # on-demand instances out from under it (production uses 1h).
       CMGR_PRUNE_AGE: 24h
+      # Detect a silent or hung worker in 10s instead of production's 30s.
+      CMGR_WORKER_MAX_MISSES: "20"
+      CMGR_WORKER_CONTROL_TIMEOUT: 10s
     volumes:
       # The challenge tree lives in a volume so the scenario can edit a
       # challenge and run `update`; cork-entrypoint.sh seeds it from the

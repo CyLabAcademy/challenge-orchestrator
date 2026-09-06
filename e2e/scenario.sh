@@ -228,6 +228,14 @@ health_is() { [[ "$(worker_health "$1")" == "$2" ]]; }
 launch() {
   api POST "/builds/$1" "$(jq -cn --arg u "$2" --arg v "$3" '{user_id: $u, env: {CUSTOM_VAR: $v}}')"
 }
+# try_launch <build id> <user id> <custom var>: like launch, but prints the
+# HTTP status on the first line and the body after it, whatever the outcome.
+try_launch() {
+  curl -sS --connect-timeout 5 --max-time "$API_TIMEOUT" -w '\n%{http_code}' \
+    -X POST -H 'Content-Type: application/json' \
+    -d "$(jq -cn --arg u "$2" --arg v "$3" '{user_id: $u, env: {CUSTOM_VAR: $v}}')" "$CMGRD_SERVER/builds/$1" |
+    { body=$(cat); printf '%s\n%s\n' "${body##*$'\n'}" "${body%$'\n'*}"; }
+}
 
 # On-demand instance bookkeeping: track/forget keep OD_IDS and the per-instance
 # maps in step, so later steps and the teardown know what is live and where.
@@ -299,6 +307,35 @@ assert_gone_from_worker() {
 # reap <ip> <instance id> <instance json>: what docker-reaper does in
 # production for containers cmgrd could not or did not tear down.
 container_gone() { [[ "$(worker_status "$1" "/containers/$2/json")" == 404 ]]; }
+
+# orphan_gone <worker ip> <instance id> <instance json>: none of the
+# instance's containers and not its network are left on the worker, which is
+# what cmgrd's reconciliation of a re-added (or, at startup, every) worker
+# must achieve for instances it no longer records there.
+orphan_gone() {
+  local cid
+  for cid in $(jq -r '.containers[]' <<<"$3"); do
+    container_gone "$1" "$cid" || return 1
+  done
+  [[ "$(worker_status "$1" "/networks/cmgr-$2")" == 404 ]]
+}
+
+# plant_orphan <worker ip> <instance id>: a cmgr-managed container on a
+# cmgr-<id> network that no record refers to, as a DB-only stop leaves
+# behind. Prints the container id.
+plant_orphan() {
+  local ip=$1 id=$2 code cid image
+  image="$E2E_REGISTRY/$CH_ONDEMAND:${IMAGE_TAG[$CH_ONDEMAND]}"
+  code=$(worker_status "$ip" /networks/create -X POST -H 'Content-Type: application/json' -d "{\"Name\":\"cmgr-$id\",\"Driver\":\"bridge\"}")
+  [[ "$code" == 201 ]] || fail "could not plant network cmgr-$id on $ip: HTTP $code"
+  cid=$(worker_api "$ip" /containers/create -X POST -H 'Content-Type: application/json' \
+    -d "{\"Image\":\"$image\",\"Labels\":{\"cmgr.managed\":\"true\"},\"HostConfig\":{\"NetworkMode\":\"cmgr-$id\"}}" | jq -r .Id)
+  [[ -n "$cid" && "$cid" != null ]] || fail "could not plant a container from $image on $ip"
+  code=$(worker_status "$ip" "/containers/$cid/start" -X POST)
+  [[ "$code" == 204 ]] || fail "could not start the planted container on $ip: HTTP $code"
+  [[ "$(worker_api "$ip" "/containers/$cid/json" | jq -r .State.Running)" == true ]] || fail "the planted container on $ip is not running"
+  echo "$cid"
+}
 reap() {
   local cid code
   for cid in $(jq -r '.containers[]' <<<"$3"); do
@@ -340,17 +377,11 @@ assert_gone() {
 }
 
 # assert_torn_down <instance id>: what a rebuild does to an on-demand
-# instance. cmgrd removes its containers and network on the worker but keeps
-# the instance row (no containers, no ports) until the platform stops it; the
-# stop is then a plain 204.
+# instance: it cannot be restarted without its original launch payload, so
+# cmgrd removes its containers and network on the worker and its record,
+# exactly like a stop.
 assert_torn_down() {
-  local meta
-  meta=$(api GET "/instances/$1")
-  [[ "$(jq -r '.containers | length' <<<"$meta")" == 0 ]] || fail "instance $1 still lists containers after the rebuild"
-  [[ "$(jq -r '.ports // {} | length' <<<"$meta")" == 0 ]] || fail "instance $1 still holds ports after the rebuild"
-  assert_gone_from_worker "${INST_WORKER[$1]}" "$1" "${INST_META[$1]}"
-  [[ "$(api_status DELETE "/instances/$1")" == 204 ]] || fail "stopping the torn-down instance $1 was not a 204"
-  [[ "$(api_status GET "/instances/$1")" == 404 ]] || fail "instance $1 is still known after its stop"
+  assert_gone "$1" "${INST_WORKER[$1]}" "${INST_META[$1]}"
 }
 
 http_body() { curl -sf --max-time 3 "http://$1:$2/"; }
@@ -599,15 +630,49 @@ assert_gone "$id" "$w" "${INST_META[$id]}"
 forget "$id"
 ok "instance $id: containers and network gone from $w, second delete is a no-op"
 
+# ------------------------------------------- 7b. stale network self-heal
+
+step "stale network: a launch whose cmgr-<id> network already exists on the worker still starts (ids are never reused)"
+inst=$(launch "$OD_BUILD" "e2e-user-21" "e2e-value-21")
+id=$(jq -r .id <<<"$inst")
+[[ "$(api_status DELETE "/instances/$id")" == 204 ]] || fail "could not stop instance $id"
+# Ids are never reused (AUTOINCREMENT), so the next launch takes $id + 1,
+# and a stop must never bring an id back. Either worker may receive the
+# launch, so leave a stale network of that name on both.
+next=$((id + 1))
+for ip in "${WORKER_IPS[@]}"; do
+  code=$(worker_status "$ip" /networks/create -X POST -H 'Content-Type: application/json' -d "{\"Name\":\"cmgr-$next\",\"Driver\":\"bridge\"}")
+  [[ "$code" == 201 ]] || fail "could not plant network cmgr-$next on $ip: HTTP $code"
+done
+inst=$(launch "$OD_BUILD" "e2e-user-22" "e2e-value-22")
+[[ "$(jq -r .id <<<"$inst")" == "$next" ]] || fail "expected the launch to take instance id $next (never $id again), got $(jq -r .id <<<"$inst")"
+id=$next
+track "$inst" 22
+check_ondemand "$inst" 22
+w=${INST_WORKER[$id]}
+for ip in "${WORKER_IPS[@]}"; do
+  if [[ "$ip" != "$w" ]]; then
+    code=$(worker_status "$ip" "/networks/cmgr-$id" -X DELETE)
+    [[ "$code" == 204 ]] || fail "could not remove the unused planted network on $ip: HTTP $code"
+  fi
+done
+cmgrd-cli stop "$id"
+assert_gone "$id" "$w" "$inst"
+forget "$id"
+ok "instance $id started over a stale cmgr-$id network on $w: cmgrd replaced the network and the instance served; the stopped id was not reused"
+
 # ------------------------------------------------- 8. cmgrd restart
 
 step "cmgrd restart: workers and instances come back from the database"
 if have_outer; then
   cork=$(compose_container cork)
   [[ -n "$cork" ]] || fail "cork container not found via the outer docker API"
+  planted=$(plant_orphan "$WA" 999)
+  note "planted an orphan (cmgr.managed container on network cmgr-999, no record) on $WA"
   outer_ctl "$cork" restart
   retry 60 "cmgrd after restart" quiet api GET /version
   retry 30 "every worker to report ok again" all_workers_ok
+  retry 30 "the planted orphan to be removed from $WA" orphan_gone "$WA" 999 "{\"containers\":[\"$planted\"]}"
   [[ "$(api_status GET "/instances/$PERSIST_INST")" == 200 ]] || fail "persistent instance $PERSIST_INST forgotten across the restart"
   id=${OD_IDS[0]}
   meta=$(api GET "/instances/$id")
@@ -616,7 +681,7 @@ if have_outer; then
   inst=$(launch "$OD_BUILD" "e2e-user-5" "e2e-value-5")
   track "$inst" 5
   check_ondemand "$inst" 5
-  ok "after a restart the workers are re-polled to ok, instance $id is still served and stoppable, new launches work"
+  ok "after a restart the workers are re-polled to ok, the orphan on $WA was removed at startup, instance $id is still served, new launches work"
 else
   skip "needs the outer docker socket"
 fi
@@ -648,7 +713,7 @@ note "registry now holds $OD_TAG_G1 (rollback) and $OD_TAG_G2 (current)"
 for id in "${OD_IDS[@]}"; do
   assert_torn_down "$id"
 done
-note "${#OD_IDS[@]} on-demand instances were torn down on their workers and not restarted; their records stayed (no containers, no ports) until the platform's DELETE"
+note "${#OD_IDS[@]} on-demand instances were torn down on their workers and removed from cmgrd, not restarted"
 OD_IDS=()
 PERSIST_META_G2=$(api GET "/instances/$PERSIST_INST")
 [[ "$(jq -c '.containers | sort' <<<"$PERSIST_META_G2")" != "$(jq -c '.containers | sort' <<<"$PERSIST_META_G1")" ]] || fail "persistent instance $PERSIST_INST kept its old containers"
@@ -711,11 +776,11 @@ vmeta=${INST_META[$victim]}
 cmgrd-cli stop "$victim"
 [[ "$(api_status GET "/instances/$victim")" == 404 ]] || fail "instance $victim is still known after stop"
 assert_on_worker "$WB" "$vmeta"
-note "instance $victim cleared from cmgrd; its container still runs on $WB (docker-reaper's job in production)"
-reap "$WB" "$victim" "$vmeta"
-forget "$victim"
+note "instance $victim cleared from cmgrd; its container still runs on $WB until the worker is re-added"
 readd "$WB"
-ok "launches went to $WA only, the stop on $WB was DB-only, worker-add brought $WB back"
+retry 30 "worker-add to remove the leftovers of instance $victim from $WB" orphan_gone "$WB" "$victim" "$vmeta"
+forget "$victim"
+ok "launches went to $WA only, the stop on $WB was DB-only, worker-add brought $WB back and removed the leftovers"
 
 # ------------------------------------------------ 11. telemetry silence
 
@@ -727,8 +792,8 @@ if have_outer; then
   id=$(instance_on "$WB")
   STOPPED_SIDECAR=$sidecar
   outer_ctl "$sidecar" stop
-  note "stopped ${PUBLIC[$WB]}-telemetry; cmgrd tolerates 30s of silence (60 misses at 500ms)"
-  retry 60 "worker $WB to be marked down" health_is "$WB" down
+  note "stopped ${PUBLIC[$WB]}-telemetry; cmgrd tolerates 10s of silence here (CMGR_WORKER_MAX_MISSES=20 at 500ms)"
+  retry 20 "worker $WB to be marked down" health_is "$WB" down
   assert_on_worker "$WB" "${INST_META[$id]}"
   ok "worker $WB went down on telemetry silence; instance $id keeps running on it"
   outer_ctl "$sidecar" start
@@ -796,7 +861,7 @@ ok "all down: 500; worker-add restored both"
 
 # ------------------------------------------ 14. hung docker daemon
 
-step "hung dockerd: a control call that hangs marks the worker down; later stops on it clear records only"
+step "hung dockerd: a stop that hangs marks the worker down and still clears the records; a launch placed there fails fast as retryable"
 if have_outer; then
   ensure_instance_on "$WB" 18
   id=$(instance_on "$WB")
@@ -804,29 +869,61 @@ if have_outer; then
   [[ -n "$wb" ]] || fail "compose container for ${PUBLIC[$WB]} not found"
   PAUSED_WORKER=$wb # the EXIT trap unpauses if anything below fails
   outer_ctl "$wb" pause
-  note "paused ${PUBLIC[$WB]}'s dockerd (telemetry keeps answering); stopping instance $id, expect the 30s control timeout"
+  note "paused ${PUBLIC[$WB]}'s dockerd (telemetry keeps answering); stopping instance $id, expect one 10s control timeout"
   t=$(date +%s)
-  if cmgrd-cli stop "$id" >/dev/null 2>&1; then
-    fail "stop of instance $id succeeded against a paused daemon"
-  fi
-  note "stop failed after $(( $(date +%s) - t ))s"
+  cmgrd-cli stop "$id" >/dev/null 2>&1 || fail "the stop of instance $id did not succeed once its hung worker was declared down"
+  took=$(( $(date +%s) - t ))
+  note "stop returned success after ${took}s"
+  (( took < 25 )) || fail "the stop outlived the 10s control timeout (CMGR_WORKER_CONTROL_TIMEOUT)"
   health_is "$WB" down || fail "worker $WB was not marked down after the hung call"
-  [[ "$(api_status DELETE "/instances/$id")" == 204 ]] || fail "second stop of instance $id on the down worker was not a 204"
-  [[ "$(api_status GET "/instances/$id")" == 404 ]] || fail "instance $id still known"
+  [[ "$(api_status GET "/instances/$id")" == 404 ]] || fail "instance $id still known after the stop"
   outer_ctl "$wb" unpause
   PAUSED_WORKER=""
   retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
-  reap "$WB" "$id" "${INST_META[$id]}"
-  forget "$id"
   readd "$WB"
-  ok "hung call -> $WB down (sticky), records cleared on the second stop, worker-add after unpause recovered it"
+  retry 30 "worker-add to remove the leftovers of instance $id from $WB" orphan_gone "$WB" "$id" "${INST_META[$id]}"
+  forget "$id"
+  ok "hung stop -> $WB down (sticky) and the records cleared in the same call; worker-add after unpause recovered it and removed the leftovers"
+
+  # The launch side: pause it again while it is ok, so round robin places a
+  # launch there. That launch must fail within one control timeout, as a
+  # 503 the platform retries, and the other must land on the healthy worker.
+  outer_ctl "$wb" pause
+  PAUSED_WORKER=$wb
+  refused=0
+  for i in 19 20; do
+    t=$(date +%s)
+    out=$(try_launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i")
+    took=$(( $(date +%s) - t ))
+    code=${out%%$'\n'*}
+    body=${out#*$'\n'}
+    case "$code" in
+      200|201)
+        track "$body" "$i"
+        [[ "$(jq -r .worker <<<"$body")" == "$WA" ]] || fail "launch $i succeeded on the paused worker $WB"
+        ;;
+      503)
+        refused=$((refused + 1))
+        (( took < 25 )) || fail "the launch on the hung worker took ${took}s to fail; expected one control timeout"
+        health_is "$WB" down || fail "worker $WB is not down after the failed launch"
+        note "launch $i placed on $WB failed fast: 503 after ${took}s ($(head -c 120 <<<"$body"))"
+        ;;
+      *) fail "launch $i returned HTTP $code: $(head -c 200 <<<"$body")" ;;
+    esac
+  done
+  (( refused == 1 )) || fail "expected exactly one launch to be refused by the paused worker, got $refused"
+  outer_ctl "$wb" unpause
+  PAUSED_WORKER=""
+  retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
+  readd "$WB"
+  ok "a launch placed on the hung worker failed fast as retryable and took the worker down; the other landed on $WA; worker-add recovered $WB"
 else
   skip "needs the outer docker socket"
 fi
 
 # ------------------------------------------------- 15. worker-remove
 
-step "worker-remove: purges the worker and its instance records, leaving its containers to the reaper"
+step "worker-remove: purges the worker and its instance records, leaving its containers alone until it is re-added"
 ensure_instance_on "$WB" 15
 victims=()
 for id in "${OD_IDS[@]}"; do
@@ -837,12 +934,14 @@ cmgrd-cli worker-remove "$WB"
 for id in "${victims[@]}"; do
   [[ "$(api_status GET "/instances/$id")" == 404 ]] || fail "instance $id survived the removal of its worker"
   assert_on_worker "$WB" "${INST_META[$id]}"
-  reap "$WB" "$id" "${INST_META[$id]}"
-  forget "$id"
 done
 readd "$WB"
 [[ "$(api GET /workers | jq -r --arg ip "$WB" '.[] | select(.ip == $ip) | .instances')" == 0 ]] || fail "re-added worker $WB still counts instances"
-ok "worker $WB purged with ${#victims[@]} instance record(s), containers left running, re-added clean"
+for id in "${victims[@]}"; do
+  retry 30 "worker-add to remove the leftovers of instance $id from $WB" orphan_gone "$WB" "$id" "${INST_META[$id]}"
+  forget "$id"
+done
+ok "worker $WB purged with ${#victims[@]} instance record(s), containers left running until worker-add removed them, re-added clean"
 
 # -------------------------------------------------------------- 16. teardown
 
