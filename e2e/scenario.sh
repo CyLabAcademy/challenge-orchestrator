@@ -55,10 +55,16 @@ PORT_HIGH=20029
 # ---------------------------------------------------------------- helpers
 
 T0=$(date +%s)
+# Skipped steps are counted, not just printed: without the outer docker
+# socket five of the twenty steps are the only coverage of worker health and
+# the restart path, and a run that quietly drops them must not report the
+# same verdict as one that ran them.
+SKIPPED=0
+SKIPPED_NAMES=()
 step() { printf '\n=== [%4ds] %s\n' "$(( $(date +%s) - T0 ))" "$*"; }
 ok() { printf '  ok   %s\n' "$*"; }
 note() { printf '  --   %s\n' "$*"; }
-skip() { printf '  skip %s\n' "$*"; }
+skip() { SKIPPED=$((SKIPPED + 1)); SKIPPED_NAMES+=("$*"); printf '  skip %s\n' "$*"; }
 fail() { printf '  FAIL %s\n' "$*" >&2; exit 1; }
 quiet() { "$@" >/dev/null 2>&1; }
 
@@ -198,21 +204,16 @@ unfake_overload() { # unfake_overload <fake id>: back to the real sidecar
   unset 'FAKES[$1]'
 }
 
-# down_worker <worker ip>: cmgrd-cli worker-down, verified. cmgrd's poller
-# checks "already down" before it polls and stores the result after, so a
-# poll in flight during worker-down can overwrite the sticky down with the
-# poll's verdict (seen in cork's log as "ok -> down" then "down -> ok" within
-# a second). Re-issue once and say so; with that race fixed in cork the note
-# never appears.
+# down_worker <worker ip>: cmgrd-cli worker-down, verified at once. The PATCH
+# is handled synchronously and markWorkerDown swaps the health unconditionally,
+# so the very next read must say down: a poll already in flight cannot put the
+# worker back, because pollerSetHealth stores its verdict with a
+# compare-and-swap that refuses to leave down. This used to need a retry —
+# cork really did have that race — so a single call is the assertion.
 down_worker() {
   cmgrd-cli worker-down "$1"
-  sleep 1
-  if ! health_is "$1" down; then
-    note "worker-down on $1 was overwritten by an in-flight telemetry poll (cork race); re-issuing"
-    cmgrd-cli worker-down "$1"
-    sleep 1
-  fi
-  health_is "$1" down || fail "worker $1 is not reported down after worker-down"
+  health_is "$1" down ||
+    fail "worker $1 is not down on the read right after worker-down: an in-flight telemetry poll overwrote it (the race fixed in ab72f5d)"
 }
 
 # readd <worker ip>: the recovery path for a down or purged worker.
@@ -453,7 +454,16 @@ WB=${WORKER_IPS[1]}
 
 printf 'cork end-to-end scenario\n  cmgrd     %s\n  workers   %s\n  registry  %s\n' \
   "$CMGRD_SERVER" "$E2E_WORKERS" "$E2E_REGISTRY"
-if have_outer; then note "outer docker socket available: chaos steps enabled"; else note "outer docker socket unavailable or E2E_CHAOS=$E2E_CHAOS: chaos steps will be skipped"; fi
+# Latched once: every chaos step tests OUTER rather than re-probing, so a
+# socket that goes away mid-run fails the step that needed it instead of
+# turning into a skip nobody reads.
+OUTER=0
+if have_outer; then
+  OUTER=1
+  note "outer docker socket available: chaos steps enabled"
+else
+  note "outer docker socket unavailable or E2E_CHAOS=$E2E_CHAOS: chaos steps will be skipped"
+fi
 
 step "waiting for the fleet"
 retry 90 "cmgrd" quiet api GET /version
@@ -493,6 +503,12 @@ ok "$NWORKERS workers registered, telemetry-polled, and eligible for placement"
 step "scanning the challenge directory: cmgrd-cli update"
 [[ -d "$CHALLENGES_SEED" && -f "$CHALLENGES/$ONDEMAND_SRC" ]] || fail "challenge tree not mounted at $CHALLENGES (seed at $CHALLENGES_SEED)"
 restore_sources # undo edits left by an interrupted run
+# The CMGR_DIR volume is seeded from the read-only mount only when it is
+# empty, and run.sh never takes the fleet down with -v: a volume left over
+# from an older checkout would silently test challenges nobody has now.
+if ! seed_diff=$(diff -rq "$CHALLENGES_SEED" "$CHALLENGES" 2>&1); then
+  fail "the challenges volume does not match this checkout ($(head -3 <<<"$seed_diff" | tr '\n' ';')); run 'docker compose down -v' and bring the fleet back up"
+fi
 cmgrd-cli update --verbose | sed 's/^/       /'
 for id in "$CH_PERSISTENT" "$CH_ONDEMAND" "$CH_MAKE" "$CH_FLAGONLY"; do
   if ! has_line "$id" cmgrd-cli list; then fail "$id is not in the challenge list"; fi
@@ -645,9 +661,14 @@ id=$(jq -r .id <<<"$inst")
 # and a stop must never bring an id back. Either worker may receive the
 # launch, so leave a stale network of that name on both.
 next=$((id + 1))
+declare -A PLANTED_NET=()
 for ip in "${WORKER_IPS[@]}"; do
   code=$(worker_status "$ip" /networks/create -X POST -H 'Content-Type: application/json' -d "{\"Name\":\"cmgr-$next\",\"Driver\":\"bridge\"}")
   [[ "$code" == 201 ]] || fail "could not plant network cmgr-$next on $ip: HTTP $code"
+  # The planted network is byte for byte what cmgrd would create, so only its
+  # id distinguishes "removed and recreated" from "adopted the leftover".
+  PLANTED_NET[$ip]=$(worker_api "$ip" "/networks/cmgr-$next" | jq -r '.Id // empty')
+  [[ -n "${PLANTED_NET[$ip]}" ]] || fail "could not read the id of the planted network cmgr-$next on $ip"
 done
 inst=$(launch "$OD_BUILD" "e2e-user-22" "e2e-value-22")
 [[ "$(jq -r .id <<<"$inst")" == "$next" ]] || fail "expected the launch to take instance id $next (never $id again), got $(jq -r .id <<<"$inst")"
@@ -655,6 +676,10 @@ id=$next
 track "$inst" 22
 check_ondemand "$inst" 22
 w=${INST_WORKER[$id]}
+live_net=$(worker_api "$w" "/networks/cmgr-$id" | jq -r '.Id // empty')
+[[ -n "$live_net" ]] || fail "no cmgr-$id network on $w after the launch"
+[[ "$live_net" != "${PLANTED_NET[$w]}" ]] ||
+  fail "the launch adopted the stale network cmgr-$id on $w instead of removing it and creating its own"
 for ip in "${WORKER_IPS[@]}"; do
   if [[ "$ip" != "$w" ]]; then
     code=$(worker_status "$ip" "/networks/cmgr-$id" -X DELETE)
@@ -669,16 +694,30 @@ ok "instance $id started over a stale cmgr-$id network on $w: cmgrd replaced the
 # ------------------------------------------------- 8. cmgrd restart
 
 step "cmgrd restart: workers and instances come back from the database"
-if have_outer; then
+if (( OUTER )); then
   cork=$(compose_container cork)
   [[ -n "$cork" ]] || fail "cork container not found via the outer docker API"
   planted=$(plant_orphan "$WA" 999)
   note "planted an orphan (cmgr.managed container on network cmgr-999, no record) on $WA"
   outer_ctl "$cork" restart
   retry 60 "cmgrd after restart" quiet api GET /version
+  # Ordering, not eventual consistency: runWorker reconciles and only then
+  # starts the poller, so the first ok verdict must already be past the
+  # removals. Waiting for ok and then giving the orphan another 30s would
+  # pass just as well with the poller started first, which is the regression
+  # that puts launches on a box whose leftovers still hold its host ports.
+  retry 60 "worker $WA to report ok after the restart" health_is "$WA" ok
+  orphan_gone "$WA" 999 "{\"containers\":[\"$planted\"]}" ||
+    fail "worker $WA reported ok while the planted orphan was still on it: the reconcile did not finish before the poller started"
   retry 30 "every worker to report ok again" all_workers_ok
-  retry 30 "the planted orphan to be removed from $WA" orphan_gone "$WA" 999 "{\"containers\":[\"$planted\"]}"
-  [[ "$(api_status GET "/instances/$PERSIST_INST")" == 200 ]] || fail "persistent instance $PERSIST_INST forgotten across the restart"
+  pafter=$(api GET "/instances/$PERSIST_INST")
+  [[ -n "$pafter" && "$pafter" != null ]] || fail "persistent instance $PERSIST_INST forgotten across the restart"
+  # The record surviving says nothing about the containers: a startup
+  # reconcile that mistook a persistent instance's containers for orphans
+  # would leave the row and its ports untouched.
+  [[ "$(jq -c '.containers | sort' <<<"$pafter")" == "$(jq -c '.containers | sort' <<<"$PERSIST_META")" ]] ||
+    fail "persistent instance $PERSIST_INST changed containers across the restart"
+  assert_on_worker "$PERSIST_WORKER" "$pafter"
   id=${OD_IDS[0]}
   meta=$(api GET "/instances/$id")
   [[ "$(jq -r .worker <<<"$meta")" == "${INST_WORKER[$id]}" ]] || fail "instance $id lost its worker across the restart"
@@ -728,6 +767,15 @@ port=$(jq -r '.ports.socat // 0' <<<"$PERSIST_META_G2")
 [[ "$w" == "$(jq -r .worker <<<"$PERSIST_META_G1")" ]] || fail "persistent instance $PERSIST_INST moved workers on rebuild"
 [[ "$port" == "$(jq -r .ports.socat <<<"$PERSIST_META_G1")" ]] || fail "persistent instance $PERSIST_INST changed port on rebuild: $(jq -r .ports.socat <<<"$PERSIST_META_G1") -> $port"
 assert_on_worker "$w" "$PERSIST_META_G2"
+# The recorded container ids differ as soon as new ones exist; what matters is
+# that restartInstance tore the old ones down on the box rather than only
+# forgetting them. Nothing else would notice: reconcileWorker attributes a
+# container to the instance id in its network name, so a leftover of the same
+# instance is never an orphan.
+for cid in $(jq -r '.containers[]' <<<"$PERSIST_META_G1"); do
+  container_gone "$w" "$cid" ||
+    fail "generation 1 container $cid of the persistent instance is still on $w after the rebuild"
+done
 retry 30 "generation 2 of the persistent instance at $pub:$port" tcp_says "$pub" "$port" '' 'e2e-generation-2'
 inst=$(launch "$OD_BUILD" "e2e-user-6" "e2e-value-6")
 track "$inst" 6
@@ -782,15 +830,16 @@ cmgrd-cli stop "$victim"
 [[ "$(api_status GET "/instances/$victim")" == 404 ]] || fail "instance $victim is still known after stop"
 assert_on_worker "$WB" "$vmeta"
 note "instance $victim cleared from cmgrd; its container still runs on $WB until the worker is re-added"
-readd "$WB"
-retry 30 "worker-add to remove the leftovers of instance $victim from $WB" orphan_gone "$WB" "$victim" "$vmeta"
+readd "$WB" # returns only once $WB reports ok
+orphan_gone "$WB" "$victim" "$vmeta" ||
+  fail "worker $WB reported ok while the leftovers of instance $victim were still on it"
 forget "$victim"
 ok "launches went to $WA only, the stop on $WB was DB-only, worker-add brought $WB back and removed the leftovers"
 
 # ------------------------------------------------ 11. telemetry silence
 
 step "telemetry silence: a worker whose agent goes quiet is marked down after 30s and stays down until re-added"
-if have_outer; then
+if (( OUTER )); then
   sidecar=$(compose_container "${PUBLIC[$WB]}-telemetry")
   [[ -n "$sidecar" ]] || fail "no container for compose service ${PUBLIC[$WB]}-telemetry"
   ensure_instance_on "$WB" 16
@@ -815,7 +864,7 @@ fi
 # ------------------------------------------------------ 12. overloaded
 
 step "overloaded: a worker reporting overloaded is skipped for placement but not down, and recovers by itself"
-if have_outer; then
+if (( OUTER )); then
   ensure_instance_on "$WB" 17
   fake_overload "$WB"
   fake=$LAST_FAKE
@@ -840,7 +889,7 @@ fi
 # ------------------------------------- 13. every worker unavailable
 
 step "every worker unavailable: all overloaded is a 503 with Retry-After, all down is a 500"
-if have_outer; then
+if (( OUTER )); then
   fake_overload "$WA"
   fake_a=$LAST_FAKE
   fake_overload "$WB"
@@ -867,7 +916,7 @@ ok "all down: 500; worker-add restored both"
 # ------------------------------------------ 14. hung docker daemon
 
 step "hung dockerd: a stop that hangs marks the worker down and still clears the records; a launch placed there fails fast as retryable"
-if have_outer; then
+if (( OUTER )); then
   ensure_instance_on "$WB" 18
   id=$(instance_on "$WB")
   wb=$(compose_container "${PUBLIC[$WB]}")
@@ -879,7 +928,11 @@ if have_outer; then
   cmgrd-cli stop "$id" >/dev/null 2>&1 || fail "the stop of instance $id did not succeed once its hung worker was declared down"
   took=$(( $(date +%s) - t ))
   note "stop returned success after ${took}s"
-  (( took < 25 )) || fail "the stop outlived the 10s control timeout (CMGR_WORKER_CONTROL_TIMEOUT)"
+  # One timeout, not two: teardown returns a transport failure from
+  # stopContainers straight away rather than spending a second
+  # CMGR_WORKER_CONTROL_TIMEOUT on a network removal against the same
+  # unreachable daemon. 25s passed either way; a single-timeout stop is ~10s.
+  (( took < 15 )) || fail "the stop spent more than one control timeout (${took}s): teardown attempted the network removal against the unreachable daemon"
   health_is "$WB" down || fail "worker $WB was not marked down after the hung call"
   [[ "$(api_status GET "/instances/$id")" == 404 ]] || fail "instance $id still known after the stop"
   outer_ctl "$wb" unpause
@@ -896,6 +949,10 @@ if have_outer; then
   outer_ctl "$wb" pause
   PAUSED_WORKER=$wb
   refused=0
+  # A launch refused after placement has already inserted its row, so the
+  # rollback is the interesting half: nothing may be left recorded on the
+  # worker that refused it.
+  wb_before=$(api GET /workers | jq -r --arg ip "$WB" '.[] | select(.ip==$ip) | .instances')
   for i in 19 20; do
     t=$(date +%s)
     out=$(try_launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i")
@@ -917,6 +974,9 @@ if have_outer; then
     esac
   done
   (( refused == 1 )) || fail "expected exactly one launch to be refused by the paused worker, got $refused"
+  wb_after=$(api GET /workers | jq -r --arg ip "$WB" '.[] | select(.ip==$ip) | .instances')
+  [[ "$wb_after" == "$wb_before" ]] ||
+    fail "the refused launch left an instance record on $WB ($wb_before -> $wb_after)"
   outer_ctl "$wb" unpause
   PAUSED_WORKER=""
   retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
@@ -943,7 +1003,8 @@ done
 readd "$WB"
 [[ "$(api GET /workers | jq -r --arg ip "$WB" '.[] | select(.ip == $ip) | .instances')" == 0 ]] || fail "re-added worker $WB still counts instances"
 for id in "${victims[@]}"; do
-  retry 30 "worker-add to remove the leftovers of instance $id from $WB" orphan_gone "$WB" "$id" "${INST_META[$id]}"
+  orphan_gone "$WB" "$id" "${INST_META[$id]}" ||
+    fail "worker $WB reported ok while the leftovers of instance $id were still on it"
   forget "$id"
 done
 ok "worker $WB purged with ${#victims[@]} instance record(s), containers left running until worker-add removed them, re-added clean"
@@ -951,10 +1012,27 @@ ok "worker $WB purged with ${#victims[@]} instance record(s), containers left ru
 # -------------------------------------------------------------- 16. teardown
 
 step "teardown: stop the remaining on-demand instances, remove the schema, check the workers, builder, and registry are clean"
+# All at once rather than one at a time: the teardown semaphore is only ever
+# contended here, and a bounded wait, a double release or a release that never
+# happens all pass when the stops are sequential.
+stop_tmp=$(mktemp -d)
+t=$(date +%s)
 for id in "${OD_IDS[@]}"; do
-  cmgrd-cli stop "$id"
+  api_status DELETE "/instances/$id" >"$stop_tmp/$id" &
+done
+wait
+took=$(( $(date +%s) - t ))
+(( took < 60 )) || fail "${#OD_IDS[@]} concurrent stops took ${took}s: a teardown slot was leaked or never released"
+for id in "${OD_IDS[@]}"; do
+  code=$(cat "$stop_tmp/$id")
+  [[ "$code" == 204 ]] ||
+    fail "the concurrent stop of instance $id answered HTTP $code: a teardown slot was refused rather than waited for"
+done
+rm -rf "$stop_tmp"
+for id in "${OD_IDS[@]}"; do
   assert_gone "$id" "${INST_WORKER[$id]}" "${INST_META[$id]}"
 done
+note "${#OD_IDS[@]} instances stopped concurrently in ${took}s, none refused"
 PERSIST_META=$(api GET "/instances/$PERSIST_INST")
 PERSIST_WORKER=$(jq -r .worker <<<"$PERSIST_META")
 cmgrd-cli remove-schema "$SCHEMA_NAME"
@@ -978,4 +1056,9 @@ restore_sources
 cmgrd-cli worker-list | sed 's/^/       /'
 ok "instances gone from the workers, builds gone from cmgrd and the builder, tags gone from the registry, sources restored"
 
-printf '\nALL STEPS PASSED in %ds\n' "$(( $(date +%s) - T0 ))"
+if (( SKIPPED )); then
+  printf '\nPASSED WITH %d STEP(S) SKIPPED in %ds\n' "$SKIPPED" "$(( $(date +%s) - T0 ))"
+  printf '  not run: %s\n' "${SKIPPED_NAMES[@]}"
+else
+  printf '\nALL STEPS PASSED in %ds\n' "$(( $(date +%s) - T0 ))"
+fi
