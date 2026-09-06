@@ -20,6 +20,7 @@
 #   E2E_REGISTRY         registry address, as in CMGR_REGISTRY     zot.internal
 #   E2E_BUILDER          the builder daemon's plain-TCP API        http://builder:2375
 #   E2E_CHAOS            1 to run the outer-socket chaos steps     1
+#   E2E_FULL             1 to add the full-mode steps (run.sh --full) 0
 #   E2E_COMPOSE_PROJECT  compose project name, for those steps     cork-e2e
 #   E2E_IMAGE            image to run the fake telemetry from      cork-e2e/cork
 #   DOCKER_CERT_PATH     cork's worker client certificates         /root/.docker_certs
@@ -31,6 +32,7 @@ E2E_SCHEMA="${E2E_SCHEMA:-/opt/e2e/schema.yaml}"
 E2E_REGISTRY="${E2E_REGISTRY:-zot.internal}"
 E2E_BUILDER="${E2E_BUILDER:-http://builder:2375}"
 E2E_CHAOS="${E2E_CHAOS:-1}"
+E2E_FULL="${E2E_FULL:-0}"
 E2E_COMPOSE_PROJECT="${E2E_COMPOSE_PROJECT:-cork-e2e}"
 E2E_IMAGE="${E2E_IMAGE:-cork-e2e/cork}"
 DOCKER_CERT_PATH="${DOCKER_CERT_PATH:-/root/.docker_certs}"
@@ -61,10 +63,21 @@ T0=$(date +%s)
 # same verdict as one that ran them.
 SKIPPED=0
 SKIPPED_NAMES=()
+# A step left out because the mode did not ask for it is not the same as one
+# that could not run: the first is a choice, the second is a hole. Counting
+# them together would make the verdict say nothing.
+FULL=0
+if [[ "$E2E_FULL" == 1 ]]; then FULL=1; fi
+DESELECTED=0
+DESELECTED_NAMES=()
 step() { printf '\n=== [%4ds] %s\n' "$(( $(date +%s) - T0 ))" "$*"; }
 ok() { printf '  ok   %s\n' "$*"; }
 note() { printf '  --   %s\n' "$*"; }
 skip() { SKIPPED=$((SKIPPED + 1)); SKIPPED_NAMES+=("$*"); printf '  skip %s\n' "$*"; }
+# deselect <what>: a step this mode does not run. Regular runs print one line
+# per full-mode step so the difference between the modes is visible in the
+# transcript, not just in the documentation.
+deselect() { DESELECTED=$((DESELECTED + 1)); DESELECTED_NAMES+=("$*"); printf '  --   full mode only: %s\n' "$*"; }
 fail() { printf '  FAIL %s\n' "$*" >&2; exit 1; }
 quiet() { "$@" >/dev/null 2>&1; }
 
@@ -2176,6 +2189,10 @@ ok "instances gone from the workers, builds gone from cmgrd and the builder, tag
 if (( SKIPPED )); then
   printf '\nPASSED WITH %d STEP(S) SKIPPED in %ds\n' "$SKIPPED" "$(( $(date +%s) - T0 ))"
   printf '  not run: %s\n' "${SKIPPED_NAMES[@]}"
+  if (( DESELECTED )); then printf '  and %d full-mode step(s) this run did not ask for\n' "$DESELECTED"; fi
+elif (( DESELECTED )); then
+  printf '\nALL REGULAR-MODE STEPS PASSED in %ds\n' "$(( $(date +%s) - T0 ))"
+  printf '  %d full-mode step(s) not run; E2E_FULL=1 (run.sh --full) adds them\n' "$DESELECTED"
 else
   printf '\nALL STEPS PASSED in %ds\n' "$(( $(date +%s) - T0 ))"
 fi

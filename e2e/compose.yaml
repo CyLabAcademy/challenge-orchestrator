@@ -228,6 +228,7 @@ services:
       E2E_SCHEMA: /opt/e2e/schema.yaml
       E2E_REGISTRY: zot.internal
       E2E_CHAOS: ${E2E_CHAOS:-1}
+      E2E_FULL: ${E2E_FULL:-0}
       E2E_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-cork-e2e}
       E2E_IMAGE: cork-e2e/cork
       E2E_BUILDER: http://builder:2375

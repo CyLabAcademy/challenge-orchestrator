@@ -60,6 +60,13 @@ docker compose up -d --build   # PKI, registry, builder, workers + telemetry, co
 docker compose run --rm e2e    # the scenario
 ```
 
+`./run.sh` runs the regular mode; `./run.sh --full` (or `E2E_FULL=1`) adds the
+steps that are only worth their seconds when nobody is waiting: the registry's
+failure paths, artifact delivery, multi-container challenges, cold pulls,
+docker-reaper and container resource limits. A regular run names the full-mode
+steps it did not take, and its verdict says which mode it was, so the two are
+never confused for one another.
+
 `./run.sh` does both and stamps the cork image with `git describe`. A scenario
 run takes three to four minutes on a fast connection, most of it building and
 rebuilding the example challenges on the builder and waiting out the two 30 s
