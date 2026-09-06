@@ -145,6 +145,11 @@ services:
       # Detect a silent or hung worker in 10s instead of production's 30s.
       CMGR_WORKER_MAX_MISSES: "20"
       CMGR_WORKER_CONTROL_TIMEOUT: 10s
+      # How long a request launch waits for one of a worker's two launch slots
+      # before it is refused as busy, and the threshold admission control
+      # measures a daemon's backlog against. Production leaves this at the 10s
+      # default; 2s here so one burst overflows inside a run.
+      CMGR_WORKER_LAUNCH_WAIT: 2s
     volumes:
       # The challenge tree lives in a volume so the scenario can edit a
       # challenge and run `update`; cork-entrypoint.sh seeds it from the
