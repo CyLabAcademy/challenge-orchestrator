@@ -502,17 +502,51 @@ func (m *Manager) pushImage(imageName string) error {
 	return nil
 }
 
+// registryTimedOut reports whether a failed pull is the daemon's own timeout
+// talking to the registry rather than ours running out.
+//
+// The daemon bounds its registry requests independently of the context we hand
+// the client, and in practice more tightly: a stalled registry surfaces as this
+// error at around fifteen seconds, well inside the pull timeout. Without this
+// ErrPullTimeout is close to unreachable in production, because our deadline
+// can only win the race when the daemon has none of its own -- and a pull that
+// hung on the registry would be answered 500, which the platform fails the
+// player on, instead of the 503 it retries.
+//
+// Matched on the message because there is no typed error left to inspect: the
+// daemon serialises its error to a string on the way back through the API, so
+// what arrives here is text however it started life.
+func registryTimedOut(err error) bool {
+	msg := err.Error()
+	for _, marker := range []string{
+		"Client.Timeout exceeded", // net/http's client timeout, the common one
+		"context deadline exceeded",
+		"TLS handshake timeout",
+		"i/o timeout",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // pullImage pulls on the given daemon (workers pull with their own registry
 // certs via certs.d, so no credentials travel with the request), including
-// reading the pull stream, within timeout. A pull that exceeds it fails the
-// launch as retryable (ErrPullTimeout) but never marks the worker down: the
-// registry, not the worker, is the likelier culprit.
+// reading the pull stream, within timeout. A pull that runs out of time fails
+// the launch as retryable (ErrPullTimeout) but never marks the worker down:
+// the registry, not the worker, is the likelier culprit. "Runs out of time"
+// means either deadline -- ours, or the daemon's own on its registry client
+// (see registryTimedOut), which usually expires first.
 func (m *Manager) pullImage(cli *client.Client, imageName string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(m.ctx, timeout)
 	defer cancel()
 	timedOut := func(err error) error {
 		if ctx.Err() != nil {
 			return fmt.Errorf("%w: %s after %s: %v", ErrPullTimeout, imageName, timeout, err)
+		}
+		if registryTimedOut(err) {
+			return fmt.Errorf("%w: %s, on the daemon's own registry timeout inside our %s: %v", ErrPullTimeout, imageName, timeout, err)
 		}
 		return err
 	}
@@ -531,7 +565,10 @@ func (m *Manager) pullImage(cli *client.Client, imageName string, timeout time.D
 	if streamErr := dockerStreamError(messages); streamErr != nil {
 		err = fmt.Errorf("failed to pull image '%s': %s", imageName, streamErr)
 		m.log.error(err)
-		return err
+		// Through timedOut like the two paths above: a registry that accepts
+		// the pull and then stalls reports it here, and that is the same
+		// retryable failure as one that never answered at all.
+		return timedOut(err)
 	}
 	return nil
 }
