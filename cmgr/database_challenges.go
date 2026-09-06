@@ -705,6 +705,18 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 					for _, iid := range instances {
 						instance, err := m.lookupInstanceMetadata(iid)
 						if err != nil {
+							// The list above is a moment old and the platform
+							// stops on-demand instances continuously, so an id
+							// that has gone between the two is ordinary rather
+							// than a failure: for a dynamic build it is the
+							// outcome this loop was about to produce anyway, and
+							// for a persistent one the next converge relaunches
+							// it. Reporting it would fail an operator's
+							// update-schema for a race it cannot avoid.
+							if _, gone := err.(*UnknownIdentifierError); gone {
+								m.log.debugf("instance %d of %s went away before the rebuild reached it", iid, build.Challenge)
+								continue
+							}
 							errs = append(errs, err)
 							continue
 						}
