@@ -462,9 +462,14 @@ retry 60 "the builder daemon" quiet curl -sSf "$E2E_BUILDER/_ping"
 for ip in "${WORKER_IPS[@]}"; do
   retry 120 "dockerd on $ip" quiet worker_api "$ip" /_ping
   retry 60 "telemetry on $ip" quiet curl -sSf --max-time 3 "http://$ip:2136/health"
+  # A worker that fell back to iptables still passes every other step, while
+  # behaving nothing like production: network setup there grows with the
+  # number of challenge networks on the box.
+  backend=$(worker_api "$ip" /info | jq -r '.FirewallBackend.Driver // "unknown"')
+  [[ "$backend" == "nftables" ]] || fail "worker $ip programs its firewall with $backend, not nftables"
   sweep_worker "$ip"
 done
-ok "cmgrd $(api GET /version | jq -r .version), zot, builder, and $NWORKERS workers (dockerd + telemetry) answer"
+ok "cmgrd $(api GET /version | jq -r .version), zot, builder, and $NWORKERS workers (dockerd on nftables + telemetry) answer"
 
 # ------------------------------------------------- 1. register the workers
 

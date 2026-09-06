@@ -7,6 +7,8 @@
 
     "storage-driver": "overlay2",
 
+    "firewall-backend": "nftables",
+
     "default-address-pools": [
         {"base": "10.201.0.0/16", "size": 29}
     ],

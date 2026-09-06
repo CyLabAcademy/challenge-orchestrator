@@ -24,7 +24,7 @@
 name: cork-e2e
 
 x-dind: &dind
-  image: docker:29.6.0-dind
+  image: docker:${DIND_VERSION:-29.6.0}-dind
   privileged: true
   environment:
     # Never let dind mint its own certificates: TLS is either configured from
@@ -39,6 +39,22 @@ x-dind: &dind
 
 x-worker: &worker
   <<: *dind
+  # The workers run dind plus the nft binary (worker.Dockerfile): daemon.json
+  # asks for the nftables firewall backend, which docker 29 drives by execing
+  # nft, and the stock image does not carry it. Without it dockerd refuses to
+  # start, which is the failure this fleet should have rather than a silent
+  # fall back to iptables.
+  build:
+    context: .
+    dockerfile: worker.Dockerfile
+    args:
+      DIND_VERSION: ${DIND_VERSION:-29.6.0}
+  image: cork-e2e/worker
+  # Docker does not enable forwarding for itself in nftables mode (it does
+  # under iptables), so published instance ports would not work without this.
+  # The production hosts get the same sysctl from the ansible docker role.
+  sysctls:
+    net.ipv4.ip_forward: 1
   # dockerd takes hosts and TLS from daemon.json, which carries the fields of
   # the multihost_docker role's template that cork depends on (hosts, TLS
   # paths, address pools, logging). Passing "dockerd" as the first argument

@@ -45,6 +45,15 @@ roughly 5 GB of disk, and internet access for base images and the apt runs
 inside challenge builds. The workers and the builder are `docker:dind`
 containers and therefore run privileged.
 
+The workers add the `nft` binary to that image (`worker.Dockerfile`) and ask
+for docker's nftables firewall backend in `worker/daemon.json`, which is where
+production is going: with iptables, the time to set up a challenge network
+grows with the number of networks already on the box. `DIND_VERSION` (default
+29.6.0) sets the docker version for the workers and the builder together —
+29.6.0 is the first release that execs `nft` instead of linking libnftables,
+which aborted once a netlink socket landed past fd 1024 (moby#52873). The
+fleet-wait step fails if a worker comes up on iptables anyway.
+
 ```sh
 cd e2e
 docker compose up -d --build   # PKI, registry, builder, workers + telemetry, cork
