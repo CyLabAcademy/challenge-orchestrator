@@ -38,6 +38,8 @@ func NewManager(logLevel LogLevel) *Manager {
 		return nil
 	}
 
+	mgr.workerTiming = mgr.workerTimingFromEnv()
+
 	if err := mgr.setDirectories(); err != nil {
 		return nil
 	}
@@ -179,6 +181,14 @@ func (m *Manager) Update(fp string) *ChallengeUpdates {
 // UpdateWithOptions is identical to Update but takes explicit options; Update
 // is equivalent to calling this with the zero-value UpdateOptions.
 func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *ChallengeUpdates {
+	// One rebuild at a time. Two of them would work over the same instances:
+	// each tearing down what the other just started, reassigning the same
+	// ports twice, and taking the network the other had just created for a
+	// leftover of an earlier generation (startNetwork). An update is an
+	// operator action, so the second one waits rather than being refused.
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+
 	cu := m.DetectChanges(fp)
 	errs := m.addChallenges(cu.Added)
 	if len(errs) != 0 {
@@ -265,6 +275,18 @@ func (m *Manager) Build(challenge ChallengeId, seeds []int, flagFormat string) (
 // additional environment variables are needed.
 func (m *Manager) Start(build BuildId, envVars map[string]string) (InstanceId, error) {
 	// Get build metadata
+	//
+	// This read is the launch's whole view of the build. A rebuild that
+	// stamps a new checksum after it, and takes its snapshot of the build's
+	// instances before this launch inserts its row, neither sees this
+	// instance nor is seen by it: the instance serves the generation that was
+	// current when it began, under a build that now records the next one. It
+	// is left to expire rather than torn down. The flag does not change with
+	// a rebuild, the superseded images stay in retention as the rollback
+	// target, and only update-schema creates persistent instances, so this is
+	// bounded to one on-demand instance and one TTL. Serializing against a
+	// rebuild is not an option: a rebuild runs for minutes and every caller
+	// blocks on its launch.
 	bMeta, err := m.lookupBuildMetadata(build)
 	if err != nil {
 		return 0, err
@@ -274,10 +296,14 @@ func (m *Manager) Start(build BuildId, envVars map[string]string) (InstanceId, e
 		return 0, errors.New("locked build: change the schema definition to start more instances")
 	}
 
-	return m.newInstance(bMeta, envVars)
+	return m.newInstance(bMeta, envVars, m.requestLimits())
 }
 
-func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (InstanceId, error) {
+// newInstance records and launches an instance of the build on the daemon
+// placement picks, within limits: the request limits for a launch the
+// platform asked for, the restart limits for one the schema converge creates,
+// since nothing retries the latter.
+func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string, limits launchLimits) (InstanceId, error) {
 	cMeta, err := m.GetChallengeMetadata(build.Challenge)
 	if err != nil {
 		return 0, err
@@ -304,6 +330,11 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 		iMeta.Worker = worker
 	}
 
+	// Refuse at once what would only be refused after the wait (admit).
+	if err := m.admit(iMeta, limits); err != nil {
+		return 0, err
+	}
+
 	err = m.openInstance(iMeta)
 	if err != nil {
 		return 0, err
@@ -313,7 +344,7 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 
 	revPortMap, err := m.getReversePortMap(build.Challenge)
 	if err != nil {
-		m.removeInstanceMetadata(iMeta.Id)
+		m.clearInstanceRecords(iMeta.Id, "its port map could not be read")
 		return 0, err
 	}
 
@@ -326,7 +357,9 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 				portName := revPortMap[portStr]
 				hostPort, err := m.reservePort(iMeta.Id, iMeta.Worker, portName)
 				if err != nil {
-					m.stopInstance(iMeta)
+					// Nothing has reached the daemon: clear the records (port
+					// rows cascade) without a docker round trip.
+					m.clearInstanceRecords(iMeta.Id, "a port could not be reserved")
 					return 0, err
 				}
 				iMeta.Ports[portName] = hostPort
@@ -334,20 +367,30 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string) (
 		}
 	}
 
-	err = m.startNetwork(iMeta, cMeta.ChallengeOptions.NetworkOptions)
-	if err != nil {
-		m.stopInstance(iMeta)
-		return 0, err
-	}
-
-	err = m.startContainers(build, iMeta, cMeta.ChallengeOptions.Overrides, envVars, revPortMap)
-	if err != nil {
+	started, err := m.launch(build, iMeta, cMeta.ChallengeOptions.NetworkOptions, cMeta.ChallengeOptions.Overrides, envVars, revPortMap, limits)
+	if err != nil && started {
 		// It is possible we are in a partially deployed state.  Make sure
 		// we are torn down, but ignore the returned error.
 		m.stopInstance(iMeta)
+	} else if err != nil {
+		// Nothing reached the daemon: clear the records (port and container
+		// rows cascade) without a docker round trip, which against a wedged
+		// daemon would hold the retryable answer for another control timeout.
+		m.clearInstanceRecords(iMeta.Id, "its launch was refused before it reached the daemon")
 	}
 
 	return iMeta.Id, err
+}
+
+// clearInstanceRecords removes the records of an instance whose launch failed
+// before anything of it reached a daemon; its port and container rows cascade.
+// A failure here is logged rather than returned: the request is already
+// failing, and the row, never finalized, is reclaimed by the sweep in Prune a
+// few minutes later, so it holds its ports until then but not for good.
+func (m *Manager) clearInstanceRecords(id InstanceId, why string) {
+	if err := m.removeInstanceMetadata(id); err != nil {
+		m.log.errorf("could not clear the records of instance %d after %s: %s; the unfinalized-instance sweep reclaims them", id, why, err)
+	}
 }
 
 // Stops the running "instance".
@@ -374,19 +417,23 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 	// A down (or purged) worker cannot be reached: clear our records and
 	// report success so callers (the platform's stop/restart/TTL flows) are
 	// never wedged behind a dead box. Any containers actually left running
-	// are docker-reaper's or manual cleanup's problem.
+	// are removed if the box rejoins placement (reconcileWorker, on
+	// worker-add and at startup); until then they are docker-reaper's.
 	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
 		m.log.warnf("worker %s down: clearing instance %d records without docker teardown", instance.Worker, instance.Id)
 		return m.removeInstanceMetadata(instance.Id)
 	}
 
-	err := m.stopContainers(instance)
+	err := m.teardown(instance)
 	if err != nil {
-		return err
-	}
-
-	err = m.stopNetwork(instance)
-	if err != nil {
+		// The teardown itself took the worker down (a control call hung), or
+		// the worker went down while it waited for its slot: finish the way a
+		// stop on a down worker does, so the caller gets its success now
+		// rather than from a second attempt.
+		if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+			m.log.warnf("worker %s went down during the stop of instance %d: clearing its records without further docker teardown", instance.Worker, instance.Id)
+			return m.removeInstanceMetadata(instance.Id)
+		}
 		return err
 	}
 
@@ -555,7 +602,7 @@ func (m *Manager) convergeSchema(schema *Schema) []error {
 						break
 					}
 				}
-				_, err = m.newInstance(buildMeta, nil)
+				_, err = m.newInstance(buildMeta, nil, m.restartLimits())
 				if err != nil {
 					errs = append(errs, err)
 					break
@@ -784,13 +831,29 @@ func (m *Manager) Prune() error {
 		m.log.infof("pruned %d old instances", count)
 	}
 
-	// Clean up unfinalized instances (crashed launches) older than 5 minutes
+	// Clean up unfinalized instances (crashed launches) older than 5 minutes.
+	//
+	// Their workers are read first, because deleting the rows is what makes
+	// their leftovers findable. A launch killed mid-flight leaves containers
+	// running (RestartPolicy "always"), and reconcileWorker spares them for
+	// exactly as long as a row still names them: the pass at cmgrd start
+	// walks straight past them. Once these rows are gone they are orphans,
+	// which is the state that pass exists to clear — so run it again, for
+	// just those workers, rather than leaving them to hold their published
+	// ports until the next worker-add or cmgrd start.
+	var gcWorkers []string
+	gcWorkerQuery := `SELECT DISTINCT worker FROM instances WHERE is_finalized = 0 AND created_at < datetime('now', '-5 minutes') AND worker != '';`
+	if err := m.db.Select(&gcWorkers, gcWorkerQuery); err != nil {
+		m.log.errorf("failed to list the workers of unfinalized instances: %s", err)
+	}
+
 	gcQuery := `DELETE FROM instances WHERE is_finalized = 0 AND created_at < datetime('now', '-5 minutes');`
 	gcRes, err := m.db.Exec(gcQuery)
 	if err == nil {
 		gcCount, _ := gcRes.RowsAffected()
 		if gcCount > 0 {
 			m.log.infof("garbage collected %d unfinalized instances", gcCount)
+			m.reclaimAfterGC(gcWorkers)
 		}
 	} else {
 		m.log.errorf("failed to garbage collect unfinalized instances: %s", err)

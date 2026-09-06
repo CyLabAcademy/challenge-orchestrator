@@ -3,6 +3,8 @@ package cmgr
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1692,7 +1694,7 @@ func TestRebuildInstancesTableMigration(t *testing.T) {
 				}
 			}
 
-			if err := rebuildInstancesTable(db, tc.hasCreatedAt, tc.hasIsFinalized); err != nil {
+			if err := rebuildInstancesTable(db, tc.hasCreatedAt, tc.hasIsFinalized, false); err != nil {
 				t.Fatalf("rebuildInstancesTable failed: %s", err)
 			}
 
@@ -1770,6 +1772,224 @@ func TestRebuildInstancesTableMigration(t *testing.T) {
 				t.Error("expected foreign key violation after rebuild, insert succeeded")
 			}
 		})
+	}
+}
+
+// instancesDeclaration returns the CREATE TABLE text SQLite keeps for the
+// instances table.
+func instancesDeclaration(t *testing.T, db *sqlx.DB) string {
+	t.Helper()
+	var decl string
+	if err := db.Get(&decl, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'instances';"); err != nil {
+		t.Fatalf("read instances declaration: %s", err)
+	}
+	return decl
+}
+
+// A database from before ids stopped being reused has every current column
+// but no AUTOINCREMENT. The rebuild must add it, keep every row including its
+// worker, and continue the numbering, so that the id of a deleted instance is
+// never handed out again.
+func TestRebuildInstancesTableAddsAutoincrement(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "cmgr-autoinc-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %s", err)
+	}
+	dbFile.Close()
+	t.Cleanup(func() { removeDBFiles(dbFile.Name()) })
+	db, err := sqlx.Open("sqlite3", dbFile.Name()+"?_fk=true&_journal_mode=WAL&_busy_timeout=50&_synchronous=NORMAL")
+	if err != nil {
+		t.Fatalf("failed to open db: %s", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	const schema = `
+	CREATE TABLE builds (id INTEGER PRIMARY KEY);
+	CREATE TABLE instances (
+		id INTEGER PRIMARY KEY,
+		lastsolved INTEGER,
+		build INTEGER NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		is_finalized INTEGER NOT NULL DEFAULT 0 CHECK(is_finalized IN (0,1)),
+		worker TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY (build) REFERENCES builds (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+	);
+	CREATE TABLE portAssignments (
+		instance INTEGER NOT NULL,
+		name TEXT NOT NULL,
+		port INTEGER NOT NULL,
+		worker TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY (instance) REFERENCES instances (id) ON UPDATE RESTRICT ON DELETE CASCADE
+	);
+	CREATE TABLE containers (
+		instance INTEGER NOT NULL,
+		id TEXT NOT NULL PRIMARY KEY,
+		FOREIGN KEY (instance) REFERENCES instances (id) ON UPDATE RESTRICT ON DELETE CASCADE
+	);
+	INSERT INTO builds(id) VALUES (1);
+	INSERT INTO instances(id, lastsolved, build, worker) VALUES (1, 0, 1, '10.0.0.1');
+	INSERT INTO instances(id, lastsolved, build, worker) VALUES (5, 0, 1, '');
+	INSERT INTO portAssignments(instance, name, port, worker) VALUES (1, 'challenge', 12345, '10.0.0.1');
+	INSERT INTO containers(instance, id) VALUES (1, 'deadbeefcafe');`
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatalf("failed to create the pre-AUTOINCREMENT schema: %s", err)
+	}
+	if strings.Contains(strings.ToUpper(instancesDeclaration(t, db)), "AUTOINCREMENT") {
+		t.Fatal("fixture already has AUTOINCREMENT")
+	}
+
+	if err := rebuildInstancesTable(db, true, true, true); err != nil {
+		t.Fatalf("rebuildInstancesTable failed: %s", err)
+	}
+	if !strings.Contains(strings.ToUpper(instancesDeclaration(t, db)), "AUTOINCREMENT") {
+		t.Fatal("instances still lacks AUTOINCREMENT after the rebuild")
+	}
+
+	var worker string
+	if err := db.Get(&worker, "SELECT worker FROM instances WHERE id = 1;"); err != nil || worker != "10.0.0.1" {
+		t.Fatalf("instance 1 worker after the rebuild = %q, %v; want 10.0.0.1", worker, err)
+	}
+	for _, check := range []struct{ what, query string }{
+		{"instances", "SELECT COUNT(*) FROM instances;"},
+		{"portAssignment", "SELECT COUNT(*) FROM portAssignments WHERE instance = 1;"},
+		{"container", "SELECT COUNT(*) FROM containers WHERE instance = 1;"},
+	} {
+		var n int
+		if err := db.Get(&n, check.query); err != nil {
+			t.Fatalf("%s count: %s", check.what, err)
+		}
+		if want := map[string]int{"instances": 2, "portAssignment": 1, "container": 1}[check.what]; n != want {
+			t.Errorf("%s rows after the rebuild = %d, want %d", check.what, n, want)
+		}
+	}
+
+	// The numbering continues past the largest id copied, and the id of a
+	// deleted instance is not handed out again.
+	if _, err := db.Exec("DELETE FROM instances WHERE id = 5;"); err != nil {
+		t.Fatalf("delete instance 5: %s", err)
+	}
+	res, err := db.Exec("INSERT INTO instances(lastsolved, build) VALUES (0, 1);")
+	if err != nil {
+		t.Fatalf("insert after the rebuild: %s", err)
+	}
+	if id, _ := res.LastInsertId(); id != 6 {
+		t.Fatalf("the instance after the rebuild got id %d, want 6 (5 was deleted and must not come back)", id)
+	}
+	if _, err := db.Exec("DELETE FROM instances WHERE id = 6;"); err != nil {
+		t.Fatalf("delete instance 6: %s", err)
+	}
+	res, err = db.Exec("INSERT INTO instances(lastsolved, build) VALUES (0, 1);")
+	if err != nil {
+		t.Fatalf("second insert after the rebuild: %s", err)
+	}
+	if id, _ := res.LastInsertId(); id != 7 {
+		t.Fatalf("the next instance got id %d, want 7", id)
+	}
+}
+
+// initDatabase detects a table declared without AUTOINCREMENT and rebuilds
+// it; a fresh database gets it from the schema; a second run changes nothing.
+func TestInitDatabaseAddsAutoincrement(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "cmgr-autoinc-init-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %s", err)
+	}
+	dbFile.Close()
+	t.Cleanup(func() { removeDBFiles(dbFile.Name()) })
+	t.Setenv(DB_ENV, dbFile.Name())
+
+	old := strings.Replace(schemaQuery, "id INTEGER PRIMARY KEY AUTOINCREMENT,", "id INTEGER PRIMARY KEY,", 1)
+	if old == schemaQuery {
+		t.Fatal("schemaQuery does not declare instances.id with AUTOINCREMENT")
+	}
+	db, err := sqlx.Open("sqlite3", dbFile.Name()+"?_fk=true")
+	if err != nil {
+		t.Fatalf("failed to open db: %s", err)
+	}
+	if _, err := db.Exec(old); err != nil {
+		t.Fatalf("failed to create the old schema: %s", err)
+	}
+	db.Close()
+
+	for run := 1; run <= 2; run++ {
+		m := &Manager{log: newLogger(DISABLED)}
+		if err := m.initDatabase(); err != nil {
+			t.Fatalf("initDatabase run %d: %s", run, err)
+		}
+		decl := instancesDeclaration(t, m.db)
+		m.db.Close()
+		if !strings.Contains(strings.ToUpper(decl), "AUTOINCREMENT") {
+			t.Fatalf("run %d: instances lacks AUTOINCREMENT: %s", run, decl)
+		}
+	}
+
+	fresh := &Manager{log: newLogger(DISABLED)}
+	t.Setenv(DB_ENV, filepath.Join(t.TempDir(), "fresh.db"))
+	if err := fresh.initDatabase(); err != nil {
+		t.Fatalf("initDatabase on a fresh database: %s", err)
+	}
+	defer fresh.db.Close()
+	if !strings.Contains(strings.ToUpper(instancesDeclaration(t, fresh.db)), "AUTOINCREMENT") {
+		t.Fatal("a fresh database lacks AUTOINCREMENT on instances")
+	}
+}
+
+// A database from before workers existed has no portAssignments.worker
+// column, and the index on (worker, port) can only be created once the
+// migration has added it. Startup must survive that upgrade path.
+func TestInitDatabaseIndexesLegacyPortAssignments(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "cmgr-legacy-ports-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %s", err)
+	}
+	dbFile.Close()
+	t.Cleanup(func() { removeDBFiles(dbFile.Name()) })
+
+	// The current schema without its worker columns is what a database from
+	// before workers looks like, and it stays in step with the schema.
+	legacy := strings.ReplaceAll(schemaQuery, "\t\tworker TEXT NOT NULL DEFAULT '',\n", "")
+	if legacy == schemaQuery {
+		t.Fatal("schemaQuery no longer declares the worker columns as expected")
+	}
+
+	// Seeded with foreign keys off: one instance with a port assignment for
+	// the migration to carry over, without the rows they reference.
+	seed, err := sqlx.Open("sqlite3", dbFile.Name()+"?_fk=false")
+	if err != nil {
+		t.Fatalf("failed to open db: %s", err)
+	}
+	if _, err := seed.Exec(legacy); err != nil {
+		t.Fatalf("failed to create the pre-worker schema (does schemaQuery index a worker column?): %s", err)
+	}
+	rows := `
+	INSERT INTO builds(id, flag, format, seed, hasartifacts, challenge, schema, instancecount) VALUES (1, 'f', 'fmt', 1, 0, 'ch', 's', -1);
+	INSERT INTO instances(id, build) VALUES (1, 1);
+	INSERT INTO portAssignments(instance, name, port) VALUES (1, 'challenge', 12345);`
+	if _, err := seed.Exec(rows); err != nil {
+		t.Fatalf("failed to seed the pre-worker rows: %s", err)
+	}
+	seed.Close()
+
+	t.Setenv(DB_ENV, dbFile.Name())
+	m := &Manager{log: newLogger(DISABLED)}
+	if err := m.initDatabase(); err != nil {
+		t.Fatalf("initDatabase on a pre-worker database: %s", err)
+	}
+	defer m.db.Close()
+
+	var indexes int
+	if err := m.db.Get(&indexes, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'portAssignmentWorkerPortIndex';"); err != nil {
+		t.Fatalf("index check: %s", err)
+	}
+	if indexes != 1 {
+		t.Error("the (worker, port) index was not created after the migration")
+	}
+	var worker string
+	if err := m.db.Get(&worker, "SELECT worker FROM portAssignments WHERE instance = 1;"); err != nil {
+		t.Fatalf("the migrated port assignment: %s", err)
+	}
+	if worker != "" {
+		t.Errorf("a migrated port assignment got worker %q, want the local daemon", worker)
 	}
 }
 

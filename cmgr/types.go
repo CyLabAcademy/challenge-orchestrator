@@ -26,6 +26,14 @@ const (
 	PRUNE_AGE_ENV         string = "CMGR_PRUNE_AGE"
 	DB_WAL_ENV            string = "CMGR_DB_WAL"
 
+	// Worker tunables (see workerTiming in workers.go).
+	WORKER_POLL_INTERVAL_ENV   string = "CMGR_WORKER_POLL_INTERVAL"
+	WORKER_POLL_TIMEOUT_ENV    string = "CMGR_WORKER_POLL_TIMEOUT"
+	WORKER_MAX_MISSES_ENV      string = "CMGR_WORKER_MAX_MISSES"
+	WORKER_CONTROL_TIMEOUT_ENV string = "CMGR_WORKER_CONTROL_TIMEOUT"
+	WORKER_PULL_TIMEOUT_ENV    string = "CMGR_WORKER_PULL_TIMEOUT"
+	WORKER_LAUNCH_WAIT_ENV     string = "CMGR_WORKER_LAUNCH_WAIT"
+
 	DYNAMIC_INSTANCES int = -1
 	LOCKED            int = -2
 )
@@ -46,6 +54,9 @@ type Manager struct {
 	challengeDockerfiles map[string][]byte
 	rand                 *rand.Rand
 	randMu               sync.Mutex
+	// updateMu serializes rebuilds (UpdateWithOptions): two of them would
+	// tear down and relaunch the same instances against each other.
+	updateMu sync.Mutex
 	// imageMu serializes the "is this content still referenced? if not, untag"
 	// critical sections (executeBuild cleanup, pruneReplacedImages,
 	// destroyImages) so a concurrent remover cannot delete a tag between
@@ -62,7 +73,7 @@ type Manager struct {
 	lastPruneUnix      atomic.Int64 // atomic UnixNano timestamp used as CAS gate for prune interval
 	pruneInterval      time.Duration
 	pruneAge           time.Duration
-	launchSemaphore    chan struct{}
+	localQueue         *daemonQueue // slots of the local daemon (instances with no worker)
 	policy             managerPolicy
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
@@ -73,7 +84,8 @@ type Manager struct {
 	workerOrder       []string // round-robin iteration order over workers
 	rrCursor          int      // guarded by workersMu
 	placementEnabled  bool
-	launchConcurrency int // per-daemon launch cap from CMGR_CONCURRENT_LAUNCHES
+	launchConcurrency int          // per-daemon launch (and teardown) slots from CMGR_CONCURRENT_LAUNCHES
+	workerTiming      workerTiming // poll/timeout tunables, from the environment (see timing())
 }
 
 type PortInfo struct {
