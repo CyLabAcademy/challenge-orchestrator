@@ -1,0 +1,20 @@
+# A second schema, converged only in full mode (E2E_FULL=1).
+#
+# It is separate from schema.yaml for two reasons. The first is cost: this
+# challenge builds openssh into two runtime images, and a schema is built when
+# it is added, so putting it in schema.yaml would charge regular mode for a
+# build regular mode never launches. The second is that adding a schema to a
+# cmgrd that is already serving one is itself untested -- production runs a
+# schema per event, and nothing else here has two at once.
+name: e2e-multi
+flag_format: e2e{%s}
+challenges:
+  # The multi-container shape: `# LAUNCH work randomDnsName` in its Dockerfile
+  # makes two containers on one cmgr-<id> network, only `work` publishes a
+  # port, and the `builder` stage that mints the secrets is never launched and
+  # never pushed. Its problem.md also carries a per-stage `overrides:` block,
+  # which is the only place in this scenario where two containers of one
+  # instance get different limits.
+  cmgr/examples/aptitude-and-privileges:
+    seeds: [11]
+    instance_count: -1

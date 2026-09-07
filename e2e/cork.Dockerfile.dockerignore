@@ -1,0 +1,8 @@
+# Per-Dockerfile ignore file (BuildKit) for e2e/cork.Dockerfile, whose
+# context is the repository root.
+.git
+bin
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.tar.gz

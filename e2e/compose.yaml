@@ -1,0 +1,282 @@
+# Local end-to-end simulation of a cork fleet.
+#
+# One compose project stands in for the production boxes:
+#
+#   cork + builder   the orchestrator: cmgrd, plus the local docker daemon it
+#                    builds challenge images on. In production both live on one
+#                    box and cmgrd uses the unix socket; here the daemon is a
+#                    docker:dind sibling reached over plain TCP inside this
+#                    network (DOCKER_HOST).
+#   zot              the image registry (zot.internal:443): mTLS, identities from CN,
+#                    cmgr read-write and worker read-only.
+#   worker-a/-b      two docker workers: dockerd on :2376 behind mTLS with the
+#                    shared "academy-docker-worker" server certificate, and the
+#                    cork-telemetry agent on :2136 in the same network namespace.
+#                    Fixed IPs, because cmgrd registers workers by IP.
+#   certgen          mints the fleet PKI with config-examples/gen-docker-certs.sh
+#                    and hands each box only the files it gets in production
+#                    (one volume per box and trust domain; CA keys go nowhere).
+#   e2e              the scenario driver (profile "test"):
+#                    docker compose run --rm e2e
+#
+# README.md covers usage, what the scenario asserts, and how this differs
+# from a real deployment.
+name: cork-e2e
+
+x-dind: &dind
+  image: docker:${DIND_VERSION:-29.6.0}-dind
+  privileged: true
+  environment:
+    # Never let dind mint its own certificates: TLS is either configured from
+    # the fleet PKI (workers) or deliberately off (builder).
+    DOCKER_TLS_CERTDIR: ""
+  healthcheck:
+    test: ["CMD", "docker", "info"]
+    interval: 10s
+    timeout: 10s
+    retries: 12
+    start_period: 20s
+
+x-worker: &worker
+  <<: *dind
+  # The workers run dind plus the nft binary (worker.Dockerfile): daemon.json
+  # asks for the nftables firewall backend, which docker 29 drives by execing
+  # nft, and the stock image does not carry it. Without it dockerd refuses to
+  # start, which is the failure this fleet should have rather than a silent
+  # fall back to iptables.
+  build:
+    context: .
+    dockerfile: worker.Dockerfile
+    args:
+      DIND_VERSION: ${DIND_VERSION:-29.6.0}
+  image: cork-e2e/worker
+  # Docker does not enable forwarding for itself in nftables mode (it does
+  # under iptables), so published instance ports would not work without this.
+  # The production hosts get the same sysctl from the ansible docker role.
+  sysctls:
+    net.ipv4.ip_forward: 1
+  # dockerd takes hosts and TLS from daemon.json, which carries the fields of
+  # the multihost_docker role's template that cork depends on (hosts, TLS
+  # paths, address pools, logging). Passing "dockerd" as the first argument
+  # keeps the dind entrypoint from adding conflicting --host flags.
+  command: ["dockerd", "--config-file=/etc/docker/daemon.json"]
+  depends_on:
+    certgen:
+      condition: service_completed_successfully
+
+# cmgrd + cmgrd-cli from this checkout; the same image runs the scenario.
+x-cork-build: &cork-build
+  context: ..
+  dockerfile: e2e/cork.Dockerfile
+  args:
+    CORK_VERSION: ${CORK_VERSION:-e2e}
+
+# The telemetry sidecar shares its worker's network namespace, so cmgrd
+# polls it at the worker's IP on :2136.
+x-telemetry: &telemetry
+  build:
+    context: .
+    dockerfile: telemetry.Dockerfile
+  image: cork-e2e/telemetry
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2136/health"]
+    interval: 3s
+    timeout: 3s
+    retries: 10
+
+services:
+  certgen:
+    build: ./certgen
+    environment:
+      REGISTRY_HOST: zot.internal
+    volumes:
+      - ../config-examples/gen-docker-certs.sh:/usr/local/bin/gen-docker-certs.sh:ro
+      - certs-ca:/pki
+      - cork-docker-certs:/dist/cork-docker
+      - cork-registry-certs:/dist/cork-registry
+      - worker-docker-certs:/dist/worker-docker
+      - worker-registry-certs:/dist/worker-registry
+      - zot-certs:/dist/zot
+
+  zot:
+    image: ghcr.io/project-zot/zot-linux-amd64:v2.1.18
+    command: ["serve", "/etc/zot/config.json"]
+    # Reached as zot.internal on 443: the registry address doubles as the
+    # certs.d directory name, and a colon (host:port) in a mount target is
+    # refused by the daemon, so the fleet uses a dotted host on the default
+    # port instead of production's host:5000.
+    networks:
+      default:
+        aliases: [zot.internal]
+    volumes:
+      - ./zot/config.json:/etc/zot/config.json:ro
+      - zot-certs:/etc/zot/certs:ro
+      - zot-data:/var/lib/zot
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
+
+  builder:
+    <<: *dind
+    # No command: with DOCKER_TLS_CERTDIR empty the dind entrypoint runs
+    # dockerd on its unix socket and plain tcp://0.0.0.0:2375, reachable only
+    # inside this compose network.
+    volumes:
+      - cork-registry-certs:/etc/docker/certs.d/zot.internal:ro
+      - builder-data:/var/lib/docker
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
+
+  cork:
+    build: *cork-build
+    image: cork-e2e/cork
+    environment:
+      DOCKER_HOST: tcp://builder:2375
+      DOCKER_CERT_PATH: /root/.docker_certs
+      CMGR_REGISTRY: zot.internal
+      CMGR_DIR: /challenges
+      CMGR_DB: /var/lib/cork/cmgr.db
+      CMGR_ARTIFACT_DIR: /var/lib/cork/artifacts
+      CMGR_PORTS: "20000-20029"
+      # Long enough that a slow run cannot prune the scenario's own
+      # on-demand instances out from under it (production uses 1h).
+      CMGR_PRUNE_AGE: 24h
+      # Detect a silent or hung worker in 10s instead of production's 30s.
+      CMGR_WORKER_MAX_MISSES: "20"
+      CMGR_WORKER_CONTROL_TIMEOUT: 10s
+      # How long a request launch waits for one of a worker's two launch slots
+      # before it is refused as busy, and the threshold admission control
+      # measures a daemon's backlog against. Production leaves this at the 10s
+      # default; 2s here so one burst overflows inside a run.
+      CMGR_WORKER_LAUNCH_WAIT: 2s
+    volumes:
+      # The challenge tree lives in a volume so the scenario can edit a
+      # challenge and run `update`; cork-entrypoint.sh seeds it from the
+      # read-only mount when the volume is empty.
+      - ${CHALLENGE_DIR:-../examples}:/challenges-seed:ro
+      - challenges:/challenges
+      - cork-data:/var/lib/cork
+      - cork-docker-certs:/root/.docker_certs:ro
+      - cork-registry-certs:/etc/docker/certs.d/zot.internal:ro
+    ports:
+      - "4200:4200"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4200/version"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    depends_on:
+      builder:
+        condition: service_healthy
+      zot:
+        condition: service_started
+
+  worker-a:
+    <<: *worker
+    hostname: worker-a
+    networks:
+      default:
+        ipv4_address: 172.28.0.11
+    ports:
+      # Challenge instance ports (CMGR_PORTS), reachable from the host as-is.
+      - "20000-20029:20000-20029"
+    volumes:
+      - ./worker/daemon.json:/etc/docker/daemon.json:ro
+      - worker-docker-certs:/root/.docker_certs:ro
+      - worker-registry-certs:/etc/docker/certs.d/zot.internal:ro
+      - worker-a-data:/var/lib/docker
+
+  worker-a-telemetry:
+    <<: *telemetry
+    network_mode: "service:worker-a"
+    depends_on:
+      worker-a:
+        condition: service_started
+
+  worker-b:
+    <<: *worker
+    hostname: worker-b
+    networks:
+      default:
+        ipv4_address: 172.28.0.12
+    ports:
+      # Same instance port range as worker-a, shifted by 1000 on the host.
+      - "21000-21029:20000-20029"
+    volumes:
+      - ./worker/daemon.json:/etc/docker/daemon.json:ro
+      - worker-docker-certs:/root/.docker_certs:ro
+      - worker-registry-certs:/etc/docker/certs.d/zot.internal:ro
+      - worker-b-data:/var/lib/docker
+
+  worker-b-telemetry:
+    <<: *telemetry
+    network_mode: "service:worker-b"
+    depends_on:
+      worker-b:
+        condition: service_started
+
+  e2e:
+    build: *cork-build
+    image: cork-e2e/cork
+    profiles: [test]
+    entrypoint: ["bash", "/opt/e2e/scenario.sh"]
+    environment:
+      CMGRD_SERVER: http://cork:4200
+      E2E_WORKERS: "172.28.0.11=worker-a 172.28.0.12=worker-b"
+      E2E_SCHEMA: /opt/e2e/schema.yaml
+      E2E_SCHEMA_FULL: /opt/e2e/schema-full.yaml
+      E2E_REGISTRY: zot.internal
+      E2E_CHAOS: ${E2E_CHAOS:-1}
+      E2E_FULL: ${E2E_FULL:-0}
+      E2E_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-cork-e2e}
+      E2E_IMAGE: cork-e2e/cork
+      E2E_BUILDER: http://builder:2375
+      DOCKER_CERT_PATH: /root/.docker_certs
+    volumes:
+      - ./scenario.sh:/opt/e2e/scenario.sh:ro
+      - ./schema.yaml:/opt/e2e/schema.yaml:ro
+      - ./schema-full.yaml:/opt/e2e/schema-full.yaml:ro
+      - ${CHALLENGE_DIR:-../examples}:/challenges-seed:ro
+      - challenges:/challenges
+      - cork-docker-certs:/root/.docker_certs:ro
+      - cork-registry-certs:/etc/docker/certs.d/zot.internal:ro
+      # cmgrd's own state, writable, for the one step that has to hold
+      # SQLite's write lock from outside cmgrd. Nothing else reads it: every
+      # other assertion goes through the HTTP API.
+      - cork-data:/var/lib/cork
+      # The outer docker socket (host-root-equivalent) is for the chaos steps
+      # only: restarting cork, stopping or replacing a telemetry sidecar,
+      # pausing a worker's dockerd. If it is missing or unreachable those
+      # steps are skipped.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      cork:
+        condition: service_healthy
+      worker-a-telemetry:
+        condition: service_healthy
+      worker-b-telemetry:
+        condition: service_healthy
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  # PKI: the CA keys stay here and are mounted into certgen only.
+  certs-ca:
+  cork-docker-certs:      # orchestrator -> worker dockerds (DOCKER_CERT_PATH)
+  cork-registry-certs:    # orchestrator + builder -> zot, read-write (certs.d)
+  worker-docker-certs:    # worker dockerd server identity
+  worker-registry-certs:  # worker -> zot, read-only (certs.d)
+  zot-certs:              # registry server identity
+  # State
+  challenges:             # writable copy of the challenge tree (CMGR_DIR)
+  cork-data:
+  builder-data:
+  zot-data:
+  worker-a-data:
+  worker-b-data:

@@ -31,6 +31,8 @@ In theory you could run the workers using cork's local docker engine and run zot
 
 There is no quickstart. This product is meant for deployment in production, not testing. If you're a challenge developer, please follow the readme in [cmgr](https://github.com/picoCTF/cmgr) instead.
 
+To see the whole fleet run on one machine, `e2e/` holds a docker compose simulation of it (orchestrator, build daemon, registry, two workers with telemetry, real PKI) plus a scenario that drives the launch sequence through cmgrd and checks every box; see [e2e/README.md](e2e/README.md).
+
 These instructions relate to manual setup and should be replaced with ansible/terraform later
 
 ### Keygen
