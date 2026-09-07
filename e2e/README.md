@@ -67,6 +67,13 @@ docker-reaper and container resource limits. A regular run names the full-mode
 steps it did not take, and its verdict says which mode it was, so the two are
 never confused for one another.
 
+Full mode also converges a **second schema**, `schema-full.yaml`, alongside the
+first. It holds one challenge, the multi-container `aptitude-and-privileges`,
+and is separate for two reasons: a schema is built when it is added, so putting
+that challenge in `schema.yaml` would charge regular mode for two `openssh`
+images it never launches; and running two schemas at once is itself the shape
+production uses -- a schema per event -- which nothing else here exercises.
+
 `./run.sh` does both and stamps the cork image with `git describe`. A scenario
 run takes three to four minutes on a fast connection, most of it building and
 rebuilding the example challenges on the builder and waiting out the two 30 s
@@ -155,13 +162,27 @@ pull, and health transition is logged there.
     builder and zot hold no tag of any generation, and the edited sources are
     restored.
 
+Full mode adds, among others: a **multi-container** launch (two containers on
+one `cmgr-<id>` network, only the front box published, a per-stage `overrides:`
+block giving each container its own CPU ceiling, the private `builder` stage
+kept out of the registry, and the flag fetched over ssh from the back box
+through the front one); and a **database-busy** step, the only coverage of
+`ErrDatabaseBusy` in either handler, which holds SQLite's write lock with
+`sqlite3` from outside cmgrd and requires a launch and a stop to be answered
+`503` + `Retry-After` and to go through unchanged on the retry. That step is
+the one place the scenario reaches behind the HTTP API, which is why the `e2e`
+service mounts `cork-data` and why `e2e/cork.Dockerfile` carries `sqlite`
+(`openssl` is there for the stalled-registry fixture, an `s_server` that
+accepts a connection and never answers).
+
 Steps marked *outer socket* (9, 13, 14, the 503 half of 15, and 16) need
 `/var/run/docker.sock` in the `e2e` container and are skipped otherwise, or
 with `E2E_CHAOS=0`; each prints `skip`, and the run still ends in ALL STEPS
 PASSED, so check for skips when the socket matters. The chaos steps target
 whichever worker does not host the persistent instance. If a run dies
 mid-step, an EXIT trap unpauses the worker and restores the telemetry sidecar.
-`schema.yaml` and the challenge ids at the top of `scenario.sh` go together.
+`schema.yaml`, `schema-full.yaml` and the challenge ids at the top of
+`scenario.sh` go together.
 
 ## Poking at it by hand
 

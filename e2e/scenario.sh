@@ -19,6 +19,7 @@
 #   E2E_SCHEMA           schema to converge                        /opt/e2e/schema.yaml
 #   E2E_REGISTRY         registry address, as in CMGR_REGISTRY     zot.internal
 #   E2E_BUILDER          the builder daemon's plain-TCP API        http://builder:2375
+#   E2E_SCHEMA_FULL      schema converged by full mode only        /opt/e2e/schema-full.yaml
 #   E2E_CHAOS            1 to run the outer-socket chaos steps     1
 #   E2E_FULL             1 to add the full-mode steps (run.sh --full) 0
 #   E2E_COMPOSE_PROJECT  compose project name, for those steps     cork-e2e
@@ -29,6 +30,7 @@ set -euo pipefail
 CMGRD_SERVER="${CMGRD_SERVER:-http://cork:4200}"
 E2E_WORKERS="${E2E_WORKERS:-172.28.0.11=worker-a 172.28.0.12=worker-b}"
 E2E_SCHEMA="${E2E_SCHEMA:-/opt/e2e/schema.yaml}"
+E2E_SCHEMA_FULL="${E2E_SCHEMA_FULL:-/opt/e2e/schema-full.yaml}"
 E2E_REGISTRY="${E2E_REGISTRY:-zot.internal}"
 E2E_BUILDER="${E2E_BUILDER:-http://builder:2375}"
 E2E_CHAOS="${E2E_CHAOS:-1}"
@@ -51,6 +53,7 @@ CH_MAKE=cmgr/examples/binex101             # service, instance_count -1, remote-
 CH_FLAGONLY=cmgr/examples/layer-cake       # flag_only, never launched
 PERSISTENT_SRC=custom/Dockerfile           # files the update steps edit, under CMGR_DIR
 ONDEMAND_SRC=runtime_env_vars/server.py
+MAKE_META=remote-make/problem.md           # metadata only: the container-options step appends a "## Challenge Options" block here
 PORT_LOW=20000                             # CMGR_PORTS on cork
 PORT_HIGH=20029
 
@@ -151,6 +154,15 @@ registry_tags() { # registry_tags <repo>: one tag per line, nothing for a missin
 # The builder daemon (cork's local docker), plain TCP inside the network.
 builder_tags() { curl -sS --fail-with-body --connect-timeout 5 --max-time 15 "$E2E_BUILDER/images/json" | jq -r '.[].RepoTags // [] | .[]'; }
 worker_tags() { worker_api "$1" /images/json | jq -r '.[].RepoTags // [] | .[]'; }
+# builder_untag <image ref>: drop one tag from the builder daemon and print the
+# HTTP status, the way --prune-old would have. Only the full-mode update step
+# that deliberately orphans a generation needs it: cork never reclaims such a
+# tag, so the harness must, or the teardown's "the builder holds no challenge
+# images" check trips over it.
+builder_untag() {
+  curl -sS --connect-timeout 5 --max-time 30 -o /dev/null -w '%{http_code}' \
+    -X DELETE "$E2E_BUILDER/images/$1"
+}
 
 # has_line <line> <cmd...>: whether the command's output contains exactly that
 # line. Captures first: `cmd | grep -q` under pipefail fails spuriously when
@@ -191,9 +203,52 @@ declare -A FAKES=()   # fake telemetry container id -> the sidecar it replaced
 BLOCKER_NAME=e2e-reconcile-blocker
 BLOCKER_NET=cmgr-997
 BLOCKER_WORKER=""     # worker ip currently holding that blocker, if any
+
+# Full-mode state. A step plants an orphan cmgrd is expected to reclaim later
+# in the same step; until it does, the run owes the worker its removal, since a
+# cmgr-<id> network left behind makes every later worker-add on that box burn
+# its whole reconcile budget before it can take placements.
+ORPHAN_WORKER=""      # worker ip holding the planted orphan
+ORPHAN_NET=""         # its cmgr-<id> network
+ORPHAN_CID=""         # the container holding that network open
+FRESH_CMGRD=""        # pid of the throwaway cmgrd of the fresh-box step
+EDITED_META=""        # a challenge metadata file a step edited under CMGR_DIR
+ORPHAN_TAG=""         # a content tag an update deliberately orphaned, which cork never reclaims
+STOPPED_REGISTRY=""   # outer container id of the registry this run stopped
+STALL_REGISTRY=""     # outer container id of the stand-in that accepts and never answers
+PROBE_BUILD=""        # a build made by hand that still owes a destroy
+# The registry-identity step tags a challenge image on a worker under a
+# throwaway repo and offers it to zot with the worker's own read-only
+# certificate. Both names are fixed so cleanup() can untag it if the run dies
+# between the tag and the delete.
+PROBE_REPO=cmgr/examples/e2e-probe
+PROBE_TAG=worker-write
+PROBE_WORKER=""       # worker ip holding $E2E_REGISTRY/$PROBE_REPO:$PROBE_TAG
+MAKE_TAG_DELETED=""   # a $CH_MAKE tag this run deleted from zot and still owes a re-push
+MULTI_SCHEMA_ADDED="" # a second schema this run added and still owes a remove-schema
+MULTI_INST=""         # its multi-container instance, if the run dies between launch and stop
+DB_LOCK_PID=""        # a sqlite3 holding cmgrd's write lock open on purpose
 cleanup() {
   local status=$? fake
+  # Before anything else: while the stand-in writer holds cmgrd's write
+  # lock, every API call below would be refused as a busy database.
+  if [[ -n "$DB_LOCK_PID" ]]; then kill "$DB_LOCK_PID" >/dev/null 2>&1 || true; fi
   if [[ -n "$TRAFFIC_STOP" ]]; then touch "$TRAFFIC_STOP" 2>/dev/null || true; fi
+  # Before anything that needs a daemon: it cannot fail, and it is what
+  # unblocks the NEXT run, whose seed diff would otherwise read this step's
+  # leftovers as a stale volume.
+  if [[ -n "$EDITED_META" ]]; then cp "$CHALLENGES_SEED/$EDITED_META" "$CHALLENGES/$EDITED_META" 2>/dev/null || true; fi
+  if [[ -n "$PROBE_WORKER" ]]; then
+    worker_status "$PROBE_WORKER" "/images/$E2E_REGISTRY/$PROBE_REPO:$PROBE_TAG?noprune=1" -X DELETE >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$MAKE_TAG_DELETED" ]]; then
+    # Push it back from the builder, which holds the image and cork's
+    # read-write certs.d identity: a run that died mid-step must not leave the
+    # registry one tag short of what it was handed.
+    curl -sS --connect-timeout 5 --max-time 180 -X POST -H 'X-Registry-Auth: e30=' \
+      "$E2E_BUILDER/images/$E2E_REGISTRY/$CH_MAKE/push?tag=$MAKE_TAG_DELETED" >/dev/null 2>&1 || true
+    MAKE_TAG_DELETED=""
+  fi
   if [[ -n "$PAUSED_WORKER" ]]; then outer_ctl "$PAUSED_WORKER" unpause >/dev/null 2>&1 || true; fi
   for fake in "${!FAKES[@]}"; do
     outer_ctl "$fake" stop >/dev/null 2>&1 || true
@@ -207,6 +262,32 @@ cleanup() {
     worker_status "$BLOCKER_WORKER" "/containers/$BLOCKER_NAME?force=true" -X DELETE >/dev/null 2>&1 || true
     worker_status "$BLOCKER_WORKER" "/networks/$BLOCKER_NET" -X DELETE >/dev/null 2>&1 || true
   fi
+  if [[ -n "$ORPHAN_WORKER" ]]; then
+    # Container first, as for the blocker above: while it runs, its network
+    # refuses removal.
+    worker_status "$ORPHAN_WORKER" "/containers/$ORPHAN_CID?force=true" -X DELETE >/dev/null 2>&1 || true
+    worker_status "$ORPHAN_WORKER" "/networks/$ORPHAN_NET" -X DELETE >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$FRESH_CMGRD" ]]; then kill "$FRESH_CMGRD" >/dev/null 2>&1 || true; fi
+  # The stand-in holds the registry's own network alias, so it lets go first;
+  # the probe build is destroyed last, so its registry untag has a registry to
+  # talk to. t=1 because the stand-in's entrypoint is a pipeline and bash
+  # swallows the SIGTERM.
+  if [[ -n "$STALL_REGISTRY" ]]; then outer "/containers/$STALL_REGISTRY/stop?t=1" -X POST -o /dev/null >/dev/null 2>&1 || true; fi
+  if [[ -n "$STOPPED_REGISTRY" ]]; then outer_ctl "$STOPPED_REGISTRY" start >/dev/null 2>&1 || true; fi
+  if [[ -n "$ORPHAN_TAG" ]]; then
+    # Neither a later --prune-old nor remove-schema's destroyImages reclaims
+    # it, so a run that died here would leave the builder holding a challenge
+    # image the next run's teardown reads as a leak.
+    registry_status "/v2/$CH_ONDEMAND/manifests/${ORPHAN_TAG##*:}" -X DELETE >/dev/null 2>&1 || true
+    builder_untag "$ORPHAN_TAG" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$MULTI_INST" ]]; then api_status DELETE "/instances/$MULTI_INST" >/dev/null 2>&1 || true; fi
+  # remove-schema stops what it started and untags its images, so this also
+  # clears the registry tags a run that died mid-step would otherwise leave
+  # for the next run's teardown to read as a leak.
+  if [[ -n "$MULTI_SCHEMA_ADDED" ]]; then timeout 120 cmgrd-cli remove-schema "$MULTI_SCHEMA_ADDED" >/dev/null 2>&1 || true; fi
+  if [[ -n "$PROBE_BUILD" ]]; then timeout 60 cmgrd-cli destroy "$PROBE_BUILD" >/dev/null 2>&1 || true; fi
   if [[ -n "$PHANTOM_IP" ]]; then cmgrd-cli worker-remove "$PHANTOM_IP" >/dev/null 2>&1 || true; fi
   if [[ -n "$PHANTOM_RESPONDER" ]]; then
     kill "$PHANTOM_RESPONDER" >/dev/null 2>&1 || true
@@ -243,6 +324,44 @@ unfake_overload() { # unfake_overload <fake id>: back to the real sidecar
   outer_ctl "$1" stop
   outer_ctl "${FAKES[$1]}" start
   unset 'FAKES[$1]'
+}
+
+# fake_hung_telemetry <worker ip>: an agent that accepts every poll and answers
+# none. Same shape and order as fake_overload -- stop the real sidecar, run a
+# responder in the worker's own network namespace, leave the id in LAST_FAKE
+# and the FAKES entry for unfake_overload and the EXIT trap -- but the
+# responder writes nothing at all, so only cmgrd's per-poll timeout ends the
+# request. -k keeps the listener open so a poll arriving while another is held
+# still completes its handshake; -q -1 stops nc quitting on the EOF its stdin
+# starts at, so the connection is held rather than closed; the plain listener
+# behind the || is the fallback for an nc without -k.
+fake_hung_telemetry() { # fake_hung_telemetry <worker ip>
+  local name=${PUBLIC[$1]} sidecar worker fake body
+  sidecar=$(compose_container "$name-telemetry")
+  worker=$(compose_container "$name")
+  [[ -n "$sidecar" && -n "$worker" ]] || fail "compose containers for $name not found"
+  outer_ctl "$sidecar" stop
+  body=$(jq -cn --arg img "$E2E_IMAGE" --arg net "container:$worker" '{
+    Image: $img,
+    Entrypoint: ["bash", "-c",
+      "while :; do nc -l -k -q -1 2136 >/dev/null 2>&1 || nc -l -q -1 2136 >/dev/null 2>&1 || sleep 0.2; done"],
+    HostConfig: {NetworkMode: $net, AutoRemove: true}}')
+  fake=$(outer /containers/create -X POST -H 'Content-Type: application/json' -d "$body" | jq -r .Id)
+  [[ -n "$fake" && "$fake" != null ]] || fail "could not create the wedged telemetry responder for $name"
+  FAKES[$fake]=$sidecar
+  outer_ctl "$fake" start
+  LAST_FAKE=$fake
+}
+
+# telemetry_hangs <worker ip>: a poll of that worker's agent hangs rather than
+# being refused. The exit code is the whole point: curl 28 is "the connection
+# was accepted and nothing came back", curl 7 is "nothing is listening" -- the
+# state the telemetry-silence step produces, and the one the wedged-telemetry
+# step must never be passing on.
+telemetry_hangs() {
+  local rc=0
+  curl -sS -o /dev/null --max-time 2 "http://$1:2136/health" >/dev/null 2>&1 || rc=$?
+  (( rc == 28 ))
 }
 
 # down_worker <worker ip>: cmgrd-cli worker-down, verified at once. The PATCH
@@ -410,9 +529,20 @@ reap() {
     esac
     retry 30 "container $cid to leave worker $1" container_gone "$1" "$cid"
   done
+  # A network goes only once its last endpoint does, and dockerd can hold one
+  # for a moment after the container is gone -- the same race $BLOCKER_NET is
+  # retried for in the incomplete-reconcile step. A bare --fail-with-body
+  # DELETE would abort the run on it with no message.
   if [[ "$(worker_status "$1" "/networks/cmgr-$2")" == 200 ]]; then
-    worker_api "$1" "/networks/cmgr-$2" -X DELETE -o /dev/null
+    retry 15 "the cmgr-$2 network to leave worker $1" reap_net_gone "$1" "$2"
   fi
+}
+# reap_net_gone <worker ip> <instance id>: one attempt at removing a reaped
+# instance's network; 404 counts, it is already gone.
+reap_net_gone() {
+  local code
+  code=$(worker_status "$1" "/networks/cmgr-$2" -X DELETE)
+  [[ "$code" == 204 || "$code" == 404 ]]
 }
 
 # sweep_worker <ip>: docker-reaper's job at the start of a run. Containers
@@ -481,6 +611,51 @@ check_ondemand() {
 
 # image_tag <build json> <host>: BuildMetadata.dockerId, s<seed>-<checksum hex>-<host>
 image_tag() { printf 's%d-%x-%s' "$(jq -r .seed <<<"$1")" "$(jq -r .checksum <<<"$1")" "$2"; }
+# The artifact endpoints, which are the platform's and a competitor's only view
+# of what a build publishes. artifact_get writes the body to disk (an artifact
+# is gzip, which no shell variable survives) and prints the status instead of
+# failing, exactly as api_status does, so the caller judges it.
+artifact_get() { # artifact_get <build id> <member|artifacts.tar.gz> <output file>
+  curl -sS -o "$3" -w '%{http_code}' --connect-timeout 5 --max-time 60 \
+    "$CMGRD_SERVER/builds/$1/$2"
+}
+# art_members <file>: the archive's member names, sorted, on one line, so a
+# bundle's contents can be compared against a literal. Non-zero (pipefail) when
+# the file is not a readable gzip tar, which is itself an assertion.
+art_members() { tar -tzf "$1" | sort | tr '\n' ' ' | sed 's/ $//'; }
+# same_bytes <a> <b>: byte-identical files. diff rather than cmp because diff is
+# the comparison tool this image is known to carry (the seed check uses it) and
+# it reports binary files as differing instead of printing them.
+same_bytes() { diff -q "$1" "$2" >/dev/null 2>&1; }
+# exec_in <worker ip> <container id> <user> <cmd...>: run a command inside a
+# container over that worker's own dockerd, with cork's client certificate.
+# Tty:true so the response body is the command's raw output: without it docker
+# frames the stream in 8-byte headers that nothing in this image can
+# demultiplex. Prints stdout and stderr together, with the pty's CRs stripped.
+exec_in() {
+  local ip=$1 cid=$2 user=$3 eid req
+  shift 3
+  # One argument per line into jq -R, rather than jq's positional-argument
+  # option, whose variable reads as an unset shell variable to anything
+  # scanning this file. No command run through here has a newline in an
+  # argument.
+  req=$(printf '%s\n' "$@" | jq -cRn --arg u "$user" '{AttachStdout: true, AttachStderr: true, Tty: true, User: $u, Cmd: [inputs]}')
+  eid=$(worker_api "$ip" "/containers/$cid/exec" -X POST -H 'Content-Type: application/json' -d "$req" | jq -r '.Id // empty')
+  [[ -n "$eid" ]] || return 1
+  worker_api "$ip" "/exec/$eid/start" -X POST -H 'Content-Type: application/json' \
+    -d '{"Detach": false, "Tty": true}' | tr -d '\r'
+}
+
+# manual_builds <challenge> <seed>: the ids of hand-made builds (cmgrd-cli
+# build, not a schema's) of that challenge and seed. The full-mode registry
+# steps make one and destroy it again; a run killed before its EXIT trap leaves
+# it behind, and a second build with the same challenge, seed and checksum
+# makes contentReferenced true, so the next run's destroy would keep the images
+# it is asserted to untag.
+manual_builds() { # <challenge id> <seed>
+  cmgrd-cli system-dump |
+    jq -r --arg c "$1" --argjson s "$2" '.[] | select(.id == $c) | .builds[]? | select(.seed == $s) | .id'
+}
 
 # Edit the sources the update steps rebuild. The generation marker shows up
 # in what each service answers, so a rebuilt image is distinguishable from
@@ -488,8 +663,38 @@ image_tag() { printf 's%d-%x-%s' "$(jq -r .seed <<<"$1")" "$(jq -r .checksum <<<
 restore_sources() {
   cp "$CHALLENGES_SEED/$ONDEMAND_SRC" "$CHALLENGES/$ONDEMAND_SRC"
   cp "$CHALLENGES_SEED/$PERSISTENT_SRC" "$CHALLENGES/$PERSISTENT_SRC"
+  # Metadata, not source: the container-options step appends a Challenge
+  # Options block here. problem.md is outside the source checksum but inside
+  # the tree check, so a run killed without its trap is repaired here.
+  cp "$CHALLENGES_SEED/$MAKE_META" "$CHALLENGES/$MAKE_META"
 }
-set_generation() { # set_generation <n> both|ondemand: mark the source(s) as generation n
+# The generation each source currently carries on disk, maintained by
+# set_generation. A step that edits one source and must put it back cannot name
+# a literal: which generation the other steps have left behind depends on the
+# mode, and a step deselected in regular mode moves it. This is the second time
+# that coupling has cost a run, so the number is read rather than written.
+OD_GEN=0
+PERSIST_GEN=0
+set_generation() { # set_generation <n> both|ondemand|persistent: mark the source(s) as generation n
+  case "$2" in
+    persistent) PERSIST_GEN=$1 ;;
+    ondemand) OD_GEN=$1 ;;
+    both) PERSIST_GEN=$1; OD_GEN=$1 ;;
+    *) fail "set_generation: unknown mode '$2'" ;;
+  esac
+  if [[ "$2" == persistent ]]; then
+    # Only the persistent challenge. A step that wants to rebuild it must not
+    # rewrite the on-demand source at whatever generation another step left it
+    # at: that would rebuild the on-demand challenge too and tear down every
+    # instance the scenario still tracks.
+    cp "$CHALLENGES_SEED/$PERSISTENT_SRC" "$CHALLENGES/$PERSISTENT_SRC"
+    sed -i "s/-in secret.enc'/-in secret.enc e2e-generation-$1'/" "$CHALLENGES/$PERSISTENT_SRC"
+    grep -q "e2e-generation-$1" "$CHALLENGES/$PERSISTENT_SRC" || fail "could not mark $PERSISTENT_SRC"
+    sed -i "s|RUN date > /time.txt|RUN echo e2e-generation-$1 > /time.txt|" "$CHALLENGES/$PERSISTENT_SRC"
+    grep -qx "RUN echo e2e-generation-$1 > /time.txt" "$CHALLENGES/$PERSISTENT_SRC" ||
+      fail "could not stamp the generation into the artifact source of $PERSISTENT_SRC"
+    return
+  fi
   cp "$CHALLENGES_SEED/$ONDEMAND_SRC" "$CHALLENGES/$ONDEMAND_SRC"
   sed -i "s/response = f\"CMGR_USER_ID/response = f\"E2E_GENERATION=$1\\\\nCMGR_USER_ID/" "$CHALLENGES/$ONDEMAND_SRC"
   grep -q "E2E_GENERATION=$1" "$CHALLENGES/$ONDEMAND_SRC" || fail "could not mark $ONDEMAND_SRC"
@@ -497,6 +702,15 @@ set_generation() { # set_generation <n> both|ondemand: mark the source(s) as gen
     cp "$CHALLENGES_SEED/$PERSISTENT_SRC" "$CHALLENGES/$PERSISTENT_SRC"
     sed -i "s/-in secret.enc'/-in secret.enc e2e-generation-$1'/" "$CHALLENGES/$PERSISTENT_SRC"
     grep -q "e2e-generation-$1" "$CHALLENGES/$PERSISTENT_SRC" || fail "could not mark $PERSISTENT_SRC"
+    # And inside the artifact, not only in what the service says: time.txt is
+    # tarred into the published bundle, and it is the only thing that makes a
+    # promoted archive distinguishable from the one it replaced. cmgr builds
+    # with the cache on and the edit above touches only the CMD, below the tar,
+    # so without this the bundle is byte-stable across generations and the
+    # full-mode "the promoted bundle really changed" assertion could not exist.
+    sed -i "s|RUN date > /time.txt|RUN echo e2e-generation-$1 > /time.txt|" "$CHALLENGES/$PERSISTENT_SRC"
+    grep -qx "RUN echo e2e-generation-$1 > /time.txt" "$CHALLENGES/$PERSISTENT_SRC" ||
+      fail "could not stamp the generation into the artifact source of $PERSISTENT_SRC"
   fi
 }
 
@@ -541,6 +755,101 @@ for ip in "${WORKER_IPS[@]}"; do
   sweep_worker "$ip"
 done
 ok "cmgrd $(api GET /version | jq -r .version), zot, builder, and $NWORKERS workers (dockerd on nftables + telemetry) answer"
+
+########################################################################
+# BLOCK 1 of 4 — after the "waiting for the fleet" step (see insertAfter)
+########################################################################
+
+# ------------------------------- 1b. a fresh box makes its own directories
+
+if (( FULL )); then
+  step "fresh-box startup: cmgrd creates its artifact and database directories itself, and still refuses a missing challenge directory"
+  # The promise is about a box that has nothing on it yet: ansible drops the
+  # unit file and the challenge tree, and cmgrd makes CMGR_ARTIFACT_DIR and
+  # the directory holding CMGR_DB itself (MkdirAll in cmgr/filesystem.go
+  # setDirectories:60-67 and cmgr/database.go initDatabase:225-230, which
+  # replaced a bare Stat and sqlite's "the file, never its directory"). The
+  # fleet's own cork can never answer it: cork-data has been mounted and
+  # written since the first run of this checkout, so both directories always
+  # already exist. So this runs a throwaway cmgrd out of this very image --
+  # the e2e service is built from cork.Dockerfile, so /usr/local/bin/cmgrd is
+  # the same binary cork runs -- against a tmpdir that is new every run and
+  # the builder daemon the fleet already answers on. It duplicates
+  # cmgr/startup_dirs_test.go on purpose: what the unit tests cannot say is
+  # that the shipped binary does it in the shipped layout.
+  #
+  # Nothing of the fleet is touched. The e2e service carries no CMGR_* in its
+  # environment (compose.yaml), so this daemon has no CMGR_REGISTRY (no
+  # registry work), no CMGR_PORTS (no port reservation), its own tmpdir
+  # database, no workers to load, and reads /challenges without ever scanning
+  # it (an update is an explicit call). Its only docker traffic is
+  # initDocker's Ping and Info against the builder (cmgr/docker.go:36-110),
+  # both read-only. DOCKER_CERT_PATH is inherited and deliberately harmless:
+  # initDocker uses client.WithHostFromEnv() only, never client.FromEnv, so
+  # the plain-TCP builder is not switched into HTTPS mode.
+  fresh=$(mktemp -d)
+  fresh_docker="tcp://${E2E_BUILDER#*://}" # the DOCKER_HOST form of $E2E_BUILDER
+  # Two levels below a directory that does not exist either: a Mkdir would
+  # fail where MkdirAll must not.
+  CMGR_DIR=/challenges \
+  CMGR_ARTIFACT_DIR="$fresh/var/lib/cork/artifacts" \
+  CMGR_DB="$fresh/var/lib/cork/db/cmgr.db" \
+  DOCKER_HOST="$fresh_docker" \
+    cmgrd --port 4299 >"$fresh/cmgrd.log" 2>&1 &
+  FRESH_CMGRD=$! # from here the EXIT trap kills it if anything below fails
+  fresh_answers() {
+    # Fail on a daemon that died rather than spend the whole retry budget on
+    # a port nothing will ever answer on, and say why it died. NewManager
+    # returns nil on any startup failure and cmgrd log.Fatals on that
+    # (cmd/cmgrd/main.go:52-54), so a dead process here is the assertion.
+    kill -0 "$FRESH_CMGRD" 2>/dev/null ||
+      fail "the throwaway cmgrd exited instead of starting on a fresh box: $(tr '\n' ' ' <"$fresh/cmgrd.log" | tail -c 400)"
+    quiet curl -sSf --max-time 3 http://127.0.0.1:4299/version
+  }
+  retry 30 "the throwaway cmgrd to answer on :4299" fresh_answers
+  # Answering at all already means both directories were made. These two say
+  # which one, and that the database really opened in a directory sqlite
+  # would not have created.
+  [[ -d "$fresh/var/lib/cork/artifacts" ]] ||
+    fail "the throwaway cmgrd answered without creating CMGR_ARTIFACT_DIR ($fresh/var/lib/cork/artifacts): on a fresh box every artifact bundle would fail until someone made it by hand (cmgr/filesystem.go setDirectories)"
+  [[ -f "$fresh/var/lib/cork/db/cmgr.db" ]] ||
+    fail "the throwaway cmgrd left no database at $fresh/var/lib/cork/db/cmgr.db: sqlite creates the file but never its directory, so initDatabase must MkdirAll filepath.Dir(CMGR_DB) (cmgr/database.go)"
+  kill "$FRESH_CMGRD" >/dev/null 2>&1 || true
+  wait "$FRESH_CMGRD" 2>/dev/null || true
+  FRESH_CMGRD=""
+  # The other half, which the commit message is explicit about: creating what
+  # cmgr owns must not turn into creating what the operator owns. A missing
+  # challenge directory stays a hard failure -- and it is checked before
+  # anything is created (setDirectories stats CMGR_DIR at :37, the artifacts
+  # MkdirAll is at :64 and initDatabase runs later still, cmgr/api.go:43-53),
+  # so a refused start leaves no tree behind either.
+  t=$(date +%s)
+  rc=0
+  CMGR_DIR="$fresh/nope" \
+  CMGR_ARTIFACT_DIR="$fresh/a2" \
+  CMGR_DB="$fresh/d2/cmgr.db" \
+  DOCKER_HOST="$fresh_docker" \
+    timeout 30 cmgrd --port 4298 >"$fresh/refused.log" 2>&1 || rc=$?
+  refuse_took=$(( $(date +%s) - t ))
+  (( rc != 0 )) ||
+    fail "cmgrd started with CMGR_DIR pointing at a directory that does not exist: a mistyped challenge path must fail the unit, not bring a box up serving an empty catalogue"
+  # Independent of the exit status, because the status busybox timeout reports
+  # for a kill is not something to depend on: a cmgrd that got as far as its
+  # artifact directory started, whatever it exited with.
+  [[ ! -e "$fresh/a2" && ! -e "$fresh/d2" ]] ||
+    fail "cmgrd created its artifact/database tree although CMGR_DIR was missing: the challenge directory is stat'ed first (setDirectories) precisely so a misconfigured box leaves nothing behind"
+  (( refuse_took < 25 )) ||
+    fail "cmgrd did not exit on a missing challenge directory; it had to be killed after ${refuse_took}s"
+  # The exact error, not just the phrase: setDirectories logs "challenge
+  # directory: <path>" at INFO on every successful start too, so grepping for
+  # "challenge directory" would pass whatever it exited on.
+  grep -q "could not stat the challenge directory" "$fresh/refused.log" ||
+    fail "cmgrd exited $rc for some reason other than the missing challenge directory: $(tr '\n' ' ' <"$fresh/refused.log" | tail -c 400)"
+  rm -rf "$fresh"
+  ok "a cmgrd started on a fresh path created CMGR_ARTIFACT_DIR and its database directory itself and served /version; one pointed at a missing CMGR_DIR exited $rc in ${refuse_took}s and created neither"
+else
+  deselect "fresh-box startup directories"
+fi
 
 # ------------------------------------------------- 1. register the workers
 
@@ -632,6 +941,143 @@ else
 fi
 note "chaos target is $WB (${PUBLIC[$WB]}); the persistent instance stays on $WA"
 
+# BLOCK 1 -- insert after e2e/scenario.sh:633 (the `note "chaos target is ..."`
+# that closes the "persistent instance" step). Needs PERSIST_BUILD/MK_BUILD/
+# OD_BUILD (:607-609), build_id/$STATE (:590-592) and PERSIST_META (:614), and
+# must run BEFORE the first set_generation edit.
+# ============================================================================
+
+# --------------------------------------------- 3b. artifact delivery
+
+if (( FULL )); then
+  step "artifacts: every published bundle downloads, holds exactly the challenge's files, and decrypts to the build's flag"
+  # The half of the player contract nothing else in this scenario touches: the
+  # platform hands a competitor a download, not a flag, and cork is the only
+  # thing that serves it. cork's artifact directory lives in the cork-data
+  # volume, which this container deliberately does not mount (compose.yaml), so
+  # every assertion below travels the same HTTP a player's download does.
+  # Placed here on purpose: it must run before the first set_generation edit,
+  # which appends an argument to the advertised openssl command, because the
+  # round trip at the end runs the command the service hands out.
+  # The decrypt round trip needs openssl, which this image does not carry.
+  # Everything else this step asserts — that the bundle downloads, holds
+  # exactly the challenge's files, and belongs to this build — does not, so the
+  # round trip degrades to a note rather than taking the step down with it.
+  ART_OPENSSL=1
+  command -v openssl >/dev/null 2>&1 || ART_OPENSSL=0
+  (( ART_OPENSSL )) ||
+    note "no openssl in this image: the decrypt round trips are not run (add openssl to the apk line in e2e/cork.Dockerfile to restore them)"
+  ART_TMP=$(mktemp -d) # also holds the bundles the two artifact steps after the rebuilds compare against
+  ART_G1="$ART_TMP/persist-g1.tar.gz"
+  PERSIST_FLAG=$(api GET "/builds/$PERSIST_BUILD" | jq -r .flag)
+  [[ -n "$PERSIST_FLAG" && "$PERSIST_FLAG" != null ]] ||
+    fail "build $PERSIST_BUILD has no flag to check its artifact against"
+
+  # has_artifacts is what the platform reads to decide whether to offer a
+  # download at all, and it is stored per build (HasArtifacts = len(files) > 0,
+  # cmgr/docker.go:810). Two builds that publish and two that do not, so the
+  # field is proved to discriminate rather than to be constantly true: a
+  # regression that derived it from the challenge type, or defaulted it, fails
+  # on one of the two halves.
+  for b in "$PERSIST_BUILD" "$MK_BUILD"; do
+    [[ "$(api GET "/builds/$b" | jq -r .has_artifacts)" == true ]] ||
+      fail "build $b publishes artifacts but reports has_artifacts=false: the platform would never offer its download (HasArtifacts, cmgr/docker.go:810)"
+  done
+  FLAG_BUILD=$(build_id "$CH_FLAGONLY")
+  for b in "$OD_BUILD" "$FLAG_BUILD"; do
+    [[ "$(api GET "/builds/$b" | jq -r .has_artifacts)" == false ]] ||
+      fail "build $b publishes no artifacts.tar.gz but reports has_artifacts=true: the platform would offer a download cork cannot serve"
+  done
+
+  # The operator's path (cmgrd-cli artifacts) and the player's path
+  # (GET /builds/<id>/artifacts.tar.gz) are the same handler; the CLI is used
+  # here so its exit status is covered too (cmd/cmgrd-cli/commands.go:421-445).
+  out=$(cmgrd-cli artifacts "$PERSIST_BUILD" "$ART_G1" 2>&1) ||
+    fail "cmgrd-cli artifacts $PERSIST_BUILD did not succeed: $out"
+  members=$(art_members "$ART_G1") ||
+    fail "the bundle served for build $PERSIST_BUILD is not a readable gzip tar"
+  # Exactly the files examples/custom/Dockerfile publishes, and nothing else: a
+  # member the challenge never published is a leak (the image's own /challenge
+  # tree would be one), and a missing member is a broken player download that
+  # nothing else in this run would notice.
+  [[ "$members" == "secret.enc time.txt" ]] ||
+    fail "the bundle for build $PERSIST_BUILD holds '$members', expected 'secret.enc time.txt' (examples/custom/Dockerfile publishes exactly those two)"
+
+  ART_MK="$ART_TMP/make.tar.gz"
+  out=$(cmgrd-cli artifacts "$MK_BUILD" "$ART_MK" 2>&1) ||
+    fail "cmgrd-cli artifacts $MK_BUILD did not succeed: $out"
+  members=$(art_members "$ART_MK") ||
+    fail "the bundle served for build $MK_BUILD is not a readable gzip tar"
+  # The remote-make challenge tars its own archive in its Makefile and the
+  # built-in Dockerfile moves it into /challenge, so this is the second,
+  # independent way a bundle reaches cork's artifact directory.
+  [[ "$members" == "BinEx101 BinEx101.c" ]] ||
+    fail "the bundle for build $MK_BUILD holds '$members', expected 'BinEx101 BinEx101.c' (the artifacts.tar.gz target of examples/remote-make/Makefile)"
+
+  # The per-file path is a different branch of the same handler: it walks the
+  # stored tar and copies one member out (cmd/cmgrd/main.go:493-514). Comparing
+  # it against the same member of the bundle just downloaded is what proves it
+  # serves the raw file rather than the gzip, a prefix of it, or the wrong
+  # member -- none of which a status check alone would catch.
+  code=$(artifact_get "$PERSIST_BUILD" secret.enc "$ART_TMP/secret.enc")
+  [[ "$code" == 200 ]] ||
+    fail "GET /builds/$PERSIST_BUILD/secret.enc answered HTTP $code: the per-file path is how every {{url_for}} link in a challenge's text is served"
+  tar -xzOf "$ART_G1" secret.enc >"$ART_TMP/secret.from-bundle" ||
+    fail "could not read secret.enc out of the bundle for build $PERSIST_BUILD"
+  same_bytes "$ART_TMP/secret.enc" "$ART_TMP/secret.from-bundle" ||
+    fail "the per-file download of secret.enc differs from the same member of the same build's bundle: the tar walk at cmd/cmgrd/main.go:493-514 served something other than the stored member"
+  # A name the archive does not hold is a 404, not a 500 and not an empty 200:
+  # the platform renders {{url_for}} links out of the challenge text, so a typo
+  # there must read as missing rather than as a broken cmgrd.
+  code=$(api_status GET "/builds/$PERSIST_BUILD/e2e-not-a-member")
+  [[ "$code" == 404 ]] ||
+    fail "GET /builds/$PERSIST_BUILD/e2e-not-a-member answered HTTP $code, expected 404 for a member the bundle does not hold (the io.EOF arm of the tar walk, cmd/cmgrd/main.go:511-514)"
+
+  # The round trip, which is the whole reason anything is published: the file
+  # the player downloads, decrypted with the command the running service hands
+  # out, is this build's flag. Nothing else in the scenario links an artifact to
+  # a flag, and nothing else would notice a bundle promoted from another build
+  # or another seed -- the member names and the sizes would all be right.
+  # Retried rather than asked once: this is a guard on the fixture, not the
+  # assertion, and the socat service is one TCP connection per answer.
+  ppub=$(jq -r .worker_public <<<"$PERSIST_META")
+  pport=$(jq -r .ports.socat <<<"$PERSIST_META")
+  retry 15 "the persistent instance at $ppub:$pport to advertise the generation-1 decryption command this step is about to run" \
+    tcp_says "$ppub" "$pport" '' 'openssl aes-256-cbc -d -k unguessable -pbkdf2 -in secret.enc'
+  # Guarded: a failed decrypt exits non-zero, and a bare one would abort the run
+  # without saying what went wrong.
+  if (( ART_OPENSSL )); then
+    dec=$(openssl aes-256-cbc -d -k unguessable -pbkdf2 -in "$ART_TMP/secret.enc" 2>/dev/null || true)
+    [[ "$dec" == "$PERSIST_FLAG" ]] ||
+      fail "secret.enc from build $PERSIST_BUILD's bundle decrypts to '$dec', not to the build's flag '$PERSIST_FLAG': the archive cork serves is not this build's"
+  fi
+
+  # Negative space. A build that publishes nothing must never hand out bytes:
+  # the served path is <artifact dir>/<build id>.tar.gz, so a build id that
+  # collided with another build's archive would answer 200 here and give one
+  # challenge's files to another's players.
+  code=$(api_status GET "/builds/$OD_BUILD/artifacts.tar.gz")
+  [[ "$code" != 200 ]] ||
+    fail "build $OD_BUILD reports has_artifacts=false yet GET /builds/$OD_BUILD/artifacts.tar.gz answered 200: cork served an archive for a build that publishes none"
+  # Deliberately not asserted as 404, which is what the unknown-build arm below
+  # really does answer: for a KNOWN build with no artifacts the guard at
+  # cmd/cmgrd/main.go:478 reads "ok || (err != nil && !meta.HasArtifacts)", and
+  # err is nil on that path, so the handler falls through to an os.Open that
+  # cannot succeed and answers 500. Asserting 404 here would fail today against
+  # behaviour nobody has changed; "not 200" fails only for the case that costs a
+  # player someone else's files, and keeps passing once the guard is corrected.
+  [[ "$code" == 404 ]] ||
+    note "a build without artifacts answers HTTP $code rather than 404 (cmd/cmgrd/main.go:478 tests err != nil where err == nil was meant)"
+  [[ "$(api_status GET "/builds/999999/artifacts.tar.gz")" == 404 ]] ||
+    fail "GET /builds/999999/artifacts.tar.gz was not a 404: an unknown build must come back as an UnknownIdentifierError, not a 500 (cmd/cmgrd/main.go:474-479)"
+
+  ok "has_artifacts is true for exactly the two builds that publish; both bundles hold exactly their challenge's files; the per-file path serves the stored member byte for byte and 404s an unknown one; secret.enc decrypts to build $PERSIST_BUILD's flag with the command the service advertises; a build without artifacts serves nothing and an unknown build is a 404"
+else
+  deselect "artifacts: bundles download, hold the challenge's files, and decrypt to the flag"
+fi
+
+# ============================================================================
+
 # ------------------------------------------------------------ 4. registry
 
 step "registry: every build's instance images are in zot under their content-addressed tags"
@@ -656,6 +1102,150 @@ for ip in "${WORKER_IPS[@]}"; do
   fi
 done
 ok "all instance images were pushed"
+
+############################################################################
+# BLOCK 1 -- full-mode step, goes after the registry step's ok (line 658)
+############################################################################
+
+if (( FULL )); then
+  step "cold workers: with every $CH_ONDEMAND image deleted from both boxes, the next launch on each pulls the content tag from zot inside the request"
+  # Workers keep images until docker-reaper sweeps them, and run.sh never takes
+  # the fleet down with -v, so on a box that has run this scenario before the
+  # "each worker holds the image it launched from" check in the step below can
+  # be satisfied by last week's leftover. Rather than sharpen a step that also
+  # runs in regular mode, this one makes the claim itself and hands the fleet
+  # back warm: delete the repo, prove it is gone, launch, prove the tag is back
+  # and that the instance serves this build's flag.
+  (( ${#OD_IDS[@]} == 0 )) ||
+    fail "${#OD_IDS[@]} on-demand instance(s) are tracked at this point: this step deletes every $CH_ONDEMAND image from both workers, which a daemon refuses while a container of that image runs. The step belongs before the on-demand launches, not after them"
+  COLD_REF="$E2E_REGISTRY/$CH_ONDEMAND:${IMAGE_TAG[$CH_ONDEMAND]}"
+  for ip in "${WORKER_IPS[@]}"; do
+    # Every generation of the repo, not only the current tag: an earlier full
+    # run leaves two or three behind, and the negative control below reads the
+    # repo prefix rather than one tag.
+    tags=$(worker_tags "$ip")
+    for ref in $(grep "^$E2E_REGISTRY/$CH_ONDEMAND:" <<<"$tags" || true); do
+      # Deliberately not force=true: a 409 means a container still uses the
+      # image, i.e. something the fleet-wait sweep could not see is running,
+      # and forcing it out from under that container would hide the problem
+      # instead of reporting it.
+      code=$(worker_status "$ip" "/images/$ref" -X DELETE)
+      case "$code" in
+        200|404) ;;
+        409) fail "worker $ip refuses to delete $ref because a container still uses it: sweep_worker only removes containers labelled cmgr.managed=true (scenario.sh), so a run killed before its EXIT trap ran may have left one behind. This run cannot be made cold" ;;
+        *) fail "deleting $ref from worker $ip answered HTTP $code" ;;
+      esac
+    done
+  done
+  # The negative control. Without it every assertion below passes just as well
+  # on a warm box and the step proves only that a cache hit works.
+  for ip in "${WORKER_IPS[@]}"; do
+    tags=$(worker_tags "$ip")
+    if grep -q "^$E2E_REGISTRY/$CH_ONDEMAND:" <<<"$tags"; then
+      fail "worker $ip still holds an image of $CH_ONDEMAND after the delete: imagePresent would skip the pull (cmgr/launch.go:135-141) and the launches below would prove nothing about a pull"
+    fi
+  done
+  note "deleted every $E2E_REGISTRY/$CH_ONDEMAND image from both workers; both are cold for $COLD_REF"
+
+  # One launch at a time, not two at once. Two cold pulls of the same
+  # ubuntu:24.04-based image into two dinds on one host contend for the same
+  # disk and are the likeliest way to push a pull past the 30s default
+  # pullTimeout (compose sets no CMGR_WORKER_PULL_TIMEOUT) -- which would be a
+  # legitimate 503 the fleet is entitled to, not a regression, and so a bad
+  # thing to hang a step on. Sequential also gets its placement from the
+  # invariant the harness already relies on: two consecutive launches over two
+  # ok workers land one each, because selectWorker advances its cursor per
+  # placement (cmgr/workers.go, as ensure_instance_on and the autoscaling step
+  # both assume).
+  COLD_INST=""; COLD_CODE=""; COLD_TOOK=0
+  cold_launch() { # cold_launch <user index>: one on-demand launch, past a transient refusal
+    local i=$1 attempt out s
+    for attempt in 1 2 3; do
+      s=$(date +%s)
+      out=$(try_launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i")
+      COLD_TOOK=$(( $(date +%s) - s ))
+      COLD_CODE=${out%%$'\n'*}
+      COLD_INST=${out#*$'\n'}
+      case "$COLD_CODE" in
+        200|201) return ;;
+        503)
+          # Every 503 here is retryable by contract (cmd/cmgrd/main.go:447-452)
+          # and none of them is this step's subject: a momentarily overloaded
+          # box, a busy launch queue, or a pull that ran out of time on a
+          # loaded host. Say which it was, wait for the fleet, ask again. The
+          # ErrPullTimeout case is still covered, by the health check below:
+          # a timed-out pull must not have cost the worker its place.
+          note "the launch for e2e-user-$i was refused as retryable after ${COLD_TOOK}s ($(head -c 140 <<<"$COLD_INST")); waiting for both workers and trying again"
+          retry 30 "both workers to report ok before retrying the cold launch" all_workers_ok
+          ;;
+        *)
+          fail "the cold launch for e2e-user-$i answered HTTP $COLD_CODE after ${COLD_TOOK}s: a launch onto a worker that does not hold the build's image must pull it from $E2E_REGISTRY under the worker's own certs.d identity and start ($(head -c 200 <<<"$COLD_INST"))"
+          ;;
+      esac
+    done
+    fail "three launches for e2e-user-$i in a row were refused as retryable, the last after ${COLD_TOOK}s: the fleet never got far enough to attempt the cold pull this step is about ($(head -c 200 <<<"$COLD_INST"))"
+  }
+
+  retry 30 "both workers to report ok before the cold launches" all_workers_ok
+  for i in 41 42; do
+    cold_launch "$i"
+    track "$COLD_INST" "$i"
+    note "instance $(jq -r .id <<<"$COLD_INST") on $(jq -r .worker <<<"$COLD_INST") after ${COLD_TOOK}s, its image pulled inside the request"
+  done
+  # Placement is not the subject here: if a worker flipped overloaded in the
+  # window between the health read and the second placement, both landed on one
+  # box. That costs one more launch, not the step -- ensure_instance_on is the
+  # harness's own way of getting an instance onto a named worker.
+  for ip in "${WORKER_IPS[@]}"; do
+    if [[ -z "$(instance_on "$ip")" ]]; then
+      note "both cold launches landed on the same worker; one more so $ip pulls too"
+      ensure_instance_on "$ip" 43
+    fi
+  done
+
+  # The load-bearing pair: the repo was provably empty a moment ago and holds
+  # the exact content tag now, on a daemon nothing but ensureImages writes
+  # images to. No registry credentials are configured in this fleet
+  # (CMGR_REGISTRY_USER/TOKEN are unset, so authString carries an empty
+  # username and password, cmgr/docker.go:95-103), which leaves the worker's own
+  # read-only CN=worker certs.d identity as the only thing that can have
+  # authorized the pull.
+  for ip in "${WORKER_IPS[@]}"; do
+    has_line "$COLD_REF" worker_tags "$ip" ||
+      fail "worker $ip does not hold $COLD_REF after launching an instance of that build from an empty image store: ensureImages did not pull it (cmgr/launch.go:126-153)"
+  done
+  # And the pull fetched this build's content, not merely something with the
+  # right name: the instance serves the build's flag and its own environment.
+  for id in "${OD_IDS[@]}"; do
+    check_ondemand "${INST_META[$id]}" "${INST_USER[$id]}"
+  done
+  # A pull that failed must never cost the worker its place, and a pull that
+  # succeeded certainly must not: only ErrPullTimeout is exempt from
+  # noteWorkerTransportError (cmgr/launch.go:142-150), so a regression there
+  # shows up as a box that pulled and was downed for it. down is sticky and
+  # only a worker-add clears it, so this read is the whole assertion; the retry
+  # afterwards is for overloaded, which a big pull can cause and which clears
+  # by itself.
+  for ip in "${WORKER_IPS[@]}"; do
+    ! health_is "$ip" down ||
+      fail "worker $ip was marked down by the pull it had to perform: a pull failure that is not ErrPullTimeout is offered to noteWorkerTransportError (cmgr/launch.go:142-150), and one slow registry would walk the whole fleet down until an operator re-added every box"
+  done
+  retry 20 "both workers to report ok after the cold pulls" all_workers_ok
+
+  for id in "${OD_IDS[@]}"; do
+    cmgrd-cli stop "$id"
+    assert_gone "$id" "${INST_WORKER[$id]}" "${INST_META[$id]}"
+  done
+  OD_IDS=() # the next step counts its own four launches over an empty list
+  # Both workers hold the tag again, exactly as a warm fleet would, so the step
+  # after this one sees what it always sees. HAD_TAG was read before this step
+  # deleted anything; correct it, or its note there claims a pull that will not
+  # happen. Nothing else reads HAD_TAG, and nothing asserts on it.
+  for ip in "${WORKER_IPS[@]}"; do HAD_TAG[$ip]=1; done
+  ok "both workers started this step holding no $CH_ONDEMAND image at all and ended it holding $COLD_REF, pulled from zot inside the launch that needed it, serving the build's flag, with neither box downed for the pull"
+else
+  deselect "cold workers: the first launch on each box really pulls the image from zot"
+fi
 
 # ----------------------------------------------- 5. on-demand launches
 
@@ -685,6 +1275,134 @@ for id in "${OD_IDS[@]}"; do
   note "instance $id: ${PUBLIC[${INST_WORKER[$id]}]} serves e2e-user-${INST_USER[$id]} with flag $OD_FLAG"
 done
 ok "every instance answers with its own user_id and env"
+
+############################################################################
+# BLOCK 2 -- full-mode step, goes after the on-demand-instances ok (line 687)
+############################################################################
+
+if (( FULL )); then
+  step "registry identities: the worker's certificate pulls from zot but may not push to it, and a client with no certificate is refused outright"
+  # Every probe here is driven through $WA's own dockerd, which carries the
+  # worker's certs.d identity (CN=worker, read-only in e2e/zot/config.json) --
+  # the same files, over the same identity, a pull travels with. Doing it this
+  # way needs no compose change and, more to the point, tests the identity a
+  # worker actually has rather than one the scenario mints for the occasion.
+  # cork's read-write certificate is used only to read the registry back.
+  probe_src="$E2E_REGISTRY/$CH_ONDEMAND:${IMAGE_TAG[$CH_ONDEMAND]}"
+  probe_ref="$E2E_REGISTRY/$PROBE_REPO:$PROBE_TAG"
+  has_line "$probe_src" worker_tags "$WA" ||
+    fail "worker $WA does not hold $probe_src although the launches above pulled it there: this step needs an image to offer the registry"
+
+  # worker_probe: try_launch's shape for a worker's docker API -- status on the
+  # first line, body after it, a transport failure reported as 000 rather than
+  # raised, because a push that dies mid-stream is a legitimate outcome here
+  # and must not abort the run under errexit. worker_curl hardcodes
+  # --max-time 15; curl takes the last occurrence of a repeated option, so the
+  # callers below override it for the two calls that talk to the registry.
+  worker_probe() { # worker_probe <ip> <path> [curl args...]
+    local ip=$1 path=$2 out
+    shift 2
+    out=$(worker_curl "$ip" "$path" -w '\n%{http_code}' "$@") || out=$'\n000'
+    printf '%s\n%s\n' "${out##*$'\n'}" "${out%$'\n'*}"
+  }
+
+  # The positive control for the identity, and it has to come first: without it
+  # the refusal below would prove nothing more than a broken connection or a
+  # misplaced certificate. dockerd re-resolves the manifest with the registry
+  # even for a tag it already holds, so this is a real authenticated read.
+  out=$(worker_probe "$WA" "/images/create?fromImage=$E2E_REGISTRY/$CH_ONDEMAND&tag=${IMAGE_TAG[$CH_ONDEMAND]}" -X POST --max-time 120)
+  code=${out%%$'\n'*}
+  body=${out#*$'\n'}
+  { [[ "$code" == 200 ]] && ! grep -qiE 'errorDetail|denied|unauthorized' <<<"$body"; } ||
+    fail "worker $WA cannot read $probe_src from $E2E_REGISTRY with its own certificate (HTTP $code): the \"worker\" identity is granted read on every repository (e2e/zot/config.json), and without it no launch on a cold worker could pull at all ($(head -c 200 <<<"$body"))"
+
+  # The write attempt, under a repository name in the challenges' own namespace
+  # so zot judges it by exactly the "**" policy that guards the real ones.
+  code=$(worker_status "$WA" "/images/$probe_src/tag?repo=$E2E_REGISTRY/$PROBE_REPO&tag=$PROBE_TAG" -X POST)
+  [[ "$code" == 201 ]] || fail "could not tag $probe_src as $probe_ref on worker $WA: HTTP $code"
+  PROBE_WORKER=$WA # from here the EXIT trap untags it if the run dies
+  # X-Registry-Auth: e30= is base64 "{}", the empty auth config a
+  # credential-less docker push sends; zot authenticates by certificate only
+  # (http.auth.mtls), so the certs.d client cert is the whole identity.
+  out=$(worker_probe "$WA" "/images/$E2E_REGISTRY/$PROBE_REPO/push?tag=$PROBE_TAG" -X POST -H 'X-Registry-Auth: e30=' --max-time 180)
+  push_code=${out%%$'\n'*}
+  push_body=${out#*$'\n'}
+
+  # The authoritative assertion, read back with cork's identity and independent
+  # of how dockerd words anything: a push that got through leaves the tag, or --
+  # if it died between the blobs and the manifest -- the repository. Cleaned up
+  # before failing, so a fleet with this regression is still usable afterwards.
+  if has_line "$PROBE_TAG" registry_tags "$PROBE_REPO"; then
+    registry_status "/v2/$PROBE_REPO/manifests/$PROBE_TAG" -X DELETE >/dev/null 2>&1 || true
+    fail "the worker's read-only certificate pushed $probe_ref into $E2E_REGISTRY: zot grants the \"worker\" identity read only (e2e/zot/config.json accessControl), and a worker that can write the registry can replace any challenge image the whole fleet then pulls"
+  fi
+  [[ "$(registry_status /v2/_catalog)" == 200 ]] ||
+    fail "cork's own certificate cannot read $E2E_REGISTRY/v2/_catalog, so this step cannot tell whether the worker's push created a repository"
+  # A repository may appear in the catalog without the policy having leaked:
+  # zot initialises a repository directory as a side effect of reads the worker
+  # identity is entitled to make, and an empty one publishes nothing. Verified
+  # directly against this fleet: with the worker's certificate,
+  # POST /v2/<repo>/blobs/uploads/ answers 403 and creates no catalog entry,
+  # while GET /v2/_catalog answers 200. So what matters is that the repository
+  # is EMPTY -- a tag is the only thing another box would ever pull.
+  if registry_api /v2/_catalog | jq -e --arg r "$PROBE_REPO" '.repositories // [] | index($r)' >/dev/null; then
+    probe_tags=$(registry_tags "$PROBE_REPO" | tr '\n' ' ' | sed 's/ $//')
+    [[ -z "$probe_tags" ]] ||
+      fail "the worker's push left tag(s) '$probe_tags' under $PROBE_REPO in $E2E_REGISTRY: a worker that can write the registry can replace any challenge image the whole fleet then pulls"
+    note "zot left an empty $PROBE_REPO repository behind the refused push; it holds no tag, so nothing is publishable through it"
+  fi
+  # Second, weaker, and deliberately so: that the write was REFUSED rather than
+  # merely lost. The wording is dockerd's and zot's, not cork's, so pinning an
+  # exact string here would pin another project's strings; the two assertions
+  # above are the ones that cannot be right for the wrong reason.
+  grep -qiE 'denied|unauthorized|forbidden|errorDetail' <<<"$push_body" ||
+    fail "the push of $probe_ref with the worker's certificate answered HTTP $push_code and named no refusal: nothing reached the registry, but neither did anything refuse it, so the probe did not exercise the policy ($(head -c 200 <<<"$push_body"))"
+  note "the worker's certificate was refused the push: $(tr -d '\r' <<<"$push_body" | grep -iEm1 'denied|unauthorized|forbidden|errorDetail' | head -c 160)"
+
+  code=$(worker_status "$WA" "/images/$probe_ref?noprune=1" -X DELETE)
+  case "$code" in
+    200|404) ;;
+    *) fail "could not untag $probe_ref from worker $WA: HTTP $code" ;;
+  esac
+  PROBE_WORKER=""
+  # noprune, plus the original tag still being there, means only the name went.
+  # If the image itself went, the instances running from it are on borrowed
+  # time and every later plant_orphan on this box would fail.
+  has_line "$probe_src" worker_tags "$WA" ||
+    fail "untagging the probe removed $probe_src from worker $WA: the image this run's instances launched from is gone"
+
+  # No client certificate at all. zot's identity model is mTLS only
+  # (http.auth.mtls with a configured cacert, defaultPolicy [] and
+  # anonymousPolicy []), so the refusal may land at the TLS handshake -- curl
+  # fails and %{http_code} is 000 -- or come back as a 401/403. Which one it is
+  # is zot's business; a 200 is the only outcome that matters, and it would mean
+  # every challenge image and flag-bearing layer is readable by anything that
+  # can reach the registry.
+  anon_status() { # anon_status <path>: status with the CA only, 000 for a TLS-level refusal
+    local out
+    out=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 \
+      --cacert "$REGISTRY_CERT_DIR/ca.crt" "https://$E2E_REGISTRY$1" 2>/dev/null) || true
+    if [[ -z "$out" ]]; then out=000; fi
+    printf '%s' "$out"
+  }
+  for path in "/v2/" "/v2/$CH_ONDEMAND/tags/list" "/v2/_catalog"; do
+    # The positive control for the same path first: with cork's certificate it
+    # answers 200, so the refusal below is about the identity and not about the
+    # path being wrong or the registry being down.
+    ccode=$(registry_status "$path")
+    [[ "$ccode" == 200 ]] ||
+      fail "cork's read-write certificate got HTTP $ccode from $path, so an anonymous refusal there would say nothing about identity"
+    acode=$(anon_status "$path")
+    case "$acode" in
+      000) note "anonymous GET $path: refused at the TLS handshake" ;;
+      401|403) note "anonymous GET $path: HTTP $acode" ;;
+      *) fail "an anonymous client got HTTP $acode from $E2E_REGISTRY$path: zot's defaultPolicy and anonymousPolicy are both empty (e2e/zot/config.json), so nothing without a certificate may read the registry" ;;
+    esac
+  done
+  ok "the worker's certificate read $probe_src from zot and was refused the push of $probe_ref, which left neither tag nor repository behind; an anonymous client was refused /v2/, the tag list and the catalog, all three of which cork's own certificate reads"
+else
+  deselect "registry identities: the worker's certificate is read-only and anonymous access is refused"
+fi
 
 # ------------------------------------------------- 6b. launch slot burst
 
@@ -1018,10 +1736,232 @@ pub=$(jq -r .worker_public <<<"$inst")
 port=$(jq -r .ports.socat <<<"$inst")
 assert_on_worker "$w" "$inst"
 retry 30 "the BinEx101 prompt at $pub:$port" tcp_says "$pub" "$port" '1\n1\n' 'Give me a number'
+
+############################################################################
+# BLOCK 3 -- one line inside the existing remote-make step (both modes),
+#            after its tcp_says (line 1020)
+############################################################################
+
+# After this step exactly one worker has had to hold $CH_MAKE's image, and
+# nothing rebuilds or relaunches this challenge afterwards (set_generation
+# touches only $ONDEMAND_SRC and $PERSISTENT_SRC): the full-mode missing-tag
+# step needs exactly that asymmetry, and it is free to record here.
+MK_WORKER=$w
 note "instance $id on $w: $pub:$port prompts for input"
 cmgrd-cli stop "$id"
 assert_gone "$id" "$w" "$inst"
 ok "remote-make instance launched, answered, and was torn down on the worker"
+
+########################################################################
+# BLOCK 1 -- insert after e2e/scenario.sh:1024
+#   ok "remote-make instance launched, answered, and was torn down on the worker"
+########################################################################
+
+# ------------------------------ 6b. container options (full mode only)
+
+if (( FULL )); then
+  step "container options: a challenge that asks for cpu, memory, pid and file limits gets them in its container's HostConfig on the worker"
+  # Production runs the whole picoCTF library, and that library hardens its
+  # challenges through the "## Challenge Options" block
+  # (examples/specification.md:93-190, examples/multi/problem.md:41-52): the
+  # cpu, memory and pid ceilings are what keep one instance from taking a
+  # worker down with it. Nothing in e2e/schema.yaml declares any -- its four
+  # challenges are chosen by delivery type, not by hardening -- and this step
+  # may not add one, so it declares the block on the copy of binex101's
+  # problem.md inside the CMGR_DIR volume (the technique set_generation
+  # already uses on the sources) and takes it off again at the end.
+  #
+  # binex101 is the challenge to edit, for three reasons: it is on-demand, no
+  # step holds a tracked instance of it, and it is not one of the two the
+  # update steps rebuild -- so the rebuild this edit costs (see below) tears
+  # nothing down and displaces no image generation.
+  live=$(api GET "/schemas/$SCHEMA_NAME" | jq -r --arg c "$CH_MAKE" '[.[] | select(.id == $c) | .builds[].instances[]?] | length')
+  [[ "$live" == 0 ]] ||
+    fail "$CH_MAKE has $live live instance(s) at this point: the metadata edit below rebuilds the challenge, and a rebuild removes every on-demand instance of it (updateChallenges' DYNAMIC_INSTANCES arm, cmgr/database_challenges.go:723-729) behind whichever step launched them -- move this step, do not weaken it"
+
+  # The negative control, and it is nearly free: an instance of a challenge
+  # that declares no options at all. Every challenge carries a containerOptions
+  # row for host "" -- the loader stores the zero value even when there is no
+  # block (cmgr/loader.go:43-46) -- so hasContainerOpts is true here too and
+  # the branch at cmgr/docker.go:1047-1105 does run; the limits are the only
+  # evidence that distinguishes a declared option from a daemon default.
+  # Deliberately no assertion on Init: that "" row makes cork send an explicit
+  # false, which is an implementation detail of the empty row rather than a
+  # promise about a challenge that asks for nothing.
+  bare=${OD_IDS[0]:-}
+  [[ -n "$bare" ]] ||
+    fail "no tracked on-demand instance to read as the no-options control: this step must run while the on-demand launches are still standing"
+  bare_cid=$(jq -r '.containers[0]' <<<"${INST_META[$bare]}")
+  bare_hc=$(worker_api "${INST_WORKER[$bare]}" "/containers/$bare_cid/json" |
+    jq -c '.HostConfig | {NanoCpus: (.NanoCpus // 0), Memory: (.Memory // 0), PidsLimit: (.PidsLimit // 0)}')
+  for f in NanoCpus Memory PidsLimit; do
+    [[ "$(jq -r --arg f "$f" '.[$f]' <<<"$bare_hc")" == 0 ]] ||
+      fail "instance $bare of $CH_ONDEMAND declares no container options but already runs under $f on ${INST_WORKER[$bare]} ($bare_hc): the numbers asserted below would then prove nothing about the options block"
+  done
+
+  mk_before=$(api GET "/builds/$MK_BUILD")
+  mk_tags_before=$(registry_tags "$CH_MAKE" | sort | tr '\n' ' ')
+  opts_before=$(api GET "/challenges/$CH_MAKE" | jq -cS '.challenge_options // {}')
+
+  # From here the EXIT trap puts the seed copy of problem.md back: a run that
+  # died mid-step would otherwise leave the CMGR_DIR volume out of step with
+  # the checkout, which the next run's tree check (scenario.sh:571-577) reports
+  # as a stale volume rather than as this step's mess.
+  EDITED_META=$MAKE_META
+  # The fence markers are compared literally (lines[i] == "```yaml", == "```",
+  # cmgr/loader_markdown.go:252-262), so they carry no indentation and no
+  # trailing space; the ulimit is quoted so nothing about it depends on how
+  # yaml resolves a plain scalar containing a colon.
+  cat >>"$CHALLENGES/$MAKE_META" <<'OPTS'
+
+## Challenge Options
+
+```yaml
+init: true
+cpus: 0.5
+memory: 256m
+pidslimit: 50
+ulimits:
+  - "nofile=1024:1024"
+nonewprivileges: true
+```
+OPTS
+  grep -qx 'pidslimit: 50' "$CHALLENGES/$MAKE_META" ||
+    fail "could not append the Challenge Options block to $MAKE_META"
+
+  t=$(date +%s)
+  rc=0
+  out=$(cmgrd-cli update) || rc=$?
+  sed 's/^/       /' <<<"$out"
+  (( rc == 0 )) ||
+    fail "cmgrd-cli update exited $rc after a Challenge Options block was added to $MAKE_META: a syntactically valid block must load (a section error fails the load loudly, cmgr/loader_markdown.go:161-186)"
+  took=$(( $(date +%s) - t ))
+  grep -q "  $CH_MAKE$" <<<"$out" ||
+    fail "the update did not report $CH_MAKE after its problem.md changed: the options never reached the challenge row (DetectChanges compares MetadataChecksum, the crc32 of problem.md itself, cmgr/loader_markdown.go:191-198)"
+  # And it touched nothing else. Said here rather than left to surface later:
+  # the sources of the other two challenges are pristine at this point, and a
+  # rebuild of the on-demand one would remove all four tracked instances
+  # (cmgr/database_challenges.go:723-729) and strand every step after this.
+  for other in "$CH_ONDEMAND" "$CH_PERSISTENT"; do
+    if grep -q "  $other$" <<<"$out"; then
+      fail "the update that only changed $MAKE_META also acted on $other, whose sources are untouched here: this step's edit is not confined to $CH_MAKE, and the instances the scenario is holding have been torn down"
+    fi
+  done
+  # Which section it lands in is worth saying but not worth failing on: an
+  # options change is not refreshable today -- safeToRefresh requires the
+  # parsed and persisted ChallengeOptions to be DeepEqual (cmgr/database.go:
+  # 710-722) -- so it takes the Updated arm and rebuilds. The durable promise,
+  # asserted right below, is that the rebuild reproduces the same content and
+  # so costs no image generation; whether cork later learns to refresh an
+  # options edit is a decision this step must not pin.
+  if grep -q "^Updated:" <<<"$out"; then
+    note "the options edit rebuilt $CH_MAKE in ${took}s (safeToRefresh refuses to call an options change a refresh, cmgr/database.go:717); the build context is unchanged, so the rebuild is a cache hit that reproduces the same content checksum"
+  else
+    note "the options edit was applied to $CH_MAKE in ${took}s without a rebuild"
+  fi
+
+  # problem.md is excluded from the source checksum (checksumIgnore,
+  # cmgr/filesystem.go:248-255), so the content identity -- and therefore every
+  # tag, the flag and the rollback target -- must come through an options edit
+  # untouched. A regression that folded problem.md into the source checksum
+  # would push a fresh generation for a comment change and leak the displaced
+  # tag past the teardown step's registry check.
+  mk_after=$(api GET "/builds/$MK_BUILD")
+  [[ "$(jq -r .checksum <<<"$mk_after")" == "$(jq -r .checksum <<<"$mk_before")" ]] ||
+    fail "build $MK_BUILD's content checksum changed when only problem.md did ($(jq -r .checksum <<<"$mk_before") -> $(jq -r .checksum <<<"$mk_after")): problem.md is not part of the source checksum (cmgr/filesystem.go:248-255)"
+  [[ "$(jq -r .flag <<<"$mk_after")" == "$(jq -r .flag <<<"$mk_before")" ]] ||
+    fail "the flag of build $MK_BUILD changed over a metadata-only edit"
+  [[ "$(jq -r .prev_checksum <<<"$mk_after")" == "$(jq -r .prev_checksum <<<"$mk_before")" ]] ||
+    fail "build $MK_BUILD's rollback target rotated over a metadata-only edit: a rebuild that reproduces the same checksum must leave retention alone (rotatedPrevChecksum, cmgr/database_challenges.go:346-351)"
+  mk_tags_now=$(registry_tags "$CH_MAKE" | sort | tr '\n' ' ')
+  [[ "$mk_tags_now" == "$mk_tags_before" ]] ||
+    fail "the registry tags of $CH_MAKE changed over a metadata-only edit (was '$mk_tags_before', now '$mk_tags_now'): the teardown step's leak check would inherit the difference"
+
+  # The options really are on the challenge row now. Asserting this separately
+  # is what makes a HostConfig failure below squarely the launch path
+  # (cmgr/docker.go:1047-1105) rather than the loader or the database round
+  # trip (cmgr/database_challenges.go:569-604, :120-136).
+  opts_now=$(api GET "/challenges/$CH_MAKE" | jq -cS '.challenge_options // {}')
+  [[ "$(jq -r '.cpus // ""' <<<"$opts_now")" == "0.5" && "$(jq -r '.pidslimit // 0' <<<"$opts_now")" == 50 ]] ||
+    fail "$CH_MAKE's challenge row does not carry the declared options after the update: $opts_now"
+
+  # try_launch, not launch: a container create the daemon refuses because of
+  # the options themselves (no docker-init for 'init: true', a kernel without
+  # the pids cgroup) must say so here instead of aborting the run on api's
+  # --fail-with-body with the body swallowed.
+  out=$(try_launch "$MK_BUILD" e2e-user-28 e2e-value-28)
+  code=${out%%$'\n'*}
+  body=${out#*$'\n'}
+  case "$code" in
+    200|201) ;;
+    503) fail "a launch of $CH_MAKE with container options declared was refused as retryable (503): nothing is loading the fleet at this point, so this is a busy or unhealthy worker rather than anything about the options -- $(head -c 300 <<<"$body")" ;;
+    *) fail "a launch of $CH_MAKE with cpu/memory/pid/ulimit options declared answered HTTP $code: $(head -c 300 <<<"$body") -- if the daemon refused the container create, it is one of the options its dockerd cannot honour (docker-init for 'init: true', or the pids cgroup), not the launch path" ;;
+  esac
+  track "$body" 28
+  id=$(jq -r .id <<<"$body")
+  w=${INST_WORKER[$id]}
+  [[ "$(jq -r '.containers | length' <<<"$body")" == 1 ]] ||
+    fail "instance $id of $CH_MAKE has $(jq -r '.containers | length' <<<"$body") container(s); this step inspects the one container a remote-make challenge launches"
+  cid=$(jq -r '.containers[0]' <<<"$body")
+
+  # One inspect, projected down to the fields the options branch writes: the
+  # full HostConfig carries the whole seccomp policy inline in SecurityOpt and
+  # is not something to print in a failure message. no-new-privileges is
+  # matched on its prefix, not on the exact string: cork sends
+  # "no-new-privileges:true" (docker.go:1088-1090) and the promise is the flag,
+  # not dockerd's spelling of it in the stored HostConfig.
+  hc=$(worker_api "$w" "/containers/$cid/json" |
+    jq -c '.HostConfig | {NanoCpus, Memory, PidsLimit: (.PidsLimit // 0), Init,
+                          nofile: [.Ulimits[]? | select(.Name == "nofile") | .Soft, .Hard],
+                          nonewprivs: ([.SecurityOpt[]? | select(test("^no-new-privileges"))] | length)}')
+  [[ "$(jq -r .NanoCpus <<<"$hc")" == 500000000 ]] ||
+    fail "container $cid of instance $id on $w runs with NanoCpus $(jq -r .NanoCpus <<<"$hc"), expected 500000000 for 'cpus: 0.5' (parseNanoCPUs, cmgr/cpu.go:13-28, applied at cmgr/docker.go:1058-1064): the challenge's cpu ceiling never reached the worker ($hc)"
+  [[ "$(jq -r .Memory <<<"$hc")" == 268435456 ]] ||
+    fail "container $cid of instance $id on $w runs with Memory $(jq -r .Memory <<<"$hc"), expected 268435456 for 'memory: 256m' (units.RAMInBytes at cmgr/docker.go:1065-1071) ($hc)"
+  [[ "$(jq -r .PidsLimit <<<"$hc")" == 50 ]] ||
+    fail "container $cid of instance $id on $w runs with PidsLimit $(jq -r .PidsLimit <<<"$hc"), expected 50 (cmgr/docker.go:1083-1085): a forkbomb in one instance would take the whole worker with it ($hc)"
+  [[ "$(jq -r .Init <<<"$hc")" == true ]] ||
+    fail "container $cid of instance $id on $w has Init $(jq -r .Init <<<"$hc"), expected true (cmgr/docker.go:1057) ($hc)"
+  [[ "$(jq -c .nofile <<<"$hc")" == '[1024,1024]' ]] ||
+    fail "container $cid of instance $id on $w carries nofile ulimits $(jq -c .nofile <<<"$hc"), expected [1024,1024] for 'nofile=1024:1024' (units.ParseUlimit at cmgr/docker.go:1072-1082) ($hc)"
+  [[ "$(jq -r .nonewprivs <<<"$hc")" == 1 ]] ||
+    fail "container $cid of instance $id on $w does not carry no-new-privileges although the challenge asks for it (cmgr/docker.go:1088-1090) ($hc)"
+  note "instance $id on $w: NanoCpus 500000000, Memory 268435456, PidsLimit 50, Init true, nofile 1024:1024, no-new-privileges"
+
+  # And it still works under them: a ceiling that strangles the service is a
+  # different bug from one that never arrives, and only the wire tells them
+  # apart. Same prompt the remote-make step reads.
+  pub=$(jq -r .worker_public <<<"$body")
+  port=$(jq -r .ports.socat <<<"$body")
+  retry 30 "the BinEx101 prompt at $pub:$port under its declared limits" tcp_says "$pub" "$port" '1\n1\n' 'Give me a number'
+  cmgrd-cli stop "$id"
+  assert_gone "$id" "$w" "$body"
+  forget "$id"
+
+  # Undo it for real: the challenge tree is restored AND the row is put back,
+  # because the cork database lives in the cork-data volume and outlives this
+  # run (run.sh never takes the fleet down with -v). A row left carrying these
+  # limits would harden this challenge for every later step and every later
+  # run, silently.
+  cp "$CHALLENGES_SEED/$MAKE_META" "$CHALLENGES/$MAKE_META"
+  diff -q "$CHALLENGES_SEED/$MAKE_META" "$CHALLENGES/$MAKE_META" >/dev/null ||
+    fail "$MAKE_META in $CHALLENGES still differs from the seed after the restore; the next run's tree check would report the volume as stale"
+  EDITED_META=""
+  rc=0
+  out=$(cmgrd-cli update) || rc=$?
+  sed 's/^/       /' <<<"$out"
+  (( rc == 0 )) || fail "the update that restores $MAKE_META exited $rc; $CH_MAKE is left carrying container options nothing declares"
+  opts_restored=$(api GET "/challenges/$CH_MAKE" | jq -cS '.challenge_options // {}')
+  [[ "$opts_restored" == "$opts_before" ]] ||
+    fail "$CH_MAKE still carries container options after $MAKE_META was restored (was '$opts_before', now '$opts_restored'): every later run would launch it under limits its problem.md does not declare"
+  [[ "$(api GET "/builds/$MK_BUILD" | jq -r .checksum)" == "$(jq -r .checksum <<<"$mk_before")" ]] ||
+    fail "build $MK_BUILD's checksum did not come back to what it was before this step"
+  [[ "$(registry_tags "$CH_MAKE" | sort | tr '\n' ' ')" == "$mk_tags_before" ]] ||
+    fail "the registry tags of $CH_MAKE did not come back to what they were before this step"
+  ok "a declared cpu/memory/pid/ulimit block reached instance $id's HostConfig on $w and the challenge still served under it; an instance of a challenge that declares nothing carries no limits at all; the edit cost no image generation and was taken back off the challenge row"
+else
+  deselect "container options: cpu, memory, pid and ulimit limits reach the worker's HostConfig"
+fi
 
 # ------------------------------------------------------------ 7. stop path
 
@@ -1033,6 +1973,101 @@ assert_gone "$id" "$w" "${INST_META[$id]}"
 [[ "$(api_status DELETE "/instances/$id")" == 204 ]] || fail "a second DELETE of instance $id was not a 204"
 forget "$id"
 ok "instance $id: containers and network gone from $w, second delete is a no-op"
+
+########################################################################
+# BLOCK 2 -- insert after e2e/scenario.sh:1035
+#   ok "instance $id: containers and network gone from $w, second delete is a no-op"
+########################################################################
+
+# --------------------------- 7b. reaped from under us (full mode only)
+
+if (( FULL )); then
+  step "reaped from under us: an instance whose containers and network docker-reaper has already removed still stops cleanly"
+  # This is the ordinary production case, not an edge one. Every worker runs
+  #   docker-reaper containers --filter label=cmgr.dynamic=true --min-age 60m
+  #                            --reap-networks
+  # every 60s (roles/multihost_docker/defaults/main.yml:41-46), so any
+  # on-demand instance a player leaves standing for an hour has its containers
+  # AND its cmgr-<id> network taken out from under cork, which never notices.
+  # The platform's stop then arrives against nothing. reap() is that sweep,
+  # driven through the worker's own dockerd with cork's client certificate --
+  # no outer socket, exactly as the reaper needs no cork.
+  inst=$(launch "$OD_BUILD" "e2e-user-26" "e2e-value-26")
+  track "$inst" 26
+  id=$(jq -r .id <<<"$inst")
+  w=${INST_WORKER[$id]}
+  # A real instance first: containers on the worker, a port out of CMGR_PORTS,
+  # answering. Reaping a launch that never came up would prove nothing.
+  check_ondemand "$inst" 26
+  rows_with=$(worker_instances "$w")
+  [[ "$rows_with" =~ ^[0-9]+$ ]] || fail "could not read the instance count of worker $w"
+
+  reap "$w" "$id" "$inst"
+  # The negative control, and the reason the 204 below means anything: the
+  # sweep really did complete, so the stop has nothing left to remove. Without
+  # it a 204 is just what an ordinary stop returns.
+  orphan_gone "$w" "$id" "$inst" ||
+    fail "the simulated docker-reaper sweep left containers or the cmgr-$id network on $w: the stop below would not be the post-reap case this step is about"
+  # And cork has not noticed: nothing sweeps a finalized row, so the record
+  # (and its port reservation) survives until something stops it. If this ever
+  # stops being true, the assertions below would pass for the wrong reason.
+  [[ "$(api_status GET "/instances/$id")" == 200 ]] ||
+    fail "cork dropped instance $id's record when the reaper removed its containers: only a stop, a rebuild or a worker purge may clear a record, and the platform is still holding this one"
+
+  t=$(date +%s)
+  code=$(api_status DELETE "/instances/$id")
+  took=$(( $(date +%s) - t ))
+  [[ "$code" == 204 ]] ||
+    fail "stopping instance $id after a docker-reaper sweep answered HTTP $code, not 204: a container that is already gone must be skipped (errdefs.IsNotFound in stopContainers, cmgr/docker.go:1259-1262) and a missing cmgr-$id network counted as removed (stopNetwork, cmgr/docker.go:915-919). Without that tolerance stopInstance never reaches removeInstanceMetadata (cmgr/api.go:427-440), so every stop of a reaped instance is a 500 that strands the row, its ports and its worker's instance count"
+  # Bounded, because a NotFound-intolerant path that also retried would show
+  # up as time rather than as a status. Both removals are answered by the
+  # daemon at once, so the whole call is a couple of database writes; 15s is
+  # well past that and still inside one CMGR_WORKER_CONTROL_TIMEOUT (10s in
+  # this fleet), so only a real hang can fire it.
+  (( took < 15 )) ||
+    fail "the stop of the already-reaped instance $id took ${took}s: nothing it does can block (every removal is answered 404 at once), so it spent a control timeout waiting on the daemon"
+  [[ "$(api_status GET "/instances/$id")" == 404 ]] ||
+    fail "instance $id is still known to cmgrd after a 204 stop: the record outlived the teardown that reported success"
+  # Nothing was re-created on the way out, and the network was not recreated
+  # by a stop that took "not found" for "make it so".
+  assert_gone_from_worker "$w" "$id" "$inst"
+  # down is sticky and costs an operator a worker-add, so this is the
+  # assertion that would cost a production box: a NotFound offered to
+  # noteWorkerTransportError (cmgr/docker.go:1264, isTransportError at
+  # cmgr/workers.go:521-539) would walk a fleet down every time the reaper ran
+  # ahead of a stop. Read into a variable rather than negating health_is, so a
+  # /workers read that fails is a loud failure instead of a silent pass; and
+  # written as "not down" rather than "ok", because overloaded is a legitimate
+  # transient reading here while down is never one.
+  h=$(worker_health "$w")
+  [[ "$h" != down ]] ||
+    fail "worker $w was marked down by the stop of an instance the reaper had already cleared: a container that is not there is not a transport failure (cmgr/docker.go:1259-1262, cmgr/workers.go:521-539)"
+  rows_after=$(worker_instances "$w")
+  [[ "$rows_after" == "$(( rows_with - 1 ))" ]] ||
+    fail "worker $w records $rows_after instance(s) after the reaped instance was stopped, expected $(( rows_with - 1 )): the row survived its own stop, and its port reservation with it (the port rows cascade with the instance, removeInstanceMetadata at cmgr/api.go:440)"
+  forget "$id"
+
+  # The fleet still hands out ports afterwards. A smoke test rather than a
+  # control -- placement is round robin and 30 ports per worker leave room for
+  # one stranded reservation to hide -- but it is the cheapest thing that
+  # would catch a stop that cleared the record while leaving cork's port index
+  # (179b875) holding the reaped instance's port. Deliberately no
+  # check_ondemand: the stale-network step that follows launches and serves an
+  # instance in both modes, so the "the fleet still works" half is already
+  # paid for, and this launch only has to be admitted and given a port.
+  fresh=$(launch "$OD_BUILD" "e2e-user-27" "e2e-value-27")
+  track "$fresh" 27
+  fid=$(jq -r .id <<<"$fresh")
+  fport=$(jq -r .ports.server <<<"$fresh")
+  (( fport >= PORT_LOW && fport <= PORT_HIGH )) ||
+    fail "the launch after the reaped stop was given port $fport, outside CMGR_PORTS $PORT_LOW-$PORT_HIGH"
+  cmgrd-cli stop "$fid"
+  assert_gone "$fid" "${INST_WORKER[$fid]}" "$fresh"
+  forget "$fid"
+  ok "instance $id was reaped off $w (containers and cmgr-$id network) behind cork's back, its stop still answered 204 in ${took}s, its record and its worker's instance count went with it, $w was never marked down, and the next launch still drew a port from CMGR_PORTS"
+else
+  deselect "reaped from under us: a stop after docker-reaper removed the containers and the network"
+fi
 
 # ------------------------------------------- 7b. stale network self-heal
 
@@ -1073,6 +2108,149 @@ cmgrd-cli stop "$id"
 assert_gone "$id" "$w" "$inst"
 forget "$id"
 ok "instance $id started over a stale cmgr-$id network on $w: cmgrd replaced the network and the instance served; the stopped id was not reused"
+
+# BLOCK 1 — goes after the existing stale-network step (scenario.sh:1075),
+# before the "8. cmgrd restart" banner.
+# =========================================================================
+
+# ------------------- 7c. a stale network that will not go (full mode only)
+
+if (( FULL )); then
+step "stale network with a live endpoint: the launch fails with both errors, and a name conflict never costs its worker its place in the fleet"
+# The step above plants an EMPTY cmgr-<id> network, which dockerd removes on
+# request, so startNetwork's recovery arm always reaches its second
+# NetworkCreate and the launch succeeds. The other half of that arm has no
+# cover at all: a network that still has an endpoint -- what a DB-only stop
+# leaves on a box that has not rejoined placement, and what plant_orphan makes
+# -- refuses removal, and then two things must hold at once. Both errors have
+# to reach the caller ("%w (stale network not removed: %w)", cmgr/docker.go
+# startNetwork), because the removal failure alone names nothing the launch
+# collided with; and the refusal must not be read as the daemon being
+# unreachable, or one leftover network costs a production worker until an
+# operator re-adds it.
+# Every record this step opens is closed again, so the row count both workers
+# report is the ledger it is checked against at the end.
+stale_rows_before=$(api GET /workers | jq -r 'map(.instances) | add')
+[[ "$stale_rows_before" =~ ^[0-9]+$ ]] || fail "could not read the recorded instance count before the stale-network step"
+probe=$(launch "$OD_BUILD" "e2e-user-26" "e2e-value-26")
+probe_id=$(jq -r .id <<<"$probe")
+[[ "$(api_status DELETE "/instances/$probe_id")" == 204 ]] ||
+  fail "could not stop the probe instance $probe_id this step launches only to learn the next instance id"
+# Ids are AUTOINCREMENT (452d96f) and nothing else launches between here and
+# the launch below, so the next one takes $stale. Which worker round robin
+# hands it to is not ours to choose, so both boxes get an orphan of that id.
+stale=$(( probe_id + 1 ))
+declare -A STALE_ORPHAN=()
+for ip in "${WORKER_IPS[@]}"; do
+  STALE_ORPHAN[$ip]=$(plant_orphan "$ip" "$stale")
+done
+note "planted cmgr-$stale on both workers, each held open by a running cmgr.managed container"
+
+out=$(try_launch "$OD_BUILD" "e2e-user-27" "e2e-value-27")
+code=${out%%$'\n'*}
+body=${out#*$'\n'}
+# (a) 500, not 503. A leftover network is not something a retry fixes, and the
+# retryable classes are a closed set (ErrWorkerBusy, ErrWorkerDown,
+# ErrPullTimeout, ErrAllWorkersOverloaded, ErrDatabaseBusy at
+# cmd/cmgrd/main.go): dressing this up as one would have the platform's celery
+# worker re-place the same launch onto the same undeletable network forever.
+[[ "$code" == 500 ]] ||
+  fail "the launch onto cmgr-$stale, a network whose removal is refused, answered HTTP $code, expected 500: a name conflict is not one of cmgrd's retryable failures (cmd/cmgrd/main.go) ($(head -c 200 <<<"$body"))"
+# (b) The chain, both halves of it. The conflict says what the launch ran into,
+# the removal failure says why the recovery could not clear it; a wrapper that
+# replaced the first with the second would leave an operator reading "network
+# not removed" with nothing naming the collision. "already exists" is dockerd's
+# own wording for a duplicate network name; "stale network not removed" is
+# cork's, so only one of the two can drift with a docker upgrade.
+grep -q "already exists" <<<"$body" ||
+  fail "the refused launch does not report the original conflict: startNetwork must keep the 'already exists' error in the chain rather than replacing it with the removal failure (cmgr/docker.go) ($(head -c 200 <<<"$body"))"
+grep -q "stale network not removed" <<<"$body" ||
+  fail "the refused launch reports the conflict but never says the stale network could not be removed: the removal failure was swallowed, so the caller cannot tell a self-healed launch from one that will fail again (cmgr/docker.go) ($(head -c 200 <<<"$body"))"
+
+# The negative control. Without it every assertion here would pass just as well
+# if dockerd had quietly removed the network and the launch had failed for some
+# other reason: the endpoint must still be live, on both boxes, now that the
+# launch is over.
+for ip in "${WORKER_IPS[@]}"; do
+  [[ "$(worker_api "$ip" "/containers/${STALE_ORPHAN[$ip]}/json" | jq -r .State.Running)" == true ]] ||
+    fail "the planted container on $ip is no longer running, so cmgr-$stale did not refuse removal for the reason this step is about"
+  [[ "$(worker_status "$ip" "/networks/cmgr-$stale")" == 200 ]] ||
+    fail "cmgr-$stale is gone from $ip although a container still holds it: this step no longer exercises a refused removal"
+done
+# (c) The expensive one. A 403 from a daemon that answered is not a transport
+# failure (isTransportError, cmgr/workers.go), so noteWorkerTransportError must
+# leave both boxes in the fleet. down is sticky and only worker-add clears it,
+# so this single read is the whole assertion and can never be a passing sample;
+# overloaded can be a telemetry blip on a busy box, which is why the ok check
+# below is a separate, retried one.
+for ip in "${WORKER_IPS[@]}"; do
+  if health_is "$ip" down; then
+    fail "worker $ip was marked down by a launch that failed on a name conflict: a docker API error arrived over a working connection and says nothing about the daemon's health (isTransportError, cmgr/workers.go)"
+  fi
+done
+retry 20 "both workers to report ok after the refused launch" all_workers_ok
+
+# Housekeeping. Not reap(): its single-shot network DELETE goes through
+# worker_api (--fail-with-body), and dockerd can hold an endpoint for a moment
+# after its container is gone -- the same race the blocker network is retried
+# against at the incomplete-reconcile step -- so a 403 there would abort the
+# run instead of failing an assertion.
+stale_net_gone() { # stale_net_gone <worker ip>
+  local c
+  c=$(worker_status "$1" "/networks/cmgr-$stale" -X DELETE)
+  [[ "$c" == 204 || "$c" == 404 ]]
+}
+for ip in "${WORKER_IPS[@]}"; do
+  cid=${STALE_ORPHAN[$ip]}
+  # 409: a removal already in progress, exactly as reap() tolerates it.
+  dcode=$(worker_status "$ip" "/containers/$cid?force=true" -X DELETE)
+  case "$dcode" in
+    204|404|409) ;;
+    *) fail "could not remove the planted container $cid from $ip: HTTP $dcode" ;;
+  esac
+  retry 15 "the planted container to leave $ip" container_gone "$ip" "$cid"
+  retry 15 "cmgr-$stale to leave $ip once its container is gone" stale_net_gone "$ip"
+  orphan_gone "$ip" "$stale" "{\"containers\":[\"$cid\"]}" ||
+    fail "the planted orphan of cmgr-$stale is still on $ip after this step reaped it"
+done
+
+# The row the refused launch opened outlives it on purpose, and is deliberately
+# NOT asserted against: launchStages reports a startNetwork failure with
+# started=true, so newInstance calls stopInstance, whose teardown fails on the
+# very same undeletable network before it can remove the record (cmgr/api.go).
+# Prune's unfinalized sweep collects it five minutes later. With the network
+# now reaped that stop goes through, so clearing it here hands the run back a
+# database in the state it found it in, instead of a row holding one of the 30
+# ports for the rest of the run. The status is checked only so a failure to
+# tidy up is loud.
+dcode=$(api_status DELETE "/instances/$stale")
+[[ "$dcode" == 204 || "$dcode" == 404 ]] ||
+  fail "the record the refused launch left behind (instance $stale) could not be cleared once its network was reaped: HTTP $dcode"
+inst=$(launch "$OD_BUILD" "e2e-user-28" "e2e-value-28")
+id=$(jq -r .id <<<"$inst")
+if [[ "$dcode" == 204 ]]; then
+  # The 204 proves the refused launch really had opened row $stale, so this is
+  # the id-reuse invariant asked on the one path that burns an id and then
+  # gives it back: never reuse (452d96f). A 404 means Prune got there first and
+  # the question cannot be asked.
+  (( id > stale )) ||
+    fail "the launch after the refused one took instance id $id, at or below the $stale the refused launch burned and gave back: ids must never be reused (452d96f)"
+fi
+track "$inst" 28
+check_ondemand "$inst" 28
+cmgrd-cli stop "$id"
+assert_gone "$id" "${INST_WORKER[$id]}" "$inst"
+forget "$id"
+stale_rows_after=$(api GET /workers | jq -r 'map(.instances) | add')
+(( stale_rows_after == stale_rows_before )) ||
+  fail "$(( stale_rows_after - stale_rows_before )) instance record(s) outlived this step ($stale_rows_before -> $stale_rows_after): the row the refused launch opened, or its reserved port, is still held"
+ok "a launch onto a cmgr-$stale that refuses removal was a 500 naming both the conflict and the failed removal, neither worker left the fleet, and with the orphans reaped the next launch (instance $id) served normally"
+else
+  deselect "stale network with a live endpoint on it"
+fi
+
+
+# =========================================================================
 
 # ------------------------------------------------- 8. cmgrd restart
 
@@ -1227,6 +2405,72 @@ track "$inst" 6
 check_ondemand "$inst" 6 "E2E_GENERATION=2"
 ok "persistent instance $PERSIST_INST restarted in place on $w:$port (same address) with new containers serving generation 2; a fresh launch serves generation 2"
 
+# BLOCK 2 -- insert after e2e/scenario.sh:1228 (the `ok` that closes the
+# "update, generation 2" step), before the generation-3 step. Uses ART_TMP,
+# ART_G1 and PERSIST_FLAG from block 1 and defines ART_G2 and
+# PERSIST_CHECKSUM_G2 for block 3; all three blocks share one FULL gate, so
+# the chain is never half-defined.
+# ============================================================================
+
+# ------------------------------ 9b. the rebuilt build's artifacts
+
+if (( FULL )); then
+  step "artifacts after the rebuild: the bundle served for the rebuilt build is generation 2, promoted in place"
+  # cacheArtifacts stages the new archive as .<id>.tar.gz.staged and only
+  # renames it onto <id>.tar.gz once validateBuild has passed (cmgr/docker.go:
+  # 777-789 and 813-824). The rename itself is invisible from here -- this
+  # container cannot see cork's artifact directory -- but its consequence is
+  # not: the same URL, for the same build id, must now serve the new
+  # generation's files. A rebuild that promoted nothing serves generation 1
+  # forever, and until this step nothing in the run ever looked.
+  ART_G2="$ART_TMP/persist-g2.tar.gz"
+  out=$(cmgrd-cli artifacts "$PERSIST_BUILD" "$ART_G2" 2>&1) ||
+    fail "cmgrd-cli artifacts $PERSIST_BUILD did not succeed after the rebuild: $out"
+  members=$(art_members "$ART_G2") ||
+    fail "the bundle served for build $PERSIST_BUILD after the rebuild is not a readable gzip tar"
+  [[ "$members" == "secret.enc time.txt" ]] ||
+    fail "the rebuilt bundle for build $PERSIST_BUILD holds '$members', expected 'secret.enc time.txt'"
+  gen=$(tar -xzOf "$ART_G2" time.txt) ||
+    fail "could not read time.txt out of the rebuilt bundle for build $PERSIST_BUILD"
+  # The load-bearing one, and the reason set_generation stamps the marker into
+  # time.txt as well as into the advertised command: time.txt is inside the
+  # archive, so this is the only assertion in the scenario that can tell the
+  # promoted archive from the one it replaced. cmgr builds with the cache on
+  # (executeBuild sets no NoCache) and the generation-2 edit alone touches only
+  # the CMD, after the tar, so without that stamp the two generations' bundles
+  # are byte-identical and there would be nothing here to assert.
+  [[ "$gen" == "e2e-generation-2" ]] ||
+    fail "the bundle served for build $PERSIST_BUILD carries '$gen' in time.txt after the generation-2 rebuild: the staged archive was never promoted onto <id>.tar.gz (the os.Rename at cmgr/docker.go:813-824), so players still download generation 1"
+  if same_bytes "$ART_G1" "$ART_G2"; then
+    fail "the bundle served for build $PERSIST_BUILD is byte for byte the one it served before the rebuild: nothing was promoted"
+  fi
+
+  # Promoted in place, and still coherent: same build id, same URL, still
+  # flagged as publishing, and the new ciphertext still decrypts to the build's
+  # unchanged flag. A promotion that installed another build's archive (or a
+  # flag that moved under a rebuild) fails here rather than in front of a
+  # competitor.
+  pbuild=$(api GET "/builds/$PERSIST_BUILD")
+  [[ "$(jq -r .has_artifacts <<<"$pbuild")" == true ]] ||
+    fail "build $PERSIST_BUILD reports has_artifacts=false after its rebuild although it still publishes two files"
+  [[ "$(jq -r .flag <<<"$pbuild")" == "$PERSIST_FLAG" ]] ||
+    fail "build $PERSIST_BUILD's flag changed across the rebuild: every artifact a player had already downloaded would decrypt to the wrong answer"
+  PERSIST_CHECKSUM_G2=$(jq -r .checksum <<<"$pbuild") # the failed-rebuild step below asserts the rolled-back row keeps exactly this
+  code=$(artifact_get "$PERSIST_BUILD" secret.enc "$ART_TMP/secret-g2.enc")
+  [[ "$code" == 200 ]] ||
+    fail "GET /builds/$PERSIST_BUILD/secret.enc answered HTTP $code after the rebuild"
+  if (( ${ART_OPENSSL:-0} )); then
+    dec=$(openssl aes-256-cbc -d -k unguessable -pbkdf2 -in "$ART_TMP/secret-g2.enc" 2>/dev/null || true)
+    [[ "$dec" == "$PERSIST_FLAG" ]] ||
+      fail "secret.enc from the rebuilt bundle decrypts to '$dec', not to build $PERSIST_BUILD's flag '$PERSIST_FLAG'"
+  fi
+  ok "build $PERSIST_BUILD serves a new bundle at the same URL after the rebuild: generation 2 inside time.txt, the same two members, and a secret.enc that still decrypts to the build's flag"
+else
+  deselect "artifacts after the rebuild: the promoted bundle is generation 2"
+fi
+
+# ============================================================================
+
 step "update, generation 3 with --prune-old: the generation displaced from rollback retention is untagged on the builder and in the registry"
 set_generation 3 ondemand
 out=$(cmgrd-cli update --prune-old)
@@ -1258,6 +2502,179 @@ done
 IMAGE_TAG[$CH_ONDEMAND]=$OD_TAG_G3
 IMAGE_TAG[$CH_PERSISTENT]=$(image_tag "$(api GET "/builds/$PERSIST_BUILD")" challenge)
 ok "registry and builder hold generations 2 and 3 only; 4 fresh instances across both workers serve generation 3"
+
+############################################################################
+# BLOCK 4 -- full-mode step, goes after the generation-3 step's ok (line 1260)
+############################################################################
+
+if (( FULL )); then
+  step "missing tag: with $CH_MAKE's tag deleted from zot, the worker that already holds the image still launches it, and the worker that does not fails without the registry's fault being charged to the box"
+  MK_TAG=${IMAGE_TAG[$CH_MAKE]}
+  MK_REF="$E2E_REGISTRY/$CH_MAKE:$MK_TAG"
+  COLD_WORKER=$WA
+  if [[ "$MK_WORKER" == "$WA" ]]; then COLD_WORKER=$WB; fi
+  # IMAGE_TAG holds the last non-builder host the registry step saw, so a
+  # multi-image $CH_MAKE would leave a second tag in the registry and on the
+  # cold worker, and both halves below would be about an image the launch does
+  # not need. Say so rather than pass vacuously.
+  mk_images=$(api GET "/builds/$MK_BUILD" | jq -r '[.images[] | select(.host != "builder")] | length')
+  [[ "$mk_images" == 1 ]] ||
+    fail "$CH_MAKE builds $mk_images launchable images: this step deletes the one tag IMAGE_TAG[$CH_MAKE] names, which only makes the pull fail while the challenge has exactly one"
+  has_line "$MK_REF" worker_tags "$MK_WORKER" ||
+    fail "worker $MK_WORKER does not hold $MK_REF although the remote-make step launched an instance of it there: the warm half of this step would have nothing to prove"
+  has_line "$MK_REF" builder_tags ||
+    fail "the builder does not hold $MK_REF, so the tag this step deletes from zot could not be pushed back afterwards; refusing to delete it rather than leave the registry short"
+  # Deterministic fixture: an earlier run may have placed binex101 on the other
+  # worker too, and one leftover image there turns the cold half into a warm one.
+  code=$(worker_status "$COLD_WORKER" "/images/$MK_REF" -X DELETE)
+  case "$code" in
+    200|404) ;;
+    *) fail "could not remove $MK_REF from worker $COLD_WORKER (HTTP $code): the cold half of this step needs a worker that does not hold the image" ;;
+  esac
+  if has_line "$MK_REF" worker_tags "$COLD_WORKER"; then
+    fail "worker $COLD_WORKER still holds $MK_REF after the delete"
+  fi
+  # Armed before the delete, not after: a run that dies in between still owes
+  # the registry this tag, and the EXIT trap pushes it back from the builder.
+  MAKE_TAG_DELETED=$MK_TAG
+  # Deleted BY TAG, exactly as registryDeleteTag issues it and with the 202 it
+  # accepts (cmgr/registry.go:57-110), so the manifest's blobs stay in zot and
+  # the push that restores the tag at the end of this step is cheap.
+  [[ "$(registry_status "/v2/$CH_MAKE/manifests/$MK_TAG" -X DELETE)" == 202 ]] ||
+    fail "deleting the tag $MK_TAG of $CH_MAKE from $E2E_REGISTRY was not a 202: the fixture this step needs (a tag no pull can resolve) could not be made"
+  if has_line "$MK_TAG" registry_tags "$CH_MAKE"; then
+    fail "$MK_REF is still listed by the registry after its delete"
+  fi
+  note "deleted $MK_REF from zot: $MK_WORKER still holds the image, $COLD_WORKER does not"
+
+  MK_CODE=""; MK_BODY=""; MK_TOOK=0
+  mk_launch() { # mk_launch <dir> <tag> <the worker that is up>: one $MK_BUILD launch
+    local dir=$1 tag=$2 up=$3 attempt
+    for attempt in 1 2 3; do
+      MK_CODE=000; MK_TOOK=0
+      # An empty json body: binex101 takes no user_id or env, and timed_launch
+      # records a refusal instead of raising it under errexit.
+      timed_launch "$dir" "$tag" "$MK_BUILD" '{}'
+      read -r MK_CODE MK_TOOK <"$dir/$tag.code" || true
+      MK_BODY=$(cat "$dir/$tag.body" 2>/dev/null || true)
+      # A 503 that names no pull is the one worker left standing being busy or
+      # momentarily overloaded -- retryable by contract and none of this step's
+      # business. A 503 that DOES name the pull is the mapping this step is
+      # about and must reach the assertions below unretried.
+      if [[ "$MK_CODE" == 503 ]] && ! grep -qE 'failed to pull image|image pull timed out' <<<"$MK_BODY"; then
+        note "the launch was refused as retryable after ${MK_TOOK}s ($(head -c 140 <<<"$MK_BODY")); waiting for $up and trying again"
+        retry 30 "worker $up to report ok before retrying the launch" health_is "$up" ok
+        continue
+      fi
+      return
+    done
+  }
+
+  # --- cold half: the pull the registry cannot serve ---
+  retry 30 "both workers to report ok before the cold half" all_workers_ok
+  DOWNED_WORKER=$MK_WORKER # armed before the call, so the trap owes a worker-add either way
+  down_worker "$MK_WORKER" # $COLD_WORKER is the only worker up, so the launch is placed there
+  cold_nets_before=$(worker_api "$COLD_WORKER" /networks | jq -r '.[].Name' | sort)
+  cold_rows_before=$(worker_instances "$COLD_WORKER")
+  mk_dir=$(mktemp -d)
+  mk_launch "$mk_dir" cold "$COLD_WORKER"
+  note "the launch on the image-less $COLD_WORKER answered HTTP $MK_CODE after ${MK_TOOK}s: $(head -c 160 <<<"$MK_BODY")"
+  [[ "$MK_CODE" == 500 ]] ||
+    fail "a launch whose pull the registry cannot serve answered HTTP $MK_CODE, expected 500: a missing manifest is none of the retryable classes (cmd/cmgrd/main.go:447-449), so the platform must not be told to place it again. If the team decides this should be a 503, this is the assertion that says so ($(head -c 200 <<<"$MK_BODY"))"
+  if grep -qi '^Retry-After' "$mk_dir/cold.head"; then
+    fail "the failed pull carried a Retry-After header: only the retryable classes set it (cmd/cmgrd/main.go:447-452), and the platform would re-place a launch no retry can fix until the build is repaired"
+  fi
+  # The failure has to name the image it could not get, so an operator reading
+  # a 500 can tell a broken build from a broken box. Two wordings are legitimate
+  # and which one appears depends on where the pull died: pullImage wraps a
+  # STREAM error as "failed to pull image '<ref>'" (cmgr/docker.go:531-535),
+  # but a manifest zot does not have fails ImagePull outright, and that path
+  # returns the daemon's own error unwrapped (docker.go:521-523 logs the same
+  # sentence but returns err). Both name the reference; only the reference is
+  # asserted here, because the wrapper asymmetry is cork's to settle, not this
+  # step's to pin.
+  grep -qF "$MK_REF" <<<"$MK_BODY" || grep -q "failed to pull image" <<<"$MK_BODY" ||
+    fail "the 500 names neither the image it could not pull nor the pull itself, so an operator cannot tell a missing tag from a broken worker ($(head -c 200 <<<"$MK_BODY"))"
+  rm -rf "$mk_dir"
+  # The negative control, and the assertion that costs a production box when it
+  # regresses: a registry that cannot serve a manifest is a docker API error
+  # that arrived over a working connection, not a transport failure
+  # (isTransportError, cmgr/workers.go:514-539), so the worker must still be
+  # taking placements. down is sticky and only a worker-add clears it, so this
+  # single read is the whole assertion -- one broken tag would otherwise walk
+  # the fleet down. overloaded is not a failure here (it clears itself), which
+  # is why this asks about down and then waits for ok.
+  ! health_is "$COLD_WORKER" down ||
+    fail "worker $COLD_WORKER was marked down by a pull the registry refused: the failure was charged to the daemon (the noteWorkerTransportError call in ensureImages, cmgr/launch.go:142-150), and every worker that tried this tag would leave the fleet until an operator re-added it"
+  retry 20 "worker $COLD_WORKER to report ok after the refused pull" health_is "$COLD_WORKER" ok
+  if has_line "$MK_REF" worker_tags "$COLD_WORKER"; then
+    fail "worker $COLD_WORKER holds $MK_REF although the tag is not in the registry: the launch did not fail for the reason this step arranged"
+  fi
+  # Nothing reached the daemon, so nothing may be recorded or left behind:
+  # ensureImages runs before acquireLaunchSlot and startNetwork
+  # (cmgr/launch.go:108-119), so started is false and clearInstanceRecords takes
+  # the row, its ports and its container rows back (cmgr/api.go:369-380).
+  cold_rows_after=$(worker_instances "$COLD_WORKER")
+  [[ "$cold_rows_after" == "$cold_rows_before" ]] ||
+    fail "the refused launch left an instance record on $COLD_WORKER ($cold_rows_before -> $cold_rows_after): a launch that never reached docker must cost no row and no port"
+  # Read from the schema state, not from GET /builds/<id>: only GetSchemaState
+  # populates BuildMetadata.Instances (cmgr/api.go), so a count taken from the
+  # build alone would be zero however badly this leaked.
+  mk_rows=$(api GET "/schemas/$SCHEMA_NAME" |
+    jq -r --arg c "$CH_MAKE" '[.[] | select(.id == $c) | .builds[].instances[]?] | length')
+  [[ "$mk_rows" == 0 ]] ||
+    fail "cmgrd records $mk_rows instance(s) of $CH_MAKE after a launch that never reached a daemon"
+  [[ "$(worker_api "$COLD_WORKER" /networks | jq -r '.[].Name' | sort)" == "$cold_nets_before" ]] ||
+    fail "the refused launch left a network on $COLD_WORKER: the image stage runs before startNetwork (cmgr/launch.go:108-119), so nothing of this launch may have reached docker"
+  readd "$MK_WORKER"
+  DOWNED_WORKER=""
+
+  # --- warm half: the launch that does not need the registry at all ---
+  DOWNED_WORKER=$COLD_WORKER
+  down_worker "$COLD_WORKER" # $MK_WORKER, which holds the image, is the only worker up
+  mk_dir=$(mktemp -d)
+  mk_launch "$mk_dir" warm "$MK_WORKER"
+  [[ "$MK_CODE" == 200 || "$MK_CODE" == 201 ]] ||
+    fail "the launch on $MK_WORKER, which already holds $MK_REF, answered HTTP $MK_CODE although nothing about it needs the registry: imagePresent must skip the pull for a tag the daemon already has, on the argument that content-addressed tags name the right content (cmgr/launch.go:155-176) ($(head -c 200 <<<"$MK_BODY"))"
+  inst=$MK_BODY
+  rm -rf "$mk_dir"
+  id=$(jq -r .id <<<"$inst")
+  [[ "$(jq -r .worker <<<"$inst")" == "$MK_WORKER" ]] ||
+    fail "instance $id was placed on $(jq -r .worker <<<"$inst"), not on the only worker that was up ($MK_WORKER)"
+  assert_on_worker "$MK_WORKER" "$inst"
+  pub=$(jq -r .worker_public <<<"$inst")
+  port=$(jq -r .ports.socat <<<"$inst")
+  # Not merely a 201: a blind pull would have failed the launch outright with
+  # the tag gone from zot, and an image that was not this build's would not
+  # prompt. The prompt is what says the skipped pull started the right content.
+  retry 30 "the BinEx101 prompt at $pub:$port" tcp_says "$pub" "$port" '1\n1\n' 'Give me a number'
+  note "instance $id launched on $MK_WORKER in ${MK_TOOK}s and answered, with $MK_REF absent from the registry"
+  cmgrd-cli stop "$id"
+  assert_gone "$id" "$MK_WORKER" "$inst"
+  readd "$COLD_WORKER"
+  DOWNED_WORKER=""
+
+  # Put the registry back exactly as this step found it -- the teardown step
+  # reads these tags, and a tag this step removed would make its check pass for
+  # the wrong reason. The builder still holds the image and carries cork's
+  # read-write certs.d identity, so this is also the positive control for the
+  # registry-identity step above: the very operation the worker's certificate
+  # was refused succeeds with cork's.
+  push_out=$(curl -sS --fail-with-body --connect-timeout 5 --max-time 180 \
+    -X POST -H 'X-Registry-Auth: e30=' \
+    "$E2E_BUILDER/images/$E2E_REGISTRY/$CH_MAKE/push?tag=$MK_TAG") ||
+    fail "could not push $MK_REF back into $E2E_REGISTRY from the builder: the registry is now one tag short of what this step was handed"
+  if grep -qiE 'errorDetail|denied|unauthorized' <<<"$push_out"; then
+    fail "the builder's push of $MK_REF was refused although it carries cork's read-write identity (e2e/zot/config.json grants \"cmgr\" create/update/delete): $(tail -c 200 <<<"$push_out")"
+  fi
+  has_line "$MK_TAG" registry_tags "$CH_MAKE" ||
+    fail "$MK_REF is not back in the registry after the restoring push: the teardown step's registry checks would now be reading a tag this step removed"
+  MAKE_TAG_DELETED=""
+  retry 30 "both workers to report ok after the missing-tag step" all_workers_ok
+  ok "with $MK_TAG deleted from zot: the cold $COLD_WORKER answered 500 naming the failed pull, carried no Retry-After, stayed ok and kept no row, port or network; the warm $MK_WORKER launched from the image it already held and served the BinEx101 prompt; the tag is back in the registry"
+else
+  deselect "missing tag: a warm worker launches with the tag gone from zot, a cold one fails without being downed"
+fi
 
 # ---------------------------------- 9c. rebuild while launches are in flight
 
@@ -1476,6 +2893,131 @@ for id in "${OD_IDS[@]}"; do
 done
 ok "$attempts launches overlapped the rebuild ($admitted admitted): none was answered 500, the ones left standing are whole and serving the build's flag, no untracked container or network survived on either worker, retention rotated to generations 4 and 3, and fresh launches serve generation 4"
 
+# BLOCK 2 — goes after the "rebuild under live traffic" step's ok line
+# (scenario.sh:1477), before the "10. worker-down path" banner.
+# =========================================================================
+
+# ------------------- 9d. an update without --prune-old (full mode only)
+
+if (( FULL )); then
+step "update, generation 5 without --prune-old: the generation it displaces stays tagged on the builder and in the registry"
+# --prune-old is opt-in, and this is the only step that runs an update without
+# it. There is no free way to get here: at generation 2 nothing is displaced
+# yet (displacedPruneCandidate is false, cmgr/database_challenges.go), so
+# dropping the flag from an earlier step would prove nothing -- the case needs
+# its own generation and therefore its own rebuild. What it pins is that an
+# update untags NOTHING of its own accord: a content tag may be referenced by
+# another cmgr instance on the same daemon, so reclaiming one is the operator's
+# call (UpdateOptions.PruneOldImages, cmgr/api.go; the displaced tags are
+# collected only under `if pruneOldImages && displacedPruneCandidate(...)`,
+# cmgr/database_challenges.go).
+set_generation 5 ondemand
+t=$(date +%s)
+rc=0
+out=$(cmgrd-cli update) || rc=$? # no --prune-old: that omission is the whole subject
+sed 's/^/       /' <<<"$out"
+(( rc == 0 )) ||
+  fail "cmgrd-cli update exited $rc building generation 5 of $CH_ONDEMAND"
+# Armed the moment the rebuild returns, not once the assertions are through:
+# from here the displaced generation is orphaned, and nothing in cork ever
+# reclaims it, so a run that dies below still owes the builder a cleanup.
+ORPHAN_TAG="$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3"
+note "rebuilt in $(( $(date +%s) - t ))s"
+grep -q "  $CH_ONDEMAND$" <<<"$out" || fail "$CH_ONDEMAND was not rebuilt"
+if grep -q "  $CH_PERSISTENT$" <<<"$out"; then fail "$CH_PERSISTENT was rebuilt although only the on-demand source changed"; fi
+OD_BUILD_G5=$(api GET "/builds/$OD_BUILD")
+OD_TAG_G5=$(image_tag "$OD_BUILD_G5" challenge)
+[[ "$(jq -r .checksum <<<"$OD_BUILD_G5")" != "$(jq -r .checksum <<<"$OD_BUILD_G4")" ]] ||
+  fail "build $OD_BUILD checksum did not change: generation 5 was not built, so nothing was displaced"
+# The precondition, and the reason this step is not vacuous: retention rotated
+# to {5, 4}, which is what pushes generation 3 out of it. Were the rotation
+# broken, generation 3 would still be the rollback target and its survival
+# below would say nothing about --prune-old.
+[[ "$(jq -r .prev_checksum <<<"$OD_BUILD_G5")" == "$(jq -r .checksum <<<"$OD_BUILD_G4")" ]] ||
+  fail "generation 4 is not the rollback target after the fifth build: retention did not rotate, so generation 3 was never displaced and this step proves nothing (rotatedPrevChecksum, cmgr/database_challenges.go)"
+[[ "$(jq -r .checksum <<<"$OD_BUILD_G5")" != "$(jq -r .checksum <<<"$OD_BUILD_G3")" &&
+   "$(jq -r .prev_checksum <<<"$OD_BUILD_G5")" != "$(jq -r .checksum <<<"$OD_BUILD_G3")" ]] ||
+  fail "generation 3 is still cork's current or rollback generation after the fifth build: it was not displaced"
+
+# The assertions. Generation 3 is now referenced by nothing cork retains, and
+# it must still be tagged in both places all the same.
+tags=$(registry_tags "$CH_ONDEMAND")
+grep -qx "$OD_TAG_G5" <<<"$tags" || fail "generation 5 tag $OD_TAG_G5 was not pushed"
+grep -qx "$OD_TAG_G4" <<<"$tags" || fail "generation 4 tag $OD_TAG_G4 left the registry although it is the rollback target"
+grep -qx "$OD_TAG_G3" <<<"$tags" ||
+  fail "an update without --prune-old untagged the displaced generation 3 ($OD_TAG_G3) in the registry: displaced tags are collected only when PruneOldImages is set (cmgr/api.go, cmgr/database_challenges.go), because a content tag may be referenced by another cmgr on the same daemon"
+btags=$(builder_tags)
+grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G5" <<<"$btags" || fail "generation 5 image is not on the builder"
+grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G4" <<<"$btags" || fail "generation 4 image left the builder although it is the rollback target"
+grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3" <<<"$btags" ||
+  fail "an update without --prune-old untagged the displaced generation 3 on the builder ($E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3): pruneReplacedImages must only ever run for an update that asked for it (cmgr/database_challenges.go)"
+note "generation 3 ($OD_TAG_G3) is referenced by nothing cork retains and is still tagged on the builder and in zot"
+# What the teardown reads, and what every later plant_orphan and the
+# incomplete-reconcile blocker build their container from. Set before the
+# relaunches, so the pulls below are the ones that put it on both boxes.
+IMAGE_TAG[$CH_ONDEMAND]=$OD_TAG_G5
+
+# The rebuild tore the on-demand instances down like any other, and the fleet
+# has to look to the following steps exactly as the live-traffic step left it.
+for id in "${OD_IDS[@]}"; do
+  assert_torn_down "$id"
+done
+OD_IDS=()
+
+# Nothing in cork ever reclaims that orphan -- a later --prune-old only
+# collects the generation its OWN rebuild displaces, and remove-schema's
+# destroyImages knows the current and rollback generations only -- which is the
+# second half of the promise and the operator-visible price of the flag. The
+# harness therefore has to, exactly as an operator would, and only now that the
+# assertions above have been made: the teardown step reads the builder for any
+# surviving challenge image, and it must find the same thing in both modes.
+# By tag against zot, the way cmgr/registry.go registryDeleteTag does it (a
+# digest delete would take every tag sharing the manifest).
+dcode=$(registry_status "/v2/$CH_ONDEMAND/manifests/$OD_TAG_G3" -X DELETE)
+[[ "$dcode" == 202 || "$dcode" == 200 || "$dcode" == 404 ]] ||
+  fail "deleting the orphaned generation 3 tag from the registry answered HTTP $dcode (cork accepts 202 and 404 from the same call, cmgr/registry.go registryDeleteTag)"
+orphan_tag_gone() { ! has_line "$OD_TAG_G3" registry_tags "$CH_ONDEMAND"; }
+retry 10 "the orphaned generation 3 tag $OD_TAG_G3 to leave the registry" orphan_tag_gone
+dcode=$(builder_untag "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3")
+[[ "$dcode" == 200 || "$dcode" == 404 ]] ||
+  fail "untagging the orphaned generation 3 image on the builder answered HTTP $dcode: the teardown's 'the builder holds no challenge images' check will trip over what is left"
+if has_line "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3" builder_tags; then
+  fail "the orphaned generation 3 image is still tagged on the builder after this step untagged it; the teardown invariant would not hold"
+fi
+ORPHAN_TAG=""
+
+# Back to the shape the live-traffic step hands on: tracked on-demand
+# instances, at least one on each worker. Both halves matter -- the worker-down
+# step needs one on $WB, and the incomplete-reconcile step builds its blocker
+# container on $WB from ${IMAGE_TAG[$CH_ONDEMAND]}, which only a launch there
+# pulls. The ok wait comes first: launch() goes through api (--fail-with-body),
+# so a launch refused because both boxes are briefly overloaded after the
+# rebuild would abort the run with no message.
+retry 30 "both workers to report ok after the rebuild" all_workers_ok
+for i in 23 24; do
+  inst=$(launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i")
+  track "$inst" "$i"
+done
+# ensure_instance_on rather than an assertion that two launches land one each:
+# a worker briefly skipped by round robin is not something this step should
+# fail on, and both calls are free whenever the two launches split as usual.
+ensure_instance_on "$WB" 25
+ensure_instance_on "$WA" 26
+for id in "${OD_IDS[@]}"; do
+  check_ondemand "${INST_META[$id]}" "${INST_USER[$id]}" "E2E_GENERATION=5"
+done
+for ip in "${WORKER_IPS[@]}"; do
+  has_line "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G5" worker_tags "$ip" ||
+    fail "worker $ip does not hold $E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G5 after the relaunches: the later steps that create a container from that tag on this box would fail on a missing image"
+done
+ok "an update without --prune-old rotated retention to generations 5 and 4 and left the displaced generation 3 tagged on the builder and in zot; the harness reclaimed that orphan, since nothing in cork ever will, and ${#OD_IDS[@]} fresh instances serve generation 5 across both workers"
+else
+  deselect "update, generation 5 without --prune-old"
+fi
+
+
+# =========================================================================
+
 # --------------------------------------------------- 10. worker-down path
 
 step "worker-down: a down worker is skipped for placement; stops on it clear cmgrd's records without touching docker"
@@ -1658,6 +3200,87 @@ else
   skip "needs the outer docker socket"
 fi
 
+# BLOCK 3 — goes after the telemetry-silence step's closing "fi"
+# (scenario.sh:1659), before the "12. overloaded" banner.
+# =========================================================================
+
+# --------------------------- 11b. a telemetry agent that hangs (full mode)
+
+if (( FULL )); then
+  if (( OUTER )); then
+    step "wedged telemetry: an agent that accepts every poll and answers none is bounded by the poll timeout, so its worker still goes down"
+    # The silence step above STOPS the sidecar, so every poll is refused in
+    # microseconds and misses accumulate whatever the per-poll timeout is:
+    # nothing else in this scenario makes a poll hang, and pollWorker's
+    # `&http.Client{Timeout: timing.pollTimeout}` (cmgr/workers.go) does no
+    # work today. An agent that completes the handshake and then never writes
+    # is the failure that timeout exists for -- a wedged agent, or a box
+    # thrashing so hard it never gets to answer. Without the timeout the
+    # worker's single poll goroutine blocks in that one Get forever, `misses`
+    # never increments, and the box sits at ok taking placements its dockerd
+    # may no longer be able to serve. The minPollInterval floor and the
+    # half-interval clamp (cmgr/workers.go) exist so this timeout can never be
+    # configured to zero, i.e. to unbounded.
+    ensure_instance_on "$WB" 28
+    id=$(instance_on "$WB")
+    DOWNED_WORKER=$WB # set before the sidecar stops: from here cork will down $WB and the trap owes it a worker-add
+    fake_hung_telemetry "$WB"
+    fake=$LAST_FAKE
+    # The control that separates this step from the silence step, and the one
+    # that keeps it from passing for the old reason: a poll must HANG, not be
+    # refused. curl exits 28 when the connection was accepted and nothing came
+    # back, and 7 when nothing is listening. Retried, because the responder
+    # has to bind 2136 after the sidecar has released it.
+    retry 20 "the wedged agent on $WB to accept a connection and never answer" telemetry_hangs "$WB"
+    # The clock is anchored here, not at the responder's start, and this is
+    # what makes the step deterministic: worker-add rebuilds the conn and its
+    # poller (AddWorker: "tears down its old connection and poller, starts
+    # fresh"), so the miss counter is zero however long the sidecar stop and
+    # the responder start took. Without it, a slow container start could spend
+    # the whole 10s budget on ordinary refusals and this step would report a
+    # down it had not caused. The reconcile that precedes the poller runs
+    # against $WB's dockerd, which is healthy, so it costs one fast pass.
+    cmgrd-cli worker-add "$WB" "${PUBLIC[$WB]}"
+    t=$(date +%s)
+    wedged_by=""
+    seen=""
+    # One reader per sample rather than a bare retry, because "never ok" is
+    # half the assertion: a fresh conn starts overloaded and only a poll that
+    # COMPLETED can move it to ok, so an ok here means the agent answered
+    # something and the step is not exercising a hung poll at all. 25s is well
+    # past the 10s budget (CMGR_WORKER_MAX_MISSES=20 at the 500ms default) and
+    # well short of the 20s a doubled budget would take.
+    wedged_deadline=$(( t + 25 ))
+    while (( $(date +%s) < wedged_deadline )); do
+      seen=$(worker_health "$WB")
+      [[ "$seen" != ok ]] ||
+        fail "worker $WB read ok while its agent accepts every poll and answers none: a poll completed, so either the responder is not wedged or a verdict was stored for a request that never returned (pollTelemetry, cmgr/workers.go)"
+      if [[ "$seen" == down ]]; then wedged_by=$(( $(date +%s) - t )); break; fi
+      sleep 1
+    done
+    [[ -n "$wedged_by" ]] ||
+      fail "worker $WB was still '$seen' 25s after the worker-add that restarted its poller: with the per-poll timeout gone the first poll blocks forever, misses never increment, and a box whose agent has wedged keeps taking placements (httpClient Timeout: timing.pollTimeout, cmgr/workers.go)"
+    # The same control again now that the verdict is in: the agent was still
+    # accepting and hanging at the end, so the misses that downed $WB were
+    # polls the client timeout ended, not connections the agent refused.
+    telemetry_hangs "$WB" ||
+      fail "the wedged agent on $WB stopped accepting connections before the worker went down: the misses that downed it may have been ordinary refusals, which the telemetry-silence step already covers"
+    # Its instances keep running, exactly as under silence: down is a placement
+    # and control-plane verdict, not a teardown.
+    assert_on_worker "$WB" "${INST_META[$id]}"
+    note "worker $WB was down ${wedged_by}s after its poller was restarted: 20 misses at the 500ms cadence, each poll ended by the 250ms poll timeout"
+    unfake_overload "$fake"
+    retry 30 "telemetry on $WB" quiet curl -sSf --max-time 3 "http://$WB:2136/health"
+    readd "$WB"
+    DOWNED_WORKER=""
+    ok "an agent that accepted every poll and answered none still cost $WB its place in the fleet after ${wedged_by}s, never once reading ok; instance $id kept running on it, and worker-add brought it back once the real sidecar was restored"
+  else
+    skip "wedged telemetry needs the outer docker socket"
+  fi
+else
+  deselect "wedged telemetry: an agent that accepts and never answers"
+fi
+
 # ------------------------------------------------------ 12. overloaded
 
 step "overloaded: a worker reporting overloaded is skipped for placement but not down, and recovers by itself"
@@ -1783,6 +3406,191 @@ else
   skip "needs the outer docker socket"
 fi
 
+# ---------------- 14c. the schema's own hand on its persistent instance
+
+if (( FULL )); then
+  step "persistent instances answer to the schema alone: the platform may neither stop nor start one, and update-schema relaunches one the schema is missing"
+  # The persistent build carries instance_count 1, which is neither
+  # DYNAMIC_INSTANCES (-1) nor LOCKED (-2), so Start and Stop both refuse it as
+  # a "locked build" (cmgr/api.go:296 and :411): the only hand that moves this
+  # instance is the schema converge. Neither refusal is exercised anywhere in
+  # the run, and neither is the converge's instance arithmetic on an EXISTING
+  # schema -- add-schema created this instance on an empty database
+  # (convergeSchema -> newInstance under m.restartLimits(), cmgr/api.go:605)
+  # and the rebuild steps restart it in place through restartInstance, a
+  # different caller. This step drives both arms of that arithmetic on the
+  # schema the run is already using: a converge that wants no instance of the
+  # persistent challenge, then one that wants it back. The second is the
+  # documented recovery after a worker-remove takes a persistent instance's
+  # record with the box ("a persistent instance it hosted is only relaunched
+  # by the next update-schema", cmd/cmgrd-cli/main.go), and nothing else in the
+  # scenario reaches it.
+  #
+  # No outer socket: every call here is cmgrd's own API, so this step runs in
+  # full mode whether or not the chaos steps do.
+  all_workers_ok ||
+    fail "both workers must be ok before the persistent instance is stopped and relaunched: this step pins the relaunch to $WA by downing $WB, and a converge that finds no eligible worker fails the update instead"
+  pmeta=$(api GET "/instances/$PERSIST_INST")
+  pworker=$(jq -r .worker <<<"$pmeta")
+  [[ "$pworker" == "$WA" ]] ||
+    fail "the persistent instance $PERSIST_INST is on $pworker, not on $WA: the scenario pins it away from the chaos target (scenario.sh:~627) and this step relaunches it on the worker it is meant to live on"
+  wa_rows=$(worker_instances "$WA")
+  [[ "$wa_rows" =~ ^[0-9]+$ ]] || fail "could not read the instance count of worker $WA"
+  # The instances the persistent build records, straight from the schema state
+  # (the read the converge step already uses at scenario.sh:605). One line per
+  # instance, so "exactly one" is a regex over the whole output.
+  persist_instances() {
+    api GET "/schemas/$SCHEMA_NAME" |
+      jq -r --arg c "$CH_PERSISTENT" '.[] | select(.id == $c) | .builds[].instances[]?.id'
+  }
+  lock_tmp=$(mktemp -d)
+
+  # (1) The platform's stop is refused, and the instance is untouched by the
+  # attempt. This is what keeps a TTL sweep, an operator's DELETE or a
+  # mis-aimed platform call from taking a service's only instance away with
+  # nothing in the schema saying so. The 500 is deliberate -- nothing here is
+  # retryable -- and the message is what tells it apart from any other 500.
+  code=$(curl -sS -o "$lock_tmp/stop" -w '%{http_code}' --connect-timeout 5 --max-time "$API_TIMEOUT" \
+    -X DELETE "$CMGRD_SERVER/instances/$PERSIST_INST")
+  [[ "$code" == 500 ]] ||
+    fail "DELETE /instances/$PERSIST_INST answered HTTP $code: an instance of a build the schema sizes (instance_count 1) is not the platform's to stop, and Stop must refuse it (cmgr/api.go:411)"
+  grep -q "locked build" "$lock_tmp/stop" ||
+    fail "the refused stop of the persistent instance says '$(head -c 160 "$lock_tmp/stop")' rather than naming the locked build (cmgr/api.go:411): a 500 for some other reason would pass this step for the wrong reason"
+  [[ "$(api_status GET "/instances/$PERSIST_INST")" == 200 ]] ||
+    fail "the persistent instance $PERSIST_INST is gone from cmgrd after a stop that was refused"
+  assert_on_worker "$WA" "$pmeta"
+
+  # (2) And the platform may not start another one either: the same guard on
+  # the way in (cmgr/api.go:296), which is what makes a schema's instance count
+  # mean something.
+  code=$(curl -sS -o "$lock_tmp/start" -w '%{http_code}' --connect-timeout 5 --max-time "$API_TIMEOUT" \
+    -X POST -H 'Content-Type: application/json' "$CMGRD_SERVER/builds/$PERSIST_BUILD")
+  [[ "$code" == 500 ]] ||
+    fail "POST /builds/$PERSIST_BUILD answered HTTP $code: only a schema change may add an instance to a build whose count the schema fixes (cmgr/api.go:296)"
+  grep -q "locked build" "$lock_tmp/start" ||
+    fail "the refused launch of the persistent build says '$(head -c 160 "$lock_tmp/start")' rather than naming the locked build (cmgr/api.go:296)"
+  [[ "$(persist_instances)" == "$PERSIST_INST" ]] ||
+    fail "$CH_PERSISTENT records instance(s) '$(persist_instances | tr '\n' ' ')' after a refused launch, expected only $PERSIST_INST: the refusal still created a row"
+  note "the platform's stop and start of the persistent instance were both refused as a locked build; instance $PERSIST_INST is untouched"
+
+  # (3) The converge's teardown arm. The schema copy differs from the file the
+  # run converged with in exactly one number: writing a schema by hand risks a
+  # different flag_format, and a flag-format change rebuilds every challenge in
+  # the schema (UpdateSchema's doc comment) -- minutes, and a new flag under
+  # every assertion that follows. instance_count 1 appears once in the file
+  # (the other three challenges are -1), and the diff below is the guard.
+  conv=$(mktemp -d)
+  sed 's/^\([[:space:]]*\)instance_count: 1$/\1instance_count: 0/' "$E2E_SCHEMA" >"$conv/zero.yaml"
+  # Counted line by line rather than parsed out of diff's output: this image's
+  # diff is busybox, which prints unified format by default, so a '^[<>]' count
+  # is always zero and the guard would wave through a copy that changed nothing
+  # -- which is exactly what it did.
+  ndiff=$(awk 'NR==FNR {a[FNR]=$0; next} a[FNR] != $0 {n++} END {print n+0}' "$E2E_SCHEMA" "$conv/zero.yaml")
+  [[ "$ndiff" == 1 ]] ||
+    fail "the zero-instance copy of $E2E_SCHEMA differs from it on $ndiff line(s), expected exactly the one instance_count: converging a schema that differs in anything else would change what the rest of the run is testing"
+  grep -q '^[[:space:]]*instance_count: 0$' "$conv/zero.yaml" ||
+    fail "could not write a zero-instance copy of $E2E_SCHEMA: no 'instance_count: 1' line to rewrite"
+  crc=0
+  t=$(date +%s)
+  cmgrd-cli update-schema "$conv/zero.yaml" >"$conv/out0" 2>"$conv/err0" || crc=$?
+  if (( crc != 0 )); then
+    sed 's/^/       /' "$conv/out0" "$conv/err0" || true
+    fail "cmgrd-cli update-schema exited $crc asking for no instance of $CH_PERSISTENT: a converge that wants fewer instances than it finds must stop the extras (cmgr/api.go:590-600)"
+  fi
+  note "the converge that wants no persistent instance returned in $(( $(date +%s) - t ))s"
+  # Stopped for real, not merely forgotten: stopInstance ran the docker
+  # teardown on $WA, so the containers and the cmgr-<id> network are gone.
+  assert_gone "$PERSIST_INST" "$WA" "$pmeta"
+  [[ -z "$(persist_instances)" ]] ||
+    fail "$CH_PERSISTENT still records instance(s) '$(persist_instances | tr '\n' ' ')' after a converge that asked for none"
+  # The build itself survives: only a build the schema no longer names is
+  # released (removedSchemaBuilds selects the rows still marked LOCKED,
+  # cmgr/database_builds.go:325). Were it destroyed here its images would leave
+  # the registry and the builder, and the teardown step's tag assertions would
+  # be checking nothing.
+  [[ "$(api_status GET "/builds/$PERSIST_BUILD")" == 200 ]] ||
+    fail "build $PERSIST_BUILD was destroyed by a converge that merely asked for no instance of it: only a build the schema stops naming is released (cmgr/api.go:511-517, cmgr/database_builds.go:325)"
+  # The other challenges are instance_count -1 (DYNAMIC_INSTANCES), which the
+  # converge skips outright (cmgr/api.go:577). A regression that read -1 as a
+  # target would have torn down every tracked on-demand instance here, and the
+  # steps after this one would fail somewhere far from the cause.
+  for id in "${OD_IDS[@]}"; do
+    [[ "$(api_status GET "/instances/$id")" == 200 ]] ||
+      fail "on-demand instance $id was torn down by a schema converge: a build the schema leaves dynamic (instance_count -1) keeps the instances the platform launched (cmgr/api.go:577)"
+  done
+
+  # (4) The relaunch arm. One worker up, so the relaunch is placed back on the
+  # box the instance lived on -- which the worker-remove and teardown steps
+  # take as given -- rather than on the chaos target.
+  DOWNED_WORKER=$WB # armed before the call, so the trap owes a worker-add even if down_worker's own check fails
+  down_worker "$WB"
+  retry 20 "worker $WA to report ok before the relaunch converge" health_is "$WA" ok
+  crc=0
+  t=$(date +%s)
+  cmgrd-cli update-schema "$E2E_SCHEMA" >"$conv/out1" 2>"$conv/err1" || crc=$?
+  # A converge with no eligible worker fails the update, and that is correct
+  # behaviour rather than the regression under test. It can only happen here if
+  # $WA drifted out of placement between the check above and the launch (its
+  # telemetry agent reporting overloaded, which clears by itself), so that one
+  # case gets one more converge -- idempotent, and exactly what the CLI
+  # documents as the recovery -- and says so in the log.
+  if (( crc != 0 )) && ! health_is "$WA" ok; then
+    note "the converge failed while $WA read '$(worker_health "$WA")': no worker was eligible for the relaunch, which is a loaded fleet rather than a cork failure; converging once more"
+    retry 30 "worker $WA to report ok again" health_is "$WA" ok
+    crc=0
+    cmgrd-cli update-schema "$E2E_SCHEMA" >"$conv/out1" 2>"$conv/err1" || crc=$?
+  fi
+  if (( crc != 0 )); then
+    sed 's/^/       /' "$conv/out1" "$conv/err1" || true
+    fail "cmgrd-cli update-schema exited $crc with one instance of $CH_PERSISTENT to relaunch: a converge that finds a persistent instance missing must launch it again, under the restart limits (cmgr/api.go:598-609, m.restartLimits())"
+  fi
+  ctook=$(( $(date +%s) - t ))
+  new_inst=$(persist_instances)
+  [[ "$new_inst" =~ ^[0-9]+$ ]] ||
+    fail "$CH_PERSISTENT records instance(s) '$(tr '\n' ' ' <<<"$new_inst")' after update-schema exited 0, expected exactly one: the converge reported success without converging (cmgr/api.go:598-609)"
+  [[ "$new_inst" != "$PERSIST_INST" ]] ||
+    fail "the relaunched persistent instance kept the id $PERSIST_INST of the one that was stopped: instance ids are never reused (AUTOINCREMENT, 452d96f)"
+  nmeta=$(api GET "/instances/$new_inst")
+  nworker=$(jq -r .worker <<<"$nmeta")
+  [[ "$nworker" == "$WA" ]] ||
+    fail "the relaunched persistent instance $new_inst is on $nworker, not on $WA, the only worker up when the converge ran: a converge's launch goes through the same placement as any other (selectWorker in newInstance, cmgr/api.go:328)"
+  npub=$(jq -r .worker_public <<<"$nmeta")
+  [[ "$npub" == "${PUBLIC[$WA]}" ]] ||
+    fail "the relaunched persistent instance $new_inst advertises '$npub', expected '${PUBLIC[$WA]}': players are handed the worker's public address, not its orchestration ip"
+  nport=$(jq -r '.ports.socat // 0' <<<"$nmeta")
+  (( nport >= PORT_LOW && nport <= PORT_HIGH )) ||
+    fail "the relaunched persistent instance $new_inst took port $nport, outside CMGR_PORTS $PORT_LOW-$PORT_HIGH: the port the stopped instance held was never released, or the reservation ran outside the range"
+  assert_on_worker "$WA" "$nmeta"
+  # It really serves, and serves the generation the run last built for it: the
+  # persistent source has carried the generation-2 marker since the
+  # generation-2 step (set_generation 3 and 4 pass "ondemand" and leave
+  # $PERSISTENT_SRC alone), so a relaunch off a stale image fails here.
+  retry 30 "the relaunched persistent instance at $npub:$nport" tcp_says "$npub" "$nport" '' 'e2e-generation-2'
+  # A launch the converge issues is a launch like any other as far as the box
+  # is concerned: nothing about it may take the worker out of the fleet, and
+  # down is sticky, so this single read is the whole assertion.
+  if health_is "$WA" down; then
+    fail "worker $WA is down after the converge relaunched the persistent instance on it: a relaunch that succeeded and serves must leave its worker in placement"
+  fi
+  (( $(worker_instances "$WA") == wa_rows )) ||
+    fail "worker $WA records $(worker_instances "$WA") instance(s) after the stop and relaunch, expected the $wa_rows it started with: the stopped instance's record outlived it, or the relaunch left a second one"
+
+  # The scenario's handle on the persistent instance moves with it: the
+  # converge creates a new row rather than restarting the old one, and the
+  # teardown step (scenario.sh:2166-2171) is the only later reader of these
+  # three. IMAGE_TAG, PERSIST_TAG_G1 and PERSIST_BUILD are untouched -- a
+  # converge neither rebuilds nor re-pushes an existing build (cmgr/docker.go:203-218).
+  PERSIST_INST=$new_inst
+  PERSIST_META=$nmeta
+  PERSIST_WORKER=$WA
+  readd "$WB"
+  DOWNED_WORKER=""
+  rm -rf "$conv" "$lock_tmp"
+  ok "the platform's stop and start of the persistent instance were both refused as a locked build; a converge asking for none stopped it on $WA (containers and network gone, the build kept, the on-demand instances untouched) and the next update-schema relaunched it in ${ctook}s as instance $PERSIST_INST on ${PUBLIC[$WA]}:$nport serving generation 2, with $WA still taking placements"
+else
+  deselect "the converge's stop and relaunch of the persistent instance"
+fi
+
 # ------------------------------------------------- 14b. a refused daemon
 
 # --------------------------- 14b. a worker whose dockerd refuses connections
@@ -1906,6 +3714,248 @@ wlist=$(api GET /workers)
   fail "cmgrd holds $(jq -r length <<<"$wlist") worker(s) after the phantom was removed, expected $NWORKERS"
 all_workers_ok || fail "worker $WA or $WB is not ok after the phantom was registered and removed"
 ok "worker $phantom_ip, telemetry healthy and dockerd refusing connections, never read ok, took no placement while it reconciled, went down within ${phantom_down_by}s, and left $WA/$WB serving launches"
+
+########################################################################
+# BLOCK 2 of 4 — after the "refused dockerd" step (see insertAfter)
+########################################################################
+
+# ------------------------- 14c. a worker-add onto a wedged (frozen) daemon
+
+if (( FULL )); then
+  if (( OUTER )); then
+    step "worker-add on a box whose dockerd is wedged: the worker stays out of placement while its reconcile retries, and is marked down when the budget is spent"
+    # The refused-dockerd step above covers one branch of isTransportError
+    # (client.IsErrConnectionFailed): nothing listening, every reconcile
+    # attempt failing in milliseconds, the 10s budget spent over ~20 of them.
+    # This is the other branch (context.DeadlineExceeded), and it is the one
+    # production actually sees -- an OOMing or IO-starved box whose dockerd
+    # accepts the connection and never answers. It differs in more than the
+    # error: one ContainerList against a frozen daemon burns the whole
+    # CMGR_WORKER_CONTROL_TIMEOUT (10s), which is also the whole reconcile
+    # budget (CMGR_WORKER_MAX_MISSES 20 x the 500ms poll interval), so one or
+    # two attempts spend it and the down verdict must still arrive. A
+    # reconcileWithRetries that counted attempts instead of holding a deadline
+    # (cmgr/workers.go:328-356) would hold a wedged box out of the fleet for
+    # 20 x 10s and mark it down only then. It is also the only worker-add in
+    # this scenario that lands on a worker cork already has, taking
+    # AddWorker's replace branch (workers.go:589-595) rather than adding a row.
+    wb=$(compose_container "${PUBLIC[$WB]}")
+    [[ -n "$wb" ]] || fail "compose container for ${PUBLIC[$WB]} not found"
+    # Planted while the daemon still answers: this is what the worker-add at
+    # the end of the step has to clear, and it is what distinguishes a box
+    # that was really reconciled on its way back from one merely polled to ok.
+    planted=$(plant_orphan "$WB" 996)
+    ORPHAN_WORKER=$WB; ORPHAN_NET=cmgr-996; ORPHAN_CID=$planted
+    note "planted an orphan (cmgr.managed container on cmgr-996, no record) on $WB while its daemon still answered"
+    DOWNED_WORKER=$WB # armed before the pause: the trap owes a worker-add from here on
+    PAUSED_WORKER=$wb # and an unpause
+    outer_ctl "$wb" pause
+    t=$(date +%s)
+    cmgrd-cli worker-add "$WB" "${PUBLIC[$WB]}"
+    add_took=$(( $(date +%s) - t ))
+    # (a) The operator's call does not wait for the box. AddWorker builds the
+    # client and hands the worker to runWorker's goroutine (workers.go:299,
+    # 585-595) without a single docker call of its own, so a worker-add on a
+    # daemon that is merely still starting costs the operator nothing.
+    (( add_took < 5 )) ||
+      fail "cmgrd-cli worker-add on the wedged $WB blocked for ${add_took}s: the reconcile must run in runWorker's goroutine, not in the operator's request (cmgr/workers.go:299)"
+    # The negative control for everything below, and the reason a paused
+    # daemon is the sharp injection: the telemetry sidecar is a separate
+    # container sharing the worker's network namespace (compose.yaml
+    # network_mode: service:worker-b), so the pause did not touch it and it
+    # keeps answering "not overloaded" every 500ms. If the rebuilt conn were
+    # handed to the poller before its reconcile finished, this responder alone
+    # would drive the worker to ok.
+    quiet curl -sSf --max-time 3 "http://$WB:2136/health" ||
+      fail "the telemetry sidecar of $WB stopped answering when its dockerd was paused: without it this step cannot tell a poller that never started from one with nothing to read"
+    # (b) Out of placement, not merely reported so, and asked while the budget
+    # is still running rather than after it. try_launch rather than launch: a
+    # launch that did go to the frozen box comes back 503 after a control
+    # timeout, and that is this step's failure to report rather than curl's.
+    out=$(try_launch "$OD_BUILD" e2e-user-26 e2e-value-26)
+    code=${out%%$'\n'*}
+    body=${out#*$'\n'}
+    case "$code" in
+      200|201) ;;
+      *) fail "a launch $(( $(date +%s) - t ))s into $WB's reconcile of its frozen daemon answered HTTP $code with $WA reading '$(worker_health "$WA")': $(head -c 200 <<<"$body")" ;;
+    esac
+    [[ "$(jq -r .worker <<<"$body")" == "$WA" ]] ||
+      fail "instance $(jq -r .id <<<"$body") was placed on $WB, whose reconcile has not finished against a frozen dockerd: selectWorker takes only workerOk (cmgr/workers.go:712-715), and newWorkerConn fails a fresh conn closed as overloaded until its pass is done"
+    track "$body" 26
+    id=$(jq -r .id <<<"$body")
+    cmgrd-cli stop "$id"
+    assert_gone "$id" "$WA" "${INST_META[$id]}"
+    forget "$id"
+    # (c) And never ok while the budget runs. One-sided by construction --
+    # newWorkerConn stores overloaded (workers.go:297) and only
+    # reconcileWithRetries returning true starts the poller, so with the
+    # ordering intact every sample here is "overloaded" and this cannot flake
+    # false. It samples to 9s, inside the 10s budget, so a legitimate early
+    # down verdict cannot fire it either (down is not ok).
+    seen=""
+    while (( $(date +%s) - t < 9 )); do
+      seen=$(worker_health "$WB" || true)
+      [[ -n "$seen" ]] || fail "worker $WB is not listed at all $(( $(date +%s) - t ))s after its worker-add"
+      [[ "$seen" != ok ]] ||
+        fail "worker $WB read ok $(( $(date +%s) - t ))s into a worker-add its dockerd cannot answer: the poller was started before the reconcile pass finished (runWorker), so a box that can serve no launch is back in placement"
+      sleep 0.5
+    done
+    note "$WB read '$seen' throughout the 9s after the worker-add, with its telemetry answering healthy"
+    # (d) The verdict at the end of the budget, sampled against a deadline
+    # measured from the worker-add rather than from here, as the phantom step
+    # does. 30s and not 12: the control timeout and the budget are both 10s,
+    # so whether the first attempt's deadline lands just inside or just
+    # outside the budget decides between one attempt (~10s) and two (~21s),
+    # and neither is a regression. Both are far short of the 200s an
+    # attempt-counting loop would take, which is what this bounds.
+    down_took=""
+    down_deadline=$(( t + 30 ))
+    while (( $(date +%s) < down_deadline )); do
+      seen=$(worker_health "$WB" || true)
+      [[ "$seen" != ok ]] ||
+        fail "worker $WB read ok while its dockerd was still frozen: its reconcile cannot have finished (runWorker)"
+      if [[ "$seen" == down ]]; then down_took=$(( $(date +%s) - t )); break; fi
+      sleep 1
+    done
+    [[ -n "$down_took" ]] ||
+      fail "worker $WB was still '$seen' 30s after a worker-add onto its frozen dockerd: a daemon that stays unreachable must end at down once the reconcile budget is spent (reconcileWithRetries, cmgr/workers.go:343-345), not sit out of placement forever"
+    # (e) And it is terminal: reconcileWithRetries returned false, so
+    # pollWorker never ran and nothing reads this box's telemetry any more. A
+    # daemon that comes back does not bring the worker back with it.
+    outer_ctl "$wb" unpause
+    PAUSED_WORKER=""
+    retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
+    sleep 3 # six poll intervals, as in the telemetry-silence step
+    health_is "$WB" down ||
+      fail "worker $WB recovered to '$(worker_health "$WB")' by itself once its dockerd was unpaused: a worker its own reconcile gave up on must stay down until a worker-add rebuilds the conn"
+    readd "$WB"
+    DOWNED_WORKER=""
+    # readd returns at ok, and reconcileWorker runs before the poller
+    # (runWorker), so the orphan must already be gone: asserted once, never
+    # retried -- a retry here could only hide a poller started too early.
+    orphan_gone "$WB" 996 "{\"containers\":[\"$planted\"]}" ||
+      fail "worker $WB reported ok after its worker-add with the orphan cmgr-996 still on it: the reconcile did not finish before the poller started"
+    ORPHAN_WORKER=""; ORPHAN_NET=""; ORPHAN_CID=""
+    all_workers_ok || fail "worker $WA or $WB is not ok after $WB was wedged and re-added"
+    ok "a worker-add onto a frozen dockerd answered in ${add_took}s, never read ok while its reconcile retried (telemetry answering throughout), took no placement, went down after ${down_took}s, stayed down when its daemon came back, and cleared cmgr-996 on the worker-add that recovered it"
+  else
+    skip "worker-add against a wedged dockerd needs the outer docker socket"
+  fi
+else
+  deselect "worker-add against a wedged dockerd"
+fi
+
+########################################################################
+# BLOCK 3 of 4 — immediately after BLOCK 2
+########################################################################
+
+# --------------------- 14d. a cmgrd restart with one worker's daemon wedged
+
+if (( FULL )); then
+  if (( OUTER )); then
+    step "cmgrd restart with a wedged worker: startup is not blocked, the healthy worker takes every launch, and the wedged one is downed by its own reconcile"
+    # The restart step earlier in this run brings cmgrd back with a healthy
+    # fleet. This is the production morning after: one box wedged (dockerd
+    # frozen, telemetry still answering) when cork itself is restarted. Three
+    # separate promises, none of them covered anywhere else -- startup does
+    # not block on the wedged box (initWorkers spawns a goroutine per worker
+    # and returns, cmgr/workers.go:202-227 with :299), the healthy box
+    # reconciles and takes every placement while the other is still being
+    # retried, and the wedged one ends at down through reconcileWithRetries'
+    # unreachable verdict (workers.go:343-345) rather than through telemetry,
+    # which never stops.
+    cork=$(compose_container cork)
+    [[ -n "$cork" ]] || fail "cork container not found via the outer docker API"
+    wb=$(compose_container "${PUBLIC[$WB]}")
+    [[ -n "$wb" ]] || fail "compose container for ${PUBLIC[$WB]} not found"
+    # Planted before the pause, for the worker-add at the end to clear.
+    planted=$(plant_orphan "$WB" 995)
+    ORPHAN_WORKER=$WB; ORPHAN_NET=cmgr-995; ORPHAN_CID=$planted
+    DOWNED_WORKER=$WB
+    PAUSED_WORKER=$wb
+    outer_ctl "$wb" pause
+    outer_ctl "$cork" restart
+    # The clock starts where the container does, not before it: docker's
+    # restart stops cork first (up to its stop timeout), and folding that into
+    # the measurement would make a healthy start look like a blocked one.
+    t=$(date +%s)
+    retry 60 "cmgrd to answer after the restart" quiet api GET /version
+    up_took=$(( $(date +%s) - t ))
+    # (a) The ordering assertion, deliberately not a stopwatch. initWorkers
+    # runs before ListenAndServe, so the reconcile budget and the listener
+    # start together: a startup that ran $WB's pass inline would have spent
+    # the whole 10s budget before answering, and the first thing this read
+    # would see is a worker already down. Anything else means cmgrd was
+    # serving while that pass was still running. The duration below is only
+    # the guard that keeps that reading meaningful.
+    restart_health=$(worker_health "$WB" || true)
+    [[ -n "$restart_health" ]] || fail "worker $WB is not listed after the restart: cmgrd did not reload its worker rows (initWorkers)"
+    [[ "$restart_health" != down ]] ||
+      fail "cmgrd answered its first request ${up_took}s after its container started with $WB already down: startup ran the wedged worker's whole reconcile budget before it began listening (initWorkers must hand each worker to a goroutine, cmgr/workers.go:299)"
+    (( up_took < 20 )) ||
+      fail "cmgrd took ${up_took}s from container start to answer, longer than the ~10s a startup blocked behind the wedged $WB would take: the reading above can no longer tell the two apart"
+    note "cmgrd answered ${up_took}s after its container started, with $WB reading '$restart_health'"
+    # (b) The healthy box is not held up by the wedged one either: its own
+    # reconcile is fast and its poller starts on schedule.
+    retry 20 "worker $WA to report ok after the restart" health_is "$WA" ok
+    if health_is "$WB" ok; then
+      fail "worker $WB reads ok after the restart although its dockerd is frozen: either the pause did not take (so this step is testing nothing) or its reconcile pass was skipped and its poller started anyway (runWorker)"
+    fi
+    # (c) And $WA takes every launch. Two of them: with one eligible worker
+    # the round-robin cursor must land on $WA twice (selectWorker skips
+    # anything but workerOk), and a cursor that still counted $WB would send
+    # the second into a control timeout.
+    restart_ids=()
+    for i in 27 28; do
+      out=$(try_launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i")
+      code=${out%%$'\n'*}
+      body=${out#*$'\n'}
+      case "$code" in
+        200|201) ;;
+        *) fail "launch $i after the restart answered HTTP $code with $WA reading '$(worker_health "$WA")' and $WB wedged: $(head -c 200 <<<"$body")" ;;
+      esac
+      [[ "$(jq -r .worker <<<"$body")" == "$WA" ]] ||
+        fail "launch $i was placed on the wedged worker $WB after the restart: a worker whose startup reconcile has not finished must not be eligible"
+      track "$body" "$i"
+      restart_ids+=("$(jq -r .id <<<"$body")")
+    done
+    # One full check: the fleet is not merely accepting launches after the
+    # restart, it is serving them. No generation argument -- which generation
+    # is current depends on how many update steps ran before this one.
+    check_ondemand "${INST_META[${restart_ids[0]}]}" 27
+    for id in "${restart_ids[@]}"; do
+      cmgrd-cli stop "$id"
+      assert_gone "$id" "$WA" "${INST_META[$id]}"
+      forget "$id"
+    done
+    # (d) The verdict, and where it came from. The sidecar never stopped
+    # answering, so this down cannot be the telemetry-silence path the earlier
+    # step covers: it is the startup reconcile giving up on an unreachable
+    # daemon. 30s from here, not from the restart, because the launches above
+    # already spent part of the budget -- what is bounded is that the verdict
+    # arrives at all, against the 200s an attempt-counting loop would need.
+    retry 30 "worker $WB to be marked down by its startup reconcile" health_is "$WB" down
+    quiet curl -sSf --max-time 3 "http://$WB:2136/health" ||
+      fail "the telemetry of $WB stopped answering during this step: $WB must be marked down here by its reconcile, not by telemetry silence, or the assertion above proves nothing"
+    outer_ctl "$wb" unpause
+    PAUSED_WORKER=""
+    retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
+    sleep 3
+    health_is "$WB" down ||
+      fail "worker $WB came back to '$(worker_health "$WB")' on its own once its dockerd was unpaused: a worker downed by its startup reconcile takes a worker-add, or an operator would never know a box had been out"
+    readd "$WB"
+    DOWNED_WORKER=""
+    orphan_gone "$WB" 995 "{\"containers\":[\"$planted\"]}" ||
+      fail "worker $WB reported ok after its worker-add with the orphan cmgr-995 still on it: the reconcile did not finish before the poller started"
+    ORPHAN_WORKER=""; ORPHAN_NET=""; ORPHAN_CID=""
+    all_workers_ok || fail "worker $WA or $WB is not ok after the restart with a wedged worker"
+    ok "cmgrd served ${up_took}s after its container restarted with $WB frozen ($WB reading '$restart_health'), $WA reconciled and took both launches, $WB was marked down by its own startup reconcile with its telemetry still answering, stayed down through its daemon's return, and was recovered by a worker-add that cleared cmgr-995"
+  else
+    skip "a cmgrd restart with a wedged worker needs the outer docker socket"
+  fi
+else
+  deselect "cmgrd restart with a wedged worker"
+fi
 
 # ------------------------------------------------- 15. worker-remove
 
@@ -2138,6 +4188,886 @@ for id in "${wa_ids[@]}"; do
 done
 rm -rf "$stop_tmp"
 ok "scale-out: $WB answered 201 and was in the fleet on the next read, not down, and eligible once its reconcile and first poll were through; scale-in: PATCH down took it out of placement at once, refused $refused launch(es) aimed at it as retryable without any of them waiting out the launch wait, held down against healthy telemetry and a PATCH back to ok, kept ${#wb_ids[@]} instance(s) serving, and drained to zero over the DB-only stop path; DELETE purged the records and left the containers on the box for its termination"
+
+# BLOCK 3 -- insert after e2e/scenario.sh:2140 (the `ok` that closes the
+# autoscaling lifecycle step), immediately before the "16. teardown" banner.
+# It launches nothing and stops nothing, so it disturbs neither OD_IDS nor the
+# teardown's counts.
+# ============================================================================
+
+# ------------------------- 15c. a rebuild that fails validation
+
+if (( FULL )); then
+  step "a rebuild that fails validation keeps serving the previous archive"
+  # The staged path exists for exactly this case (the comment at
+  # cmgr/docker.go:770-776): a rebuild that fails validation must leave the
+  # previous archive alone, because the build row is rolled back rather than
+  # removed and cork goes on serving it. Delete or half-write that file and
+  # every player download of a challenge whose last update was broken becomes an
+  # error, with nothing in the update's own output to say so.
+  pm_before=$(api GET "/instances/$PERSIST_INST")
+  ppub=$(jq -r .worker_public <<<"$pm_before")
+  pport=$(jq -r .ports.socat <<<"$pm_before")
+  pworker=$(jq -r .worker <<<"$pm_before")
+  # What the builder and the registry hold for this challenge before the failed
+  # rebuild. The images are pushed inside the per-host build loop, before the
+  # metadata is even extracted (cmgr/docker.go:692), so a failed generation does
+  # reach zot; the local untag on the failure path (cmgr/docker.go:838-853) is
+  # the only reclamation there is, and this step has to leave both as it found
+  # them either way.
+  persist_local_tags() {
+    local btags
+    btags=$(builder_tags)
+    grep "^$E2E_REGISTRY/$CH_PERSISTENT:" <<<"$btags" | sort || true
+  }
+  btags_before=$(persist_local_tags)
+  rtags_before=$(registry_tags "$CH_PERSISTENT")
+
+  # Generation 4 of the persistent challenge, publishing one file its problem.md
+  # does not reference. set_generation is called with "both" because only its
+  # "both" arm re-stamps the persistent source; that arm rewrites the on-demand
+  # source too, with the generation the live-traffic step already built, so
+  # those bytes do not change and that challenge is not rebuilt. Checked rather
+  # than asserted in a comment: an on-demand rebuild here would tear down every
+  # tracked on-demand instance behind the scenario's back, and the teardown --
+  # where a stop is idempotent and the containers really are gone -- would not
+  # notice.
+  cp "$CHALLENGES/$ONDEMAND_SRC" "$ART_TMP/ondemand.before"
+  persist_gen_before=$PERSIST_GEN
+  set_generation 6 persistent
+  # Kept even though the mode above cannot touch it: this is the assertion that
+  # says the on-demand challenge must not be rebuilt here, and it would catch a
+  # later edit to set_generation that broke that.
+  same_bytes "$ART_TMP/ondemand.before" "$CHALLENGES/$ONDEMAND_SRC" ||
+    fail "the persistent-only generation bump changed $ONDEMAND_SRC: this step's update would rebuild the on-demand challenge and tear down the instances the scenario still tracks"
+  # cacheArtifacts stages the three-entry archive and validateBuild then refuses
+  # the build (cmgr/loader.go:487-491) -- the cheapest failure that happens
+  # AFTER the archive is staged. A build that failed earlier (a broken
+  # Dockerfile) never reaches the promotion at all and would prove nothing about
+  # it. The extra file is planted by the Dockerfile rather than taken from
+  # whatever docker happens to provide (/etc/hostname inside a RUN is a bind
+  # mount, not image content), so the fixture and the expected message are
+  # deterministic. BOTH ampersands are escaped: an unescaped & in a sed
+  # replacement stands for the whole match, which would splice the tar line into
+  # itself and break the build for the wrong reason.
+  sed -i "s|^RUN tar czvf /challenge/artifacts.tar.gz -C / secret.enc time.txt\$|RUN echo e2e-unreferenced > /e2e-extra.txt \&\& tar czvf /challenge/artifacts.tar.gz -C / secret.enc time.txt e2e-extra.txt|" \
+    "$CHALLENGES/$PERSISTENT_SRC"
+  grep -q 'e2e-extra.txt' "$CHALLENGES/$PERSISTENT_SRC" ||
+    fail "could not make $PERSISTENT_SRC publish an artifact its problem.md does not reference (did examples/custom/Dockerfile change?)"
+  t=$(date +%s)
+  rc=0
+  # No --prune-old: nothing may be reclaimed here, and a build that never
+  # finalized displaces nothing anyway. The status is captured because a
+  # non-zero exit is the expected outcome, and errexit would abort the run
+  # before a word of the output was printed.
+  out=$(cmgrd-cli update 2>&1) || rc=$?
+  sed 's/^/       /' <<<"$out"
+  note "the failing rebuild took $(( $(date +%s) - t ))s"
+  (( rc != 0 )) ||
+    fail "cmgrd-cli update exited 0 although the rebuilt image publishes an artifact the challenge text never references: validateBuild (cmgr/loader.go:487-491) let it through, so everything below would pass for the wrong reason"
+  grep -q '^Errors:' <<<"$out" ||
+    fail "the update printed no Errors section although the rebuild of $CH_PERSISTENT had to fail validation"
+  # The negative control: without it a build that failed for any other reason (a
+  # broken Dockerfile, a registry hiccup) would satisfy every archive assertion
+  # below without ever having staged anything.
+  grep -q "artifact file 'e2e-extra.txt' published but not referenced" <<<"$out" ||
+    fail "the update failed for some reason other than the unreferenced artifact this step planted, so the archive assertions below would prove nothing: $(head -c 300 <<<"$out")"
+  grep -q "  $CH_PERSISTENT\$" <<<"$out" ||
+    fail "the update did not report $CH_PERSISTENT as changed, so no rebuild ran and nothing was staged"
+  if grep -q "  $CH_ONDEMAND\$" <<<"$out"; then
+    fail "the update rebuilt $CH_ONDEMAND as well, although its source was supposed to be byte-identical to the generation the live-traffic step built: its instances are still tracked and have just been torn down"
+  fi
+
+  # The row is rolled back, not removed: finalizeBuild is never reached
+  # (cmgr/database_challenges.go:661-666), so the build keeps the checksum, the
+  # flag and the has_artifacts of the generation that is still installed.
+  [[ "$(api_status GET "/builds/$PERSIST_BUILD")" == 200 ]] ||
+    fail "build $PERSIST_BUILD is gone after a rebuild that failed validation: a failed update rolls the row back, it does not delete it"
+  pbuild=$(api GET "/builds/$PERSIST_BUILD")
+  [[ "$(jq -r .checksum <<<"$pbuild")" == "$PERSIST_CHECKSUM_G2" ]] ||
+    fail "build $PERSIST_BUILD's checksum moved to $(jq -r .checksum <<<"$pbuild") after a rebuild that failed validation, expected the generation-2 value $PERSIST_CHECKSUM_G2: the row was finalized for a build that never validated"
+  [[ "$(jq -r .flag <<<"$pbuild")" == "$PERSIST_FLAG" ]] ||
+    fail "build $PERSIST_BUILD's flag changed although its rebuild failed"
+  [[ "$(jq -r .has_artifacts <<<"$pbuild")" == true ]] ||
+    fail "build $PERSIST_BUILD reports has_artifacts=false after a failed rebuild: the platform would stop offering a download cork is still able to serve"
+
+  # The assertion this step exists for: the download still works, and it is the
+  # old archive, byte for byte. Not merely "a 200" -- a staged archive promoted
+  # by a failure would answer 200 too, with three members and a time.txt from a
+  # build cork has rolled back.
+  ART_FAIL="$ART_TMP/persist-after-fail.tar.gz"
+  out=$(cmgrd-cli artifacts "$PERSIST_BUILD" "$ART_FAIL" 2>&1) ||
+    fail "cmgrd-cli artifacts $PERSIST_BUILD failed after a failed rebuild: the previous archive was removed or truncated, so every player download of this challenge is now an error ($out)"
+  members=$(art_members "$ART_FAIL") ||
+    fail "the archive served after the failed rebuild is not a readable gzip tar"
+  [[ "$members" == "secret.enc time.txt" ]] ||
+    fail "the archive served for build $PERSIST_BUILD after the failed rebuild holds '$members': the staged generation-4 archive (the one publishing e2e-extra.txt) was promoted although validateBuild rejected the build; the failure path must remove the staged file, not rename it (cmgr/docker.go:826-829)"
+  gen=$(tar -xzOf "$ART_FAIL" time.txt) ||
+    fail "could not read time.txt out of the archive served after the failed rebuild"
+  [[ "$gen" == "e2e-generation-2" ]] ||
+    fail "the archive served for build $PERSIST_BUILD carries '$gen' in time.txt after the failed rebuild, expected the generation-2 archive that is still the installed one"
+  same_bytes "$ART_G2" "$ART_FAIL" ||
+    fail "the archive served for build $PERSIST_BUILD is not byte for byte the one it served before the failed rebuild: something wrote to <id>.tar.gz on a path that may only ever touch the staged copy"
+
+  # And what the rolled-back build still runs: untouched, at the same address,
+  # still serving generation 2. A failed update that tore down its persistent
+  # instance would take the challenge off the board entirely.
+  pm_after=$(api GET "/instances/$PERSIST_INST")
+  [[ "$(jq -r .worker <<<"$pm_after")" == "$pworker" && "$(jq -r .ports.socat <<<"$pm_after")" == "$pport" ]] ||
+    fail "persistent instance $PERSIST_INST moved from $pworker:$pport to $(jq -r .worker <<<"$pm_after"):$(jq -r .ports.socat <<<"$pm_after") over a rebuild that failed: a build that never validated must not restart anything"
+  retry 15 "persistent instance $PERSIST_INST at $ppub:$pport to still serve generation 2 after the failed rebuild" \
+    tcp_says "$ppub" "$pport" '' 'e2e-generation-2'
+  if (( ${#OD_IDS[@]} )); then
+    [[ "$(api_status GET "/instances/${OD_IDS[0]}")" == 200 ]] ||
+      fail "on-demand instance ${OD_IDS[0]} was torn down by an update that only rebuilt $CH_PERSISTENT, and failed at that"
+  fi
+
+  # Housekeeping, with two assertions inside it. The failed generation's images
+  # are untagged locally on the failure path (cmgr/docker.go:838-853), so the
+  # builder must hold exactly what it held; nothing on that path may touch the
+  # registry, so every tag that was there must still be there. The failed
+  # generation's own tag, pushed before the build was ever validated, is the one
+  # thing legitimately new, and it is removed here with cork's identity or it
+  # would outlive the run in zot (the teardown only looks for named tags).
+  btags_after=$(persist_local_tags)
+  [[ "$btags_after" == "$btags_before" ]] ||
+    fail "the builder's tags for $CH_PERSISTENT changed over a rebuild that failed validation ('$(tr '\n' ' ' <<<"$btags_before")' -> '$(tr '\n' ' ' <<<"$btags_after")'): a failed generation no row retains must be untagged again (cmgr/docker.go:838-853)"
+  rtags_after=$(registry_tags "$CH_PERSISTENT")
+  while read -r tg; do
+    [[ -n "$tg" ]] || continue
+    grep -qxF -- "$tg" <<<"$rtags_after" ||
+      fail "tag $E2E_REGISTRY/$CH_PERSISTENT:$tg left the registry over a rebuild that failed validation: the failure path untags locally, never remotely, and that tag is still a generation cork serves"
+  done <<<"$rtags_before"
+  leaked=()
+  while read -r tg; do
+    [[ -n "$tg" ]] || continue
+    if ! grep -qxF -- "$tg" <<<"$rtags_before"; then leaked+=("$tg"); fi
+  done <<<"$rtags_after"
+  for tg in ${leaked[@]+"${leaked[@]}"}; do
+    code=$(registry_status "/v2/$CH_PERSISTENT/manifests/$tg" -X DELETE)
+    case "$code" in
+      202|404) note "removed $E2E_REGISTRY/$CH_PERSISTENT:$tg, the failed generation's tag: it was pushed before the build was validated (cmgr/docker.go:692) and no failure path untags it remotely" ;;
+      *) fail "could not remove the failed generation's tag $E2E_REGISTRY/$CH_PERSISTENT:$tg from the registry: HTTP $code" ;;
+    esac
+  done
+
+  # The persistent source back exactly as this step found it, and the on-demand
+  # source not touched at all -- this step never edits it, and the assertion
+  # above is what says so. The generation is read from PERSIST_GEN rather than
+  # named: which one the earlier steps left behind depends on the mode.
+  #
+  # cork's challenge row still holds this generation's source checksum
+  # (updateChallenges commits the metadata before it builds), so an update
+  # inserted after this point would rebuild the persistent challenge and
+  # restart its instance. Nothing between here and the teardown runs one.
+  set_generation "$persist_gen_before" persistent
+  rm -rf "$ART_TMP"
+  ok "the rebuild was refused for publishing an unreferenced artifact; the build row kept its checksum, flag and has_artifacts; cork went on serving the generation-2 archive byte for byte; instance $PERSIST_INST kept serving at $ppub:$pport; the builder is back to the tags it held and the failed generation's registry tag is gone"
+else
+  deselect "a failed rebuild keeps serving the previous archive"
+fi
+
+# ----------------------- 15c. a registry that accepts and never answers
+
+if (( FULL )); then
+  step "slow registry: a launch whose image pull runs out of time is a retryable 503 that leaves its worker in the fleet, and a worker that already holds the tag launches with the registry dead"
+  # The stand-in that accepts a connection and answers nothing is an openssl
+  # s_server run from this image, so without openssl the fixture cannot be
+  # built at all. That is a hole in the run, not a choice: skip, not deselect.
+  if (( OUTER )) && command -v openssl >/dev/null 2>&1; then
+    # Two promises, one fixture. ensureImages offers every launch failure but
+    # one to noteWorkerTransportError (cmgr/launch.go:142-150); a pull that
+    # merely ran out of time is exempt, because the registry is the likelier
+    # culprit. The regression answers the platform the same retryable 503
+    # (ErrPullTimeout, cmd/cmgrd/main.go:447-452) while quietly taking the box
+    # out of the fleet until an operator re-adds it -- in production one slow
+    # registry would walk the whole fleet down. The second promise is
+    # imagePresent (cmgr/launch.go:163-178): a tag the daemon already holds is
+    # never pulled, so a launch onto a warm worker does not touch the registry
+    # at all. Nothing else in this scenario reaches pullImage's timeout.
+    PULL_TIMEOUT=30 # cork sets no CMGR_WORKER_PULL_TIMEOUT, so the default (cmgr/workers.go:76)
+    PROBE_SEED=99   # outside schema.yaml's seeds (1, 3, 5, 7): this build is nobody else's
+
+    # A run killed before its EXIT trap leaves its probe build behind, and a
+    # second build with the same challenge, seed and checksum makes
+    # contentReferenced true (cmgr/database_builds.go:224), so destroyImages
+    # would keep the very images this step asserts it untags -- and the next
+    # teardown would fail on a builder tag nobody can explain. Clear it here,
+    # as the schema and phantom-worker steps clear their own leftovers.
+    stale=$(manual_builds "$CH_ONDEMAND" "$PROBE_SEED") ||
+      fail "could not read the build list (cmgrd-cli system-dump) to look for a leftover probe build"
+    for b in $stale; do
+      note "destroying build $b of $CH_ONDEMAND seed $PROBE_SEED, left behind by an earlier run"
+      cmgrd-cli destroy "$b" || fail "could not destroy the leftover probe build $b of $CH_ONDEMAND"
+    done
+
+    zot=$(compose_container zot)
+    [[ -n "$zot" ]] || fail "compose container for the registry (service zot) not found"
+    zot_json=$(outer "/containers/$zot/json")
+    zot_net=$(jq -r '(.NetworkSettings.Networks | keys | .[0]) // empty' <<<"$zot_json")
+    # .Name is what a Bind takes for the compose volume; .Source covers a
+    # checkout that mounts the registry's certificates from the host instead.
+    zot_certs=$(jq -r '[(.Mounts // [])[] | select(.Destination == "/etc/zot/certs") | (.Name // .Source)] | .[0] // empty' <<<"$zot_json")
+    [[ -n "$zot_net" && -n "$zot_certs" ]] ||
+      fail "could not read the registry's network ('$zot_net') and certificate volume ('$zot_certs') from the outer docker API"
+
+    # A build of its own, made while the registry is still up. It is the only
+    # way to have a tag no worker holds this late in the run -- both have
+    # launched every generation of $CH_ONDEMAND -- and every layer below the
+    # FLAG is one they already carry, so the pull that finally succeeds moves
+    # kilobytes rather than the ubuntu base. The seed is outside schema.yaml,
+    # so the build is manual (cmgr/api.go:254): it can be destroyed again (a
+    # schema's build cannot, cmgr/api.go:451) and nothing else shares its
+    # challenge+seed+checksum, which is what makes destroyImages untag it.
+    out=$(cmgrd-cli build --flag-format 'e2e{%s}' "$CH_ONDEMAND" "$PROBE_SEED" 2>&1) ||
+      fail "cmgrd-cli build $CH_ONDEMAND $PROBE_SEED failed: $out"
+    PROBE_BUILD=$(awk 'NF == 1 && $1 ~ /^[0-9]+$/ {print $1; exit}' <<<"$out") # "Build IDs:" then one indented id
+    [[ "$PROBE_BUILD" =~ ^[0-9]+$ ]] || fail "cmgrd-cli build printed no build id: $out"
+    probe_meta=$(api GET "/builds/$PROBE_BUILD")
+    probe_tag=""
+    for host in $(jq -r '.images[].host' <<<"$probe_meta"); do
+      if [[ "$host" == builder ]]; then continue; fi
+      probe_tag=$(image_tag "$probe_meta" "$host")
+    done
+    [[ -n "$probe_tag" ]] || fail "build $PROBE_BUILD of $CH_ONDEMAND has no launchable image to pull"
+    has_line "$probe_tag" registry_tags "$CH_ONDEMAND" ||
+      fail "build $PROBE_BUILD did not push $E2E_REGISTRY/$CH_ONDEMAND:$probe_tag; there is nothing for a worker to pull"
+    # The negative control for the whole step: a worker that already held this
+    # tag would skip the pull entirely (imagePresent) and the launch below
+    # would succeed with the registry dead, proving the opposite of the point.
+    for ip in "${WORKER_IPS[@]}"; do
+      if has_line "$E2E_REGISTRY/$CH_ONDEMAND:$probe_tag" worker_tags "$ip"; then
+        fail "worker $ip already holds $probe_tag, so the launch below would not pull at all"
+      fi
+    done
+    # Whether the warm rider below can run: it needs a build whose image both
+    # workers hold, which every launch since the generation-4 rebuild has
+    # arranged. Checked rather than assumed, because a fleet that is behaving
+    # perfectly must never fail on a bonus assertion.
+    warm=1
+    for ip in "${WORKER_IPS[@]}"; do
+      has_line "$E2E_REGISTRY/$CH_ONDEMAND:${IMAGE_TAG[$CH_ONDEMAND]}" worker_tags "$ip" || warm=0
+    done
+
+    # A registry that accepts the connection, finishes the handshake, and then
+    # never answers -- what a wedged one looks like to a puller. Pausing zot
+    # would not do it: a paused container still completes the TCP handshake in
+    # the kernel, so what stalls is the TLS handshake, and dockerd's registry
+    # transport bounds that at ten seconds, well inside the ${PULL_TIMEOUT}s
+    # pull timeout. A pause therefore comes back as a pull *error* and this
+    # step would be asserting the other branch. The stand-in completes the
+    # handshake with zot's own certificate and key (the workers verify it
+    # against the same CA out of certs.d) and then holds the request open,
+    # which only the pull timeout can end.
+    STOPPED_REGISTRY=$zot
+    outer_ctl "$zot" stop
+    stall_body=$(jq -cn --arg img "$E2E_IMAGE" --arg net "$zot_net" --arg vol "$zot_certs" --arg reg "$E2E_REGISTRY" '{
+      Image: $img,
+      Entrypoint: ["bash", "-c",
+        "tail -f /dev/null | openssl s_server -quiet -accept 443 -cert /certs/zot-server-cert.pem -key /certs/zot-server-key.pem"],
+      HostConfig: {Binds: [$vol + ":/certs:ro"], NetworkMode: $net, AutoRemove: true},
+      NetworkingConfig: {EndpointsConfig: {($net): {Aliases: [$reg]}}}}')
+    STALL_REGISTRY=$(outer /containers/create -X POST -H 'Content-Type: application/json' -d "$stall_body" | jq -r '.Id // empty')
+    [[ -n "$STALL_REGISTRY" ]] || fail "could not create the stand-in registry from $E2E_IMAGE"
+    outer_ctl "$STALL_REGISTRY" start
+    # curl exit 28 is the fixture: the connection was made, the handshake
+    # finished, and nothing answered. 7 (refused) or 35/60 (TLS) mean the
+    # stand-in is wrong, not cork, so they are not accepted as ready.
+    stall_stalls() {
+      local rc=0
+      registry_curl /v2/ --max-time 5 -o /dev/null >/dev/null 2>&1 || rc=$?
+      (( rc == 28 ))
+    }
+    retry 25 "the stand-in registry to accept a connection and stall on it (openssl s_server with zot's own certificate; if this is what times out, the fixture is broken, not cork)" stall_stalls
+    # s_server serves one connection at a time and the probe above just held
+    # one for five seconds: give it a moment to be back in accept() before the
+    # pull arrives, or the pull would sit in the kernel's backlog and hit
+    # dockerd's ten-second TLS bound instead of cork's pull timeout.
+    sleep 1
+    note "the registry now accepts connections at $E2E_REGISTRY:443 and never answers"
+
+    pull_dir=$(mktemp -d)
+    rows_before=$(api GET /workers | jq -r 'map(.instances) | add')
+    [[ "$rows_before" =~ ^[0-9]+$ ]] || fail "could not read the fleet's instance count before the stalled launch"
+    probe_body=$(jq -cn '{user_id: "e2e-user-98", env: {CUSTOM_VAR: "e2e-value-98"}}')
+    # In the background, so the rider below runs inside its own dead time.
+    timed_launch "$pull_dir" pull "$PROBE_BUILD" "$probe_body" &
+    pull_pid=$!
+
+    if (( warm )); then
+      # The rider, free because it runs inside the ${PULL_TIMEOUT}s the pull
+      # timeout costs anyway: a launch whose tag its daemon already holds is
+      # never pulled, so a dead registry must cost it nothing (imagePresent
+      # before the pull, cmgr/launch.go:163-178; and the whole image stage
+      # runs before acquireLaunchSlot, cmgr/launch.go:108-115, so a stalled
+      # pull holds none of the daemon's launch slots either). A blind pull in
+      # place of imagePresent stalls this launch on the same dead registry and
+      # fails it with the pull timeout's own wording, which the 503 arm below
+      # tells apart from the refusals that say nothing about the registry.
+      sleep 3
+      out=$(try_launch "$OD_BUILD" e2e-user-97 e2e-value-97)
+      code=${out%%$'\n'*}
+      body=${out#*$'\n'}
+      case "$code" in
+        200|201)
+          warm_id=$(jq -r .id <<<"$body")
+          track "$body" 97
+          check_ondemand "$body" 97
+          cmgrd-cli stop "$warm_id"
+          assert_gone "$warm_id" "${INST_WORKER[$warm_id]}" "${INST_META[$warm_id]}"
+          forget "$warm_id"
+          note "instance $warm_id launched, served and stopped on a warm worker while the registry was dead"
+          ;;
+        503)
+          if grep -q "image pull timed out" <<<"$body"; then
+            fail "a launch of $CH_ONDEMAND, whose image both workers already hold, timed out pulling from the dead registry: imagePresent no longer skips the pull for a tag the daemon has (cmgr/launch.go:163-178), so every launch in the fleet now depends on the registry ($(head -c 200 <<<"$body"))"
+          fi
+          # A busy queue or a lost race for the database's write lock is
+          # retryable and says nothing about the registry: it costs the rider
+          # its assertion rather than failing a fleet that behaved correctly.
+          note "the warm launch was refused as retryable while the registry was dead, so it proved nothing here: $(head -c 160 <<<"$body")"
+          ;;
+        *)
+          fail "a launch of $CH_ONDEMAND, whose image both workers already hold, answered HTTP $code with the registry dead: a present tag is never pulled (imagePresent, cmgr/launch.go:163-178), so a dead registry must cost this launch nothing ($(head -c 200 <<<"$body"))"
+          ;;
+      esac
+    else
+      note "not both workers hold ${IMAGE_TAG[$CH_ONDEMAND]}, so the warm launch was not attempted"
+    fi
+    wait "$pull_pid" || true # timed_launch records curl's own failure rather than raising it
+
+    code=000; took=0
+    read -r code took <"$pull_dir/pull.code" || true
+    took_ms=$(jq -rn --arg t "$took" '($t | tonumber) * 1000 | floor' 2>/dev/null || echo "")
+    [[ "$took_ms" =~ ^[0-9]+$ ]] || fail "could not read how long the stalled launch took (curl reported '$took')"
+    body=$(cat "$pull_dir/pull.body" 2>/dev/null || true)
+    if [[ "$code" != 503 ]]; then
+      # Separated from a cork verdict on purpose: these are the answers a
+      # stand-in that failed to stall produces, and blaming cork for them
+      # would send the next reader down the wrong path entirely.
+      if grep -qiE 'tls handshake|connection refused|no such host|certificate' <<<"$body"; then
+        fail "the stalled launch answered HTTP $code after ${took_ms}ms with a registry error rather than a timeout: the stand-in did not hold the pull open (dockerd bounds a TLS handshake long before cork's ${PULL_TIMEOUT}s pull timeout), so this is the fixture failing, not cork: $(head -c 200 <<<"$body")"
+      fi
+      fail "the launch whose pull hung on the registry answered HTTP $code after ${took_ms}ms, expected 503: a pull that ran out of time is retryable (ErrPullTimeout at cmd/cmgrd/main.go:447-452), and a 500 is what makes the platform's celery worker give the player up ($(head -c 200 <<<"$body"))"
+    fi
+    grep -q "image pull timed out" <<<"$body" ||
+      fail "the 503 does not name the pull timeout, so it is some other retryable refusal and this step proved nothing: $(head -c 200 <<<"$body")"
+    # The regression's fingerprint, visible in the body before any health
+    # read: noteWorkerTransportError on a timed-out pull marks the worker
+    # down, and launch (cmgr/launch.go:91-96) then re-wraps that very error as
+    # ErrWorkerDown -- still a 503, still naming the pull timeout, with
+    # "worker went down" in front of it.
+    if grep -q "worker went down" <<<"$body"; then
+      fail "the timed-out pull came back as a worker-down failure ($(head -c 200 <<<"$body")): ensureImages offered ErrPullTimeout to noteWorkerTransportError (cmgr/launch.go:142-150), so one slow registry now takes boxes out of the fleet"
+    fi
+    grep -qi '^Retry-After: 1' "$pull_dir/pull.head" ||
+      fail "the 503 of the timed-out pull carried no Retry-After, so the platform will not place the retry: $(tr -d '\r' <"$pull_dir/pull.head" | head -1)"
+    # It waited for a pull, and it was cmgrd's ceiling that bounded the wait
+    # from above. The lower bound is deliberately loose and not read off
+    # PULL_TIMEOUT: the daemon bounds its own registry requests more tightly
+    # than cmgrd does (about 15s against 30s here), so against a registry that
+    # never answers it is the daemon's deadline that ends the wait and cmgrd's
+    # that never gets to. That asymmetry is the subject of registryTimedOut
+    # (cmgr/docker.go) -- without it this launch is a 500. What must not
+    # happen is an instant refusal, which would mean the pull failure had been
+    # reclassified as something else; and the ceiling must still be cmgrd's,
+    # not restartPullTimeout's five minutes (cmgr/launch.go:70) leaking into a
+    # request launch.
+    (( took_ms >= 2000 )) ||
+      fail "the launch was refused after only ${took_ms}ms: it never waited for a pull at all, so what failed was not a timeout of either kind"
+    (( took_ms <= (PULL_TIMEOUT + 15) * 1000 )) ||
+      fail "the launch took ${took_ms}ms to give up, past cmgrd's ${PULL_TIMEOUT}s pull timeout: the pull is bounded by something else (restartLimits' five-minute ceiling leaking into a request launch, or the transport timeout)"
+    # down is sticky, so these single reads are the whole assertion, and they
+    # are the ones that cost a production box if the exemption ever goes.
+    for ip in "${WORKER_IPS[@]}"; do
+      if health_is "$ip" down; then
+        fail "worker $ip was marked down by a launch whose image pull timed out: the pull timeout indicts the registry, not the box, and a worker downed here takes no further placement until an operator's worker-add (cmgr/launch.go:142-150)"
+      fi
+    done
+    retry 20 "both workers to report ok after the stalled launch" all_workers_ok
+    rows_after=$(api GET /workers | jq -r 'map(.instances) | add')
+    (( rows_after == rows_before )) ||
+      fail "the fleet records $rows_after instance(s) after the refused launch, expected the $rows_before it started with: nothing of it reached a daemon, so its row and its ports must have been cleared (clearInstanceRecords, cmgr/api.go:369-376)"
+    [[ "$(api GET "/builds/$PROBE_BUILD" | jq -r '.instances // [] | length')" == 0 ]] ||
+      fail "build $PROBE_BUILD still records an instance although its only launch was refused"
+
+    # The registry comes back and the same launch goes through, on a worker
+    # nobody re-added. The stand-in goes first: while it holds the
+    # $E2E_REGISTRY alias a lookup could land on either of them. Its
+    # entrypoint is a pipeline, so bash swallows the SIGTERM and only the kill
+    # ends it -- t=1 rather than waiting out docker's ten-second default,
+    # which is why this is not outer_ctl.
+    outer "/containers/$STALL_REGISTRY/stop?t=1" -X POST -o /dev/null
+    STALL_REGISTRY="" # AutoRemove, so stopping it removes it
+    retry 20 "the registry container to start" quiet outer_ctl "$zot" start
+    STOPPED_REGISTRY=""
+    retry 60 "the registry to answer again" quiet registry_api /v2/
+    out=$(try_launch "$PROBE_BUILD" e2e-user-98 e2e-value-98)
+    code=${out%%$'\n'*}
+    body=${out#*$'\n'}
+    case "$code" in
+      200|201) ;;
+      *) fail "the same launch answered HTTP $code with the registry back: a pull that ran out of time must leave its build launchable and its worker taking placements with no worker-add ($(head -c 200 <<<"$body"))" ;;
+    esac
+    probe_id=$(jq -r .id <<<"$body")
+    track "$body" 98
+    probe_worker=${INST_WORKER[$probe_id]}
+    assert_on_worker "$probe_worker" "$body"
+    has_line "$E2E_REGISTRY/$CH_ONDEMAND:$probe_tag" worker_tags "$probe_worker" ||
+      fail "worker $probe_worker launched instance $probe_id without holding $probe_tag: the retry did not pull what the timed-out launch could not"
+    pub=$(jq -r .worker_public <<<"$body")
+    port=$(jq -r .ports.server <<<"$body")
+    (( port >= PORT_LOW && port <= PORT_HIGH )) || fail "port $port is outside CMGR_PORTS $PORT_LOW-$PORT_HIGH"
+    # http_says rather than check_ondemand: this build has a seed of its own
+    # and therefore a flag of its own, which is not $OD_FLAG.
+    retry 30 "instance $probe_id at $pub:$port" http_says "$pub" "$port" "CMGR_USER_ID=e2e-user-98"
+    cmgrd-cli stop "$probe_id"
+    assert_gone "$probe_id" "$probe_worker" "$body"
+    forget "$probe_id"
+
+    # Leave the fleet as it was found: the probe image off both workers (only
+    # one of them pulled it, but a 404 costs nothing and a leftover image
+    # would outlive the run -- destroyImages only untags on the builder), the
+    # probe build gone from cork, and the builder and registry back to the
+    # tags they held. With the registry up the untag is not best effort --
+    # that contract is the next step's -- so it is asserted here.
+    for ip in "${WORKER_IPS[@]}"; do
+      code=$(worker_status "$ip" "/images/$E2E_REGISTRY/$CH_ONDEMAND:$probe_tag?force=true" -X DELETE)
+      case "$code" in
+        200|404) ;;
+        *) fail "could not remove the probe image $probe_tag from worker $ip: HTTP $code (409 means a container still holds it)" ;;
+      esac
+    done
+    cmgrd-cli destroy "$PROBE_BUILD" || fail "cmgrd-cli destroy $PROBE_BUILD failed; its images would outlive the run"
+    [[ "$(api_status GET "/builds/$PROBE_BUILD")" == 404 ]] || fail "build $PROBE_BUILD survived its destroy"
+    if has_line "$probe_tag" registry_tags "$CH_ONDEMAND"; then
+      fail "destroying build $PROBE_BUILD left $probe_tag in the registry although it could reach it"
+    fi
+    if has_line "$E2E_REGISTRY/$CH_ONDEMAND:$probe_tag" builder_tags; then
+      fail "destroying build $PROBE_BUILD left $probe_tag on the builder"
+    fi
+    PROBE_BUILD=""
+    rm -rf "$pull_dir"
+    ok "a pull stalled on the registry failed its launch as a 503 + Retry-After after ${took_ms}ms, inside cmgrd's ${PULL_TIMEOUT}s ceiling (the daemon's own registry timeout is the one that fires), naming the timeout and not the worker; both workers stayed in the fleet with no worker-add and no record left behind, a warm worker launched and served with the registry dead, and the same launch went through once it answered again"
+  else
+    skip "slow registry: needs the outer docker socket and an openssl in this image (see e2e/cork.Dockerfile)"
+  fi
+else
+  deselect "slow registry: a pull that times out is a retryable 503 that does not down its worker"
+fi
+
+# ------------------------------ 15d. a destroy with no registry to call
+
+if (( FULL )); then
+  step "registry down: a build is still destroyed and untagged on the builder, and the registry tag it leaks is recoverable"
+  if (( OUTER )); then
+    # cmgr/registry.go:57-70 states the contract in as many words: the
+    # registry untag is best effort, a leaked registry tag is recoverable and
+    # a failed operation is not. Its two callers, destroyImages
+    # (cmgr/docker.go:1387-1391) and pruneReplacedImages
+    # (cmgr/docker.go:1319-1325), only log what it returns, so an unreachable
+    # registry may cost the operator a tag and nothing else: not the destroy,
+    # not the local untag, and not the operator's time waiting out
+    # registryDeleteTimeout.
+    FLAGONLY_SEED=55 # outside schema.yaml's seeds, as in the step above
+    stale=$(manual_builds "$CH_FLAGONLY" "$FLAGONLY_SEED") ||
+      fail "could not read the build list (cmgrd-cli system-dump) to look for a leftover probe build"
+    for b in $stale; do
+      note "destroying build $b of $CH_FLAGONLY seed $FLAGONLY_SEED, left behind by an earlier run"
+      cmgrd-cli destroy "$b" || fail "could not destroy the leftover probe build $b of $CH_FLAGONLY"
+    done
+    # The flag-only challenge because it is never launched and nothing else
+    # refers to it, and a seed of its own because destroyImages keeps the
+    # images of content another build still names (contentReferenced,
+    # cmgr/database_builds.go:224): with the schema's seed the destroy would
+    # untag nothing and assert nothing.
+    out=$(cmgrd-cli build --flag-format 'e2e{%s}' "$CH_FLAGONLY" "$FLAGONLY_SEED" 2>&1) ||
+      fail "cmgrd-cli build $CH_FLAGONLY $FLAGONLY_SEED failed: $out"
+    PROBE_BUILD=$(awk 'NF == 1 && $1 ~ /^[0-9]+$/ {print $1; exit}' <<<"$out")
+    [[ "$PROBE_BUILD" =~ ^[0-9]+$ ]] || fail "cmgrd-cli build printed no build id: $out"
+    fo_build=$PROBE_BUILD
+    fo_meta=$(api GET "/builds/$fo_build")
+    fo_tag=""
+    for host in $(jq -r '.images[].host' <<<"$fo_meta"); do
+      if [[ "$host" == builder ]]; then continue; fi
+      fo_tag=$(image_tag "$fo_meta" "$host")
+    done
+    [[ -n "$fo_tag" ]] || fail "build $fo_build of $CH_FLAGONLY has no pushed image"
+    # Both negative controls: without them the assertions below would pass on
+    # a build that was never tagged anywhere.
+    has_line "$fo_tag" registry_tags "$CH_FLAGONLY" ||
+      fail "build $fo_build did not push $E2E_REGISTRY/$CH_FLAGONLY:$fo_tag, so there is no tag for the destroy to leak"
+    has_line "$E2E_REGISTRY/$CH_FLAGONLY:$fo_tag" builder_tags ||
+      fail "build $fo_build is not tagged on the builder, so there is no local untag to assert"
+
+    zot=$(compose_container zot)
+    [[ -n "$zot" ]] || fail "compose container for the registry (service zot) not found"
+    # Stopped, not paused. A paused registry accepts the delete's connection
+    # and answers nothing, so the call burns the whole 30s registryDeleteTimeout
+    # (cmgr/registry.go:15) and this step would be timing that constant instead
+    # of the contract; a stopped container takes its $E2E_REGISTRY alias with
+    # it, so cork's delete fails on the name at once. That the operation
+    # survives a *fast* failure without retrying it into a hang is what the
+    # bound below is for.
+    STOPPED_REGISTRY=$zot
+    outer_ctl "$zot" stop
+    # Really unreachable before the delete is issued: a delete that quietly
+    # succeeded against a still-running registry would make the leak
+    # assertion below fail for a reason that has nothing to do with cork.
+    registry_dead() { ! quiet registry_api /v2/; }
+    retry 15 "the registry to stop answering" registry_dead
+    t=$(date +%s)
+    code=$(api_status DELETE "/builds/$fo_build")
+    took=$(( $(date +%s) - t ))
+    [[ "$code" == 204 ]] ||
+      fail "destroying build $fo_build with the registry down answered HTTP $code: the registry untag is best effort by contract (cmgr/registry.go:57-70) and must never fail the operation around it"
+    PROBE_BUILD="" # cork no longer has the row; only the leaked tag is left
+    # 20s rather than the ~10 the contract would allow: what must be caught is
+    # the 30s registryDeleteTimeout being waited out (or retried into a hang),
+    # and a name lookup that has to be refused by an upstream resolver can
+    # cost seconds of its own on a box with no working DNS.
+    (( took < 20 )) ||
+      fail "the destroy took ${took}s with the registry down: a registry call that cannot even connect must not be waited out (registryDeleteTimeout is 30s) or retried"
+    [[ "$(api_status GET "/builds/$fo_build")" == 404 ]] ||
+      fail "build $fo_build is still known to cmgrd after a 204 destroy"
+    if has_line "$E2E_REGISTRY/$CH_FLAGONLY:$fo_tag" builder_tags; then
+      fail "the destroy left $fo_tag tagged on the builder although the local removal has nothing to do with the registry (cmgr/docker.go:1378-1392); a second build sharing this challenge, seed and checksum would explain it too, i.e. a killed earlier run left its seed-$FLAGONLY_SEED build behind"
+    fi
+
+    retry 20 "the registry container to start" quiet outer_ctl "$zot" start
+    STOPPED_REGISTRY=""
+    retry 60 "the registry to answer again" quiet registry_api /v2/
+    # The documented leak, asserted as documented: the tag is still there.
+    has_line "$fo_tag" registry_tags "$CH_FLAGONLY" ||
+      fail "$fo_tag is gone from the registry although the destroy could not reach it: something other than registryDeleteTag removed it, and the leak this contract trades for is no longer the one operators are told about"
+    # And recoverable by hand with cork's own identity, which is the other
+    # half of "best effort" -- and what puts the registry back the way the
+    # teardown step expects to find it.
+    [[ "$(registry_status "/v2/$CH_FLAGONLY/manifests/$fo_tag" -X DELETE)" == 202 ]] ||
+      fail "the leaked tag $fo_tag could not be deleted by hand: the leak is not recoverable"
+    if has_line "$fo_tag" registry_tags "$CH_FLAGONLY"; then
+      fail "$fo_tag is still listed after its delete returned 202"
+    fi
+    ok "a destroy with the registry stopped returned 204 in ${took}s, removed the build and its builder tag, and left exactly one recoverable tag behind in the registry"
+  else
+    skip "registry down: needs the outer docker socket"
+  fi
+else
+  deselect "registry down: a destroy still succeeds and untags locally, leaking only the registry tag"
+fi
+
+# ------------- 15e. a second schema, and the multi-container delivery shape
+
+if (( FULL )); then
+  step "a second schema alongside the first: its multi-container challenge launches two networked containers, publishes only the front box, gives each stage its own limits, and keeps its private builder stage out of the registry"
+  # Everything else in this scenario is one schema of single-container
+  # challenges. Three promises are only testable here.
+  #
+  # The first is that a schema is not the unit of exclusion: production runs a
+  # schema per event, and adding one must not disturb the builds or instances
+  # of another (convergeSchema locks the schema it is given, cmgr/api.go:513).
+  #
+  # The second is the `# LAUNCH` directive: two build stages become two
+  # containers on the instance's one cmgr-<id> network, each answering to its
+  # stage name (Aliases, cmgr/docker.go:1130), while the `builder` stage that
+  # mints the secrets is neither launched nor pushed (cmgr/docker.go:634). A
+  # regression that published it would hand every competitor the flag.
+  #
+  # The third is `overrides:`, which replaces rather than merges
+  # (cmgr/docker.go:1048, and examples/specification.md says so in as many
+  # words): `work` must come up with its own 0.5 CPU and the back box with the
+  # top-level 0.25. Nothing else here launches an instance whose containers
+  # carry different limits, so a change that applied opts[""] to every host
+  # would pass every other step.
+  MULTI_SCHEMA=e2e-multi
+  CH_MULTI=cmgr/examples/aptitude-and-privileges
+  MULTI_FRONT=work           # the stage with the published port
+  MULTI_BACK=randomDnsName   # the stage holding the flag, reachable only from work
+  MULTI_PRIVATE=builder      # mints the secrets; never launched, never pushed
+
+  # Reads the flag off the back box the way a solver would once they have
+  # Alice's key, through the front box and over the instance's own network.
+  # It goes through the challenge's own ssh_config, so the hostname resolved
+  # is the stage-name alias cmgr assigns rather than an address this harness
+  # worked out for itself. Sets `got`; retried because sshd on two freshly
+  # started containers is not up the instant the launch returns.
+  multi_flag_over_ssh() {
+    # Tty:true puts the command's stderr on the same stream as its stdout, so
+    # the flag is extracted from the output rather than being assumed to be all
+    # of it: an ssh banner or a warning would otherwise fail this for the wrong
+    # reason. grep failing (pipefail) is the retry signal.
+    got=$(exec_in "$MULTI_WORKER" "${MULTI_CID[$MULTI_FRONT_K]}" asmith \
+      ssh -F /home/asmith/.ssh/config -i /home/asmith/.ssh/id_ed25519 \
+      -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=5 -o LogLevel=ERROR home cat flag.txt |
+      grep -o 'e2e{[^}]*}' | head -1)
+    [[ -n "$got" ]]
+  }
+
+  # A run killed before its EXIT trap leaves the schema behind, and add-schema
+  # errors if it already exists.
+  if has_line "$MULTI_SCHEMA" cmgrd-cli list-schemas; then
+    note "removing schema $MULTI_SCHEMA, left behind by an earlier run"
+    cmgrd-cli remove-schema "$MULTI_SCHEMA" || fail "could not remove the leftover schema $MULTI_SCHEMA"
+  fi
+
+  before_builds=$(cmgrd-cli system-dump | jq -r '[.[] | .builds[]?.id] | sort | join(" ")')
+  t=$(date +%s)
+  cmgrd-cli add-schema "$E2E_SCHEMA_FULL" || fail "add-schema $E2E_SCHEMA_FULL failed"
+  MULTI_SCHEMA_ADDED=$MULTI_SCHEMA
+  note "the second schema converged in $(( $(date +%s) - t ))s"
+
+  has_line "$MULTI_SCHEMA" cmgrd-cli list-schemas || fail "schema $MULTI_SCHEMA is not listed after add-schema"
+  has_line "$SCHEMA_NAME" cmgrd-cli list-schemas ||
+    fail "schema $SCHEMA_NAME disappeared when $MULTI_SCHEMA was added: a converge must lock and rebuild its own schema only"
+  # The first schema's work is untouched: its build still answers and the
+  # persistent instance it started is still on its worker.
+  [[ "$(api_status GET "/builds/$OD_BUILD")" == 200 ]] ||
+    fail "build $OD_BUILD of schema $SCHEMA_NAME did not survive the converge of $MULTI_SCHEMA"
+  pmeta=$(api GET "/instances/$PERSIST_INST") ||
+    fail "the persistent instance of schema $SCHEMA_NAME did not survive the converge of $MULTI_SCHEMA"
+  assert_on_worker "$(jq -r .worker <<<"$pmeta")" "$pmeta"
+
+  MULTI_STATE=$(api GET "/schemas/$MULTI_SCHEMA")
+  MULTI_BUILD=$(jq -r --arg id "$CH_MULTI" '.[] | select(.id == $id) | .builds[0].id' <<<"$MULTI_STATE")
+  [[ "$MULTI_BUILD" =~ ^[0-9]+$ ]] || fail "$CH_MULTI has no build in schema $MULTI_SCHEMA"
+  after_builds=$(cmgrd-cli system-dump | jq -r '[.[] | .builds[]?.id] | sort | join(" ")')
+  [[ " $after_builds " == *" $MULTI_BUILD "* ]] ||
+    fail "the build list does not contain $MULTI_BUILD after adding schema $MULTI_SCHEMA: '$after_builds'"
+  for b in $before_builds; do
+    [[ " $after_builds " == *" $b "* ]] ||
+      fail "build $b vanished when schema $MULTI_SCHEMA was added: a converge must touch no other schema's builds (was '$before_builds', now '$after_builds')"
+  done
+
+  MULTI_META=$(api GET "/builds/$MULTI_BUILD")
+  MULTI_FLAG=$(jq -r .flag <<<"$MULTI_META")
+  [[ "$MULTI_FLAG" == e2e{* ]] || fail "build $MULTI_BUILD has no e2e flag: '$MULTI_FLAG'"
+  # finalize.py writes the per-build account into metadata.json, which is what
+  # the problem.md template looks up. A multi-container build that published
+  # no lookup data would render a challenge nobody could log in to.
+  for k in username password; do
+    [[ -n "$(jq -r --arg k "$k" '.lookup_data[$k] // empty' <<<"$MULTI_META")" ]] ||
+      fail "build $MULTI_BUILD published no '$k' in its lookup data, although finalize.py writes one"
+  done
+
+  # The private stage is built like the others -- buildImages appends an Image
+  # for every host (cmgr/docker.go:697) -- but it is local to the builder
+  # daemon: the push skips it (cmgr/docker.go:692) and so does the launch
+  # (cmgr/api.go:353). So all three stages are in the build...
+  hosts=$(jq -r '[.images[].host] | sort | join(" ")' <<<"$MULTI_META")
+  for host in "$MULTI_FRONT" "$MULTI_BACK" "$MULTI_PRIVATE"; do
+    [[ "$(jq -r --arg h "$host" '[.images[].host] | index($h) != null' <<<"$MULTI_META")" == true ]] ||
+      fail "build $MULTI_BUILD has no image for stage $host (it has: $hosts)"
+  done
+  [[ "$(jq -r '.images | length' <<<"$MULTI_META")" == 3 ]] ||
+    fail "build $MULTI_BUILD has $(jq -r '.images | length' <<<"$MULTI_META") images ($hosts), expected exactly the three stages of $CH_MULTI"
+  multi_tags=$(registry_tags "$CH_MULTI" | sort | tr '\n' ' ' | sed 's/ $//')
+  for host in "$MULTI_FRONT" "$MULTI_BACK"; do
+    has_line "$(image_tag "$MULTI_META" "$host")" registry_tags "$CH_MULTI" ||
+      fail "the $host image of build $MULTI_BUILD was not pushed to the registry (tags: $multi_tags)"
+  done
+  # ...and exactly those two are in the registry. This is the assertion that
+  # matters: the private stage carries this build's flag and Alice's private
+  # key in plain text, and every worker holds a credential that can pull.
+  if has_line "$(image_tag "$MULTI_META" "$MULTI_PRIVATE")" registry_tags "$CH_MULTI"; then
+    fail "the private '$MULTI_PRIVATE' stage of build $MULTI_BUILD reached the registry: it carries this build's flag and ssh key in plain text and every worker can pull it"
+  fi
+  [[ "$(registry_tags "$CH_MULTI" | grep -c .)" == 2 ]] ||
+    fail "the registry holds $(registry_tags "$CH_MULTI" | grep -c .) tag(s) of $CH_MULTI, expected the 2 launched stages: $(registry_tags "$CH_MULTI" | tr '\n' ' ')"
+
+  # Only the front box publishes: `# PUBLISH 22 AS ssh` sits under the work
+  # stage alone, so the instance's port map has exactly one entry.
+  minst=$(launch "$MULTI_BUILD" multi-1 e2e) || fail "launching build $MULTI_BUILD failed"
+  MULTI_INST=$(jq -r .id <<<"$minst")
+  track "$minst" multi-1
+  MULTI_WORKER=$(jq -r .worker <<<"$minst")
+  mpub=$(jq -r .worker_public <<<"$minst")
+  [[ "$(jq -r '.ports | keys | join(" ")' <<<"$minst")" == ssh ]] ||
+    fail "instance $MULTI_INST published ports $(jq -c .ports <<<"$minst"), expected exactly one named ssh: only the $MULTI_FRONT stage carries a PUBLISH directive"
+  mport=$(jq -r .ports.ssh <<<"$minst")
+  (( mport >= PORT_LOW && mport <= PORT_HIGH )) || fail "instance $MULTI_INST got host port $mport, outside CMGR_PORTS $PORT_LOW-$PORT_HIGH"
+  [[ "$(jq -r '.containers | length' <<<"$minst")" == 2 ]] ||
+    fail "instance $MULTI_INST has $(jq -r '.containers | length' <<<"$minst") container(s), expected 2: the '# LAUNCH $MULTI_FRONT $MULTI_BACK' directive names two stages"
+  assert_on_worker "$MULTI_WORKER" "$minst"
+
+  # Which container is which, and what each was given. The stage name is the
+  # container's hostname (cConfig.Hostname, cmgr/docker.go:1025) and its alias
+  # on the instance's network.
+  declare -A MULTI_CID=()
+  declare -A MULTI_INSPECT=()
+  for cid in $(jq -r '.containers[]' <<<"$minst"); do
+    cjson=$(worker_api "$MULTI_WORKER" "/containers/$cid/json") ||
+      fail "could not inspect container $cid of instance $MULTI_INST on $MULTI_WORKER"
+    # Lower-cased throughout: the back stage's name is deliberately mixed case
+    # and docker is free to normalise a hostname or an alias, so nothing here
+    # depends on which case comes back.
+    host=$(jq -r .Config.Hostname <<<"$cjson" | tr 'A-Z' 'a-z')
+    MULTI_CID[$host]=$cid
+    MULTI_INSPECT[$host]=$cjson
+    # Exactly one network, and it is the instance's own: a container that also
+    # sat on the default bridge would reach the registry, the workers' own
+    # subnet and every other instance on the box.
+    nets=$(jq -r '.NetworkSettings.Networks | keys | join(" ")' <<<"$cjson")
+    [[ "$nets" == "cmgr-$MULTI_INST" ]] ||
+      fail "container $host of instance $MULTI_INST is on networks '$nets', expected only cmgr-$MULTI_INST"
+    [[ "$(jq -r --arg h "$host" --arg n "cmgr-$MULTI_INST" '(.NetworkSettings.Networks[$n].Aliases // []) | map(ascii_downcase) | index($h) != null' <<<"$cjson")" == true ]] ||
+      fail "container $host of instance $MULTI_INST does not answer to '$host' on cmgr-$MULTI_INST: the other container reaches it by that name alone"
+    # problem.md sets pidslimit 50 and init true at the top level, and the
+    # work override repeats both. Whichever set the container took, they hold.
+    [[ "$(jq -r .HostConfig.PidsLimit <<<"$cjson")" == 50 ]] ||
+      fail "container $host of instance $MULTI_INST got PidsLimit $(jq -r .HostConfig.PidsLimit <<<"$cjson"), expected 50"
+    [[ "$(jq -r .HostConfig.Init <<<"$cjson")" == true ]] ||
+      fail "container $host of instance $MULTI_INST was not given an init process, although its challenge options ask for one"
+  done
+  # The lower-cased stage names, for indexing the two maps above.
+  MULTI_FRONT_K=$(printf '%s' "$MULTI_FRONT" | tr 'A-Z' 'a-z')
+  MULTI_BACK_K=$(printf '%s' "$MULTI_BACK" | tr 'A-Z' 'a-z')
+  for host in "$MULTI_FRONT_K" "$MULTI_BACK_K"; do
+    [[ -n "${MULTI_CID[$host]:-}" ]] ||
+      fail "instance $MULTI_INST has no container for stage $host (hostnames seen: ${!MULTI_CID[*]})"
+  done
+  # The override replaces rather than merges: 0.5 for work, and the back box
+  # keeps the top-level 0.25. NanoCpus, not NanoCPUs -- that is the Engine
+  # API's spelling, whatever the Go field is called.
+  front_cpu=$(jq -r .HostConfig.NanoCpus <<<"${MULTI_INSPECT[$MULTI_FRONT_K]}")
+  back_cpu=$(jq -r .HostConfig.NanoCpus <<<"${MULTI_INSPECT[$MULTI_BACK_K]}")
+  [[ "$front_cpu" == 500000000 ]] ||
+    fail "the $MULTI_FRONT container of instance $MULTI_INST got NanoCpus $front_cpu, expected 500000000 (its 'overrides: work: cpus: 0.5')"
+  [[ "$back_cpu" == 250000000 ]] ||
+    fail "the $MULTI_BACK container of instance $MULTI_INST got NanoCpus $back_cpu, expected 250000000: it has no override, so it keeps the top-level 'cpus: 0.25'. An override must replace one host's options, not every host's"
+  # Only the front box is bound to a host port. The back box holds the flag.
+  [[ "$(jq -r '.HostConfig.PortBindings | length' <<<"${MULTI_INSPECT[$MULTI_BACK_K]}")" == 0 ]] ||
+    fail "the $MULTI_BACK container of instance $MULTI_INST is bound to a host port: it holds the flag and must be reachable only from $MULTI_FRONT"
+  [[ "$(jq -r '.HostConfig.PortBindings["22/tcp"][0].HostPort' <<<"${MULTI_INSPECT[$MULTI_FRONT_K]}")" == "$mport" ]] ||
+    fail "the $MULTI_FRONT container of instance $MULTI_INST is not bound to host port $mport, the port cmgrd handed the platform"
+  note "instance $MULTI_INST on $mpub: $MULTI_FRONT published at :$mport ($front_cpu nanocpus), $MULTI_BACK unpublished ($back_cpu nanocpus), both on cmgr-$MULTI_INST"
+
+  # The front box answers on its published port, as a competitor would find it.
+  retry 60 "sshd on $mpub:$mport (the $MULTI_FRONT container of instance $MULTI_INST)" \
+    tcp_says "$mpub" "$mport" '' 'SSH-2.0'
+
+  # And the flag really is on the other box, reachable only across the
+  # instance's own network with the key this build minted. One call for the
+  # whole multi-container contract: DNS by stage name, a second container that
+  # was launched and started, and material copied out of the private stage
+  # into both runtime images.
+  got=""
+  retry 90 "the flag to come back from $MULTI_BACK through $MULTI_FRONT on instance $MULTI_INST" multi_flag_over_ssh
+  [[ "$got" == "$MULTI_FLAG" ]] ||
+    fail "the flag on $MULTI_BACK is '$got', but cmgrd reports '$MULTI_FLAG' for build $MULTI_BUILD"
+
+  # Teardown of a multi-container instance: both containers and the network.
+  multi_done=$MULTI_INST
+  [[ "$(api_status DELETE "/instances/$MULTI_INST")" == 204 ]] || fail "stopping instance $MULTI_INST failed"
+  forget "$MULTI_INST"
+  assert_gone "$MULTI_INST" "$MULTI_WORKER" "$minst"
+  MULTI_INST=""
+
+  cmgrd-cli remove-schema "$MULTI_SCHEMA" || fail "remove-schema $MULTI_SCHEMA failed"
+  MULTI_SCHEMA_ADDED=""
+  if has_line "$MULTI_SCHEMA" cmgrd-cli list-schemas; then fail "schema $MULTI_SCHEMA is still listed after remove-schema"; fi
+  has_line "$SCHEMA_NAME" cmgrd-cli list-schemas ||
+    fail "removing schema $MULTI_SCHEMA took schema $SCHEMA_NAME with it"
+  [[ "$(api_status GET "/builds/$MULTI_BUILD")" == 404 ]] || fail "build $MULTI_BUILD survived the removal of its schema"
+  [[ "$(api_status GET "/builds/$OD_BUILD")" == 200 ]] ||
+    fail "build $OD_BUILD of schema $SCHEMA_NAME did not survive the removal of $MULTI_SCHEMA"
+  for host in "$MULTI_FRONT" "$MULTI_BACK"; do
+    if has_line "$(image_tag "$MULTI_META" "$host")" registry_tags "$CH_MULTI"; then
+      fail "the $host image of build $MULTI_BUILD is still in the registry after its schema was removed"
+    fi
+  done
+  ok "schema $MULTI_SCHEMA converged alongside $SCHEMA_NAME without touching its builds or its persistent instance; $CH_MULTI shipped two runtime images and kept '$MULTI_PRIVATE' out of the registry; instance $multi_done ran $MULTI_FRONT (0.5 cpu, published at $mpub:$mport) and $MULTI_BACK (0.25 cpu, unpublished) on one cmgr network and returned its flag over ssh from $MULTI_BACK through $MULTI_FRONT; the stop removed both containers and the network, and remove-schema left $SCHEMA_NAME whole"
+else
+  deselect "a second schema and the multi-container delivery shape"
+fi
+
+# ------------------------------ 15f. losing the race for the write lock
+
+if (( FULL )); then
+  step "database busy: a launch and a stop that lose the race for SQLite's write lock are answered as retryable 503s, and the same requests go through once it is free"
+  # The only coverage of ErrDatabaseBusy in either handler
+  # (cmd/cmgrd/main.go:449 for a launch, :571 for a stop). cmgrd opens the
+  # database with _busy_timeout=100 (cmgr/database.go:246), so a writer
+  # holding the lock for longer than that is exactly the burst that timeout is
+  # sized against; every write on the launch and stop paths goes through
+  # retryableDB (cmgr/database_instances.go:20), and the platform's celery
+  # workers retry a 503 and fail a 500.
+  #
+  # This is the one step that reaches behind the API: nothing cmgrd exposes
+  # can hold its write lock, so it is held from outside with sqlite3 against
+  # the same file, which is why cork-data is mounted into this container.
+  CMGRD_DB=/var/lib/cork/cmgr.db
+  # Can another writer take the lock right now? sqlite3's CLI has no busy
+  # timeout of its own, so BEGIN IMMEDIATE either takes it at once or says it
+  # is locked.
+  db_write_free() { quiet sqlite3 "$CMGRD_DB" 'BEGIN IMMEDIATE; ROLLBACK;'; }
+  db_write_locked() { ! db_write_free; }
+  # Every instance cmgrd records, of every build of every challenge. Counted
+  # from the system dump rather than from the workers, so an instance whose
+  # worker has left the fleet is still counted.
+  instance_rows() { cmgrd-cli system-dump | jq -r '[.[] | .builds[]?.instances[]?] | length'; }
+  if command -v sqlite3 >/dev/null 2>&1 && [[ -w "$CMGRD_DB" ]]; then
+    dbtmp=$(mktemp -d)
+    # BEGIN IMMEDIATE takes the write lock at once; the sleep holds sqlite3's
+    # stdin open, and the transaction with it. It is released explicitly
+    # below, and the sleep is only a backstop so a run that dies mid-step
+    # cannot wedge cmgrd for the rest of its life.
+    ( printf 'BEGIN IMMEDIATE;\n'; sleep 120 ) | sqlite3 "$CMGRD_DB" >/dev/null 2>&1 &
+    DB_LOCK_PID=$!
+    retry 10 "the write lock on $CMGRD_DB to be held by the stand-in writer" db_write_locked
+
+    before_inst=$(instance_rows)
+    [[ "$before_inst" =~ ^[0-9]+$ ]] || fail "could not count the instance records before the refused launch: '$before_inst'"
+    timed_launch "$dbtmp" busy "$OD_BUILD" "$(jq -cn '{user_id: "db-busy", env: {CUSTOM_VAR: "e2e"}}')"
+    read -r code _ <"$dbtmp/busy.code"
+    [[ "$code" == 503 ]] ||
+      fail "a launch that lost the race for the write lock answered HTTP $code, not 503: $(head -c 300 "$dbtmp/busy.body"). ErrDatabaseBusy is retryable, and the platform retries a 503 and fails a 500 (cmd/cmgrd/main.go:449)"
+    grep -qi '^retry-after:' "$dbtmp/busy.head" ||
+      fail "the 503 for a launch that lost the write lock carried no Retry-After: $(tr -d '\r' <"$dbtmp/busy.head" | head -20)"
+    grep -qi 'database busy' "$dbtmp/busy.body" ||
+      fail "the 503 body does not name the database: $(head -c 300 "$dbtmp/busy.body"). A launch refused as overloaded or busy is reported the same way, and this step would be asserting nothing"
+    # openInstance is the first write on the launch path and it runs before
+    # anything reaches a daemon (cmgr/api.go:337), so a launch refused here
+    # left no record and no container to reap.
+    after_inst=$(instance_rows)
+    [[ "$after_inst" == "$before_inst" ]] ||
+      fail "the launch refused for a busy database left an instance record behind: $before_inst before, $after_inst after"
+
+    # A stop loses the same race and is answered the same way. One request for
+    # status, headers and body: a second DELETE would be a different race.
+    busy_id=${OD_IDS[0]}
+    busy_meta=${INST_META[$busy_id]}
+    curl -sS --connect-timeout 5 --max-time "$API_TIMEOUT" \
+      -o "$dbtmp/stop.body" -D "$dbtmp/stop.head" -w '%{http_code}' \
+      -X DELETE "$CMGRD_SERVER/instances/$busy_id" >"$dbtmp/stop.code" 2>/dev/null || true
+    code=$(cat "$dbtmp/stop.code")
+    [[ "$code" == 503 ]] ||
+      fail "a stop that lost the race for the write lock answered HTTP $code, not 503: $(head -c 300 "$dbtmp/stop.body") (cmd/cmgrd/main.go:571)"
+    grep -qi '^retry-after:' "$dbtmp/stop.head" ||
+      fail "the 503 for a stop that lost the write lock carried no Retry-After"
+
+    kill "$DB_LOCK_PID" >/dev/null 2>&1 || true
+    wait "$DB_LOCK_PID" 2>/dev/null || true
+    DB_LOCK_PID=""
+    retry 15 "the write lock on $CMGRD_DB to be free again" db_write_free
+
+    # The retry the platform would make, for both verbs.
+    inst=$(launch "$OD_BUILD" db-busy e2e) ||
+      fail "the launch retried after the write lock was released still failed: a retryable 503 must mean the same request goes through moments later"
+    track "$inst" db-busy
+    assert_on_worker "$(jq -r .worker <<<"$inst")" "$inst"
+    [[ "$(api_status DELETE "/instances/$busy_id")" == 204 ]] ||
+      fail "the stop retried after the write lock was released still failed"
+    assert_gone "$busy_id" "${INST_WORKER[$busy_id]}" "$busy_meta"
+    forget "$busy_id"
+    rm -rf "$dbtmp"
+    ok "a launch and a stop that lost the race for the write lock were both 503 + Retry-After naming the database, the refused launch left no record and reached no daemon, and both requests went through unchanged once the lock was released"
+  else
+    skip "database busy: needs sqlite3 in this image and cmgrd's database mounted here (see e2e/cork.Dockerfile and the cork-data mount in e2e/compose.yaml)"
+  fi
+else
+  deselect "database busy: a launch and a stop that lose the write lock are retryable 503s"
+fi
 
 # -------------------------------------------------------------- 16. teardown
 

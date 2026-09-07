@@ -226,6 +226,7 @@ services:
       CMGRD_SERVER: http://cork:4200
       E2E_WORKERS: "172.28.0.11=worker-a 172.28.0.12=worker-b"
       E2E_SCHEMA: /opt/e2e/schema.yaml
+      E2E_SCHEMA_FULL: /opt/e2e/schema-full.yaml
       E2E_REGISTRY: zot.internal
       E2E_CHAOS: ${E2E_CHAOS:-1}
       E2E_FULL: ${E2E_FULL:-0}
@@ -236,10 +237,15 @@ services:
     volumes:
       - ./scenario.sh:/opt/e2e/scenario.sh:ro
       - ./schema.yaml:/opt/e2e/schema.yaml:ro
+      - ./schema-full.yaml:/opt/e2e/schema-full.yaml:ro
       - ${CHALLENGE_DIR:-../examples}:/challenges-seed:ro
       - challenges:/challenges
       - cork-docker-certs:/root/.docker_certs:ro
       - cork-registry-certs:/etc/docker/certs.d/zot.internal:ro
+      # cmgrd's own state, writable, for the one step that has to hold
+      # SQLite's write lock from outside cmgrd. Nothing else reads it: every
+      # other assertion goes through the HTTP API.
+      - cork-data:/var/lib/cork
       # The outer docker socket (host-root-equivalent) is for the chaos steps
       # only: restarting cork, stopping or replacing a telemetry sidecar,
       # pausing a worker's dockerd. If it is missing or unreachable those
