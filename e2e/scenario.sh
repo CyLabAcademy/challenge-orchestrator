@@ -228,10 +228,12 @@ MAKE_TAG_DELETED=""   # a $CH_MAKE tag this run deleted from zot and still owes 
 MULTI_SCHEMA_ADDED="" # a second schema this run added and still owes a remove-schema
 MULTI_INST=""         # its multi-container instance, if the run dies between launch and stop
 DB_LOCK_PID=""        # a sqlite3 holding cmgrd's write lock open on purpose
+DB_LOCK_FD=""         # the write end of the fifo feeding it, kept open by this shell
 cleanup() {
   local status=$? fake
   # Before anything else: while the stand-in writer holds cmgrd's write
   # lock, every API call below would be refused as a busy database.
+  if [[ -n "$DB_LOCK_FD" ]]; then exec {DB_LOCK_FD}>&- 2>/dev/null || true; DB_LOCK_FD=""; fi
   if [[ -n "$DB_LOCK_PID" ]]; then kill "$DB_LOCK_PID" >/dev/null 2>&1 || true; fi
   if [[ -n "$TRAFFIC_STOP" ]]; then touch "$TRAFFIC_STOP" 2>/dev/null || true; fi
   # Before anything that needs a daemon: it cannot fail, and it is what
@@ -646,20 +648,6 @@ exec_in() {
     -d '{"Detach": false, "Tty": true}' | tr -d '\r'
 }
 
-# outer_exec <outer container id> <cmd...>: like exec_in, but on the daemon
-# this fleet runs on, so it can look inside a worker container rather than
-# inside a challenge container running on one. Chaos steps only: it needs the
-# outer socket.
-outer_exec() {
-  local cid=$1 eid req
-  shift
-  req=$(printf '%s\n' "$@" | jq -cRn '{AttachStdout: true, AttachStderr: true, Tty: true, Cmd: [inputs]}')
-  eid=$(outer "/containers/$cid/exec" -X POST -H 'Content-Type: application/json' -d "$req" | jq -r '.Id // empty')
-  [[ -n "$eid" ]] || return 1
-  outer "/exec/$eid/start" -X POST -H 'Content-Type: application/json' \
-    -d '{"Detach": false, "Tty": true}' | tr -d '\r'
-}
-
 # manual_builds <challenge> <seed>: the ids of hand-made builds (cmgrd-cli
 # build, not a schema's) of that challenge and seed. The full-mode registry
 # steps make one and destroy it again; a run killed before its EXIT trap leaves
@@ -774,6 +762,26 @@ for ip in "${WORKER_IPS[@]}"; do
   runtime=$(jq -r '.DefaultRuntime // "unknown"' <<<"$info")
   [[ "$runtime" == "oci-interceptor" ]] ||
     fail "worker $ip has default runtime '$runtime', not oci-interceptor: the fleet is not exercising the runtime chain production runs (e2e/worker/daemon.json, e2e/worker.Dockerfile)"
+  # And it must be OUR wrapper that dockerd registered, with no runtimeArgs.
+  #
+  # This is the only thing in the fleet that can see the regression the whole
+  # wrapper design exists for. Give a runtime a non-empty runtimeArgs and
+  # docker writes its own wrapper -- "#!/bin/sh\n<path> <args> $@", no exec --
+  # and registers THAT instead, leaving a shell between the containerd shim
+  # and runc for the lifetime of every runtime call. A cancelled `runc delete`
+  # then SIGKILLs the shell and orphans runc, and its shim never shuts down:
+  # 66 of them, ~5 MiB each, measured on a 2 GiB worker.
+  #
+  # Nothing observable inside a container can catch that, because the
+  # generated wrapper still invokes the interceptor and the spec is still
+  # rewritten -- the read-only mounts asserted later are identical either way.
+  # The registered path and runtimeArgs are where the two differ.
+  rt_path=$(jq -r '.Runtimes["oci-interceptor"].path // "absent"' <<<"$info")
+  rt_args=$(jq -r '.Runtimes["oci-interceptor"].runtimeArgs // [] | length' <<<"$info")
+  [[ "$rt_path" == /usr/local/bin/oci-interceptor-runtime.sh ]] ||
+    fail "worker $ip registered oci-interceptor as '$rt_path', not the exec'ing wrapper e2e/worker/daemon.json names. A path under /var/lib/docker/runtimes/ means docker generated its own wrapper because runtimeArgs is non-empty, and that wrapper does not exec: it stays between the containerd shim and runc and leaks a shim per cancelled runtime call"
+  [[ "$rt_args" == 0 ]] ||
+    fail "worker $ip has $rt_args runtimeArgs on the oci-interceptor runtime; it must have none. Docker generates a non-exec'ing wrapper for any runtime whose runtimeArgs is non-empty, which re-inserts the process layer oci-interceptor v0.3.0 removed. The interceptor's flags belong in e2e/worker/oci-interceptor-runtime.sh, which execs"
   sweep_worker "$ip"
 done
 ok "cmgrd $(api GET /version | jq -r .version), zot, builder, and $NWORKERS workers (dockerd on nftables + oci-interceptor + telemetry) answer"
@@ -1326,13 +1334,19 @@ for path in /etc/hosts /etc/hostname /etc/resolv.conf; do
   [[ -n "$opts" ]] ||
     fail "$path is not a mount inside container $oci_cid of instance $oci_id: expected docker's bind mount (seen: $(tr '\n' ';' <<<"$mounts"))"
   [[ "$opts" == ro,* || "$opts" == ro ]] ||
-    fail "$path is mounted '$opts' inside container $oci_cid of instance $oci_id, not read-only: oci-interceptor did not rewrite this container's spec, so either it is not in the create path or docker generated a wrapper script for it (which happens whenever runtimeArgs is non-empty, and that wrapper does not exec)"
+    fail "$path is mounted '$opts' inside container $oci_cid of instance $oci_id, not read-only: oci-interceptor did not rewrite this container's spec, so it is not in the create path at all. Note this cannot tell you whether docker generated a wrapper for it -- the generated wrapper still invokes the interceptor and the spec is still rewritten. The fleet-wait step is what checks that, on the registered runtime"
 done
-# And the effect a competitor would meet.
-wrote=$(exec_in "$oci_worker" "$oci_cid" root sh -c 'echo probe >> /etc/hosts 2>&1 && echo WROTE' || true)
-if [[ "$wrote" == *WROTE* ]]; then
-  fail "a write to /etc/hosts inside container $oci_cid of instance $oci_id succeeded although the mount reports read-only"
-fi
+# And the effect a competitor would meet. The container reports the verdict
+# either way, so an exec that never ran (a wedged daemon, a container that has
+# exited, an image without /bin/sh) is an empty answer and fails here rather
+# than passing for the silence.
+wrote=$(exec_in "$oci_worker" "$oci_cid" root \
+  sh -c 'if echo probe >> /etc/hosts 2>/dev/null; then echo WROTE; else echo REFUSED; fi' || true)
+case "$wrote" in
+  *WROTE*) fail "a write to /etc/hosts inside container $oci_cid of instance $oci_id succeeded although the mount reports read-only" ;;
+  *REFUSED*) : ;;
+  *) fail "the write probe inside container $oci_cid of instance $oci_id answered neither WROTE nor REFUSED ('$wrote'): the exec did not run, so this step proved nothing about the mount being enforced" ;;
+esac
 ok "instance $oci_id went through oci-interceptor on $oci_worker: /etc/hosts, /etc/hostname and /etc/resolv.conf are all mounted read-only in its container, the mounts are still present (so docker's embedded resolver still works), and a write to /etc/hosts was refused"
 
 ############################################################################
@@ -4611,6 +4625,14 @@ if (( FULL )); then
     fi
     grep -q "image pull timed out" <<<"$body" ||
       fail "the 503 does not name the pull timeout, so it is some other retryable refusal and this step proved nothing: $(head -c 200 <<<"$body")"
+    # Which of the two deadlines ended the wait. Both wordings carry the text
+    # above, so without this the step cannot tell the daemon's registry
+    # timeout (registryTimedOut, cmgr/docker.go) from cmgrd's own context
+    # expiring -- and it is the first that fires here and the first that had
+    # no coverage. If this ever trips because the daemon stopped bounding its
+    # registry requests, the fix is to say so, not to drop the check.
+    grep -q "on the daemon's own registry timeout" <<<"$body" ||
+      fail "the 503 names a pull timeout but not the daemon's own registry timeout, so cmgrd's context deadline is what expired: registryTimedOut no longer classifies what the daemon reports, and a pull that hung would be a 500 again on any deployment where the daemon gives up first ($(head -c 250 <<<"$body"))"
     # The regression's fingerprint, visible in the body before any health
     # read: noteWorkerTransportError on a timed-out pull marks the worker
     # down, and launch (cmgr/launch.go:91-96) then re-wraps that very error as
@@ -5035,6 +5057,14 @@ if (( FULL )); then
       fail "the $host image of build $MULTI_BUILD is still in the registry after its schema was removed"
     fi
   done
+  # And on the builder, which is the only place the private stage ever
+  # existed: it is never pushed, so the registry check above cannot see it,
+  # and it carries this build's flag and Alice's private key in plain text.
+  for host in "$MULTI_FRONT" "$MULTI_BACK" "$MULTI_PRIVATE"; do
+    if has_line "$E2E_REGISTRY/$CH_MULTI:$(image_tag "$MULTI_META" "$host")" builder_tags; then
+      fail "the $host image of build $MULTI_BUILD is still on the builder after its schema was removed; destroyImages left it behind$([[ "$host" == "$MULTI_PRIVATE" ]] && printf ' -- and that stage holds the flag and the ssh key in plain text')"
+    fi
+  done
   ok "schema $MULTI_SCHEMA converged alongside $SCHEMA_NAME without touching its builds or its persistent instance; $CH_MULTI shipped two runtime images and kept '$MULTI_PRIVATE' out of the registry; instance $multi_done ran $MULTI_FRONT (0.5 cpu, published at $mpub:$mport) and $MULTI_BACK (0.25 cpu, unpublished) on one cmgr network and returned its flag over ssh from $MULTI_BACK through $MULTI_FRONT; the stop removed both containers and the network, and remove-schema left $SCHEMA_NAME whole"
 else
   deselect "a second schema and the multi-container delivery shape"
@@ -5067,12 +5097,30 @@ if (( FULL )); then
   instance_rows() { cmgrd-cli system-dump | jq -r '[.[] | .builds[]?.instances[]?] | length'; }
   if command -v sqlite3 >/dev/null 2>&1 && [[ -w "$CMGRD_DB" ]]; then
     dbtmp=$(mktemp -d)
-    # BEGIN IMMEDIATE takes the write lock at once; the sleep holds sqlite3's
-    # stdin open, and the transaction with it. It is released explicitly
-    # below, and the sleep is only a backstop so a run that dies mid-step
-    # cannot wedge cmgrd for the rest of its life.
-    ( printf 'BEGIN IMMEDIATE;\n'; sleep 120 ) | sqlite3 "$CMGRD_DB" >/dev/null 2>&1 &
+    # ONE process holds the lock, fed through a fifo this shell keeps open.
+    #
+    # Not `( printf ...; sleep N ) | sqlite3 &`: $! there names sqlite3, but
+    # bash's `wait <pid>` waits for the JOB, and the job also holds the
+    # sleeping subshell -- which nothing signals and which never writes to the
+    # closed pipe again, so it takes no SIGPIPE. Waiting on it idled out the
+    # backstop here; NOT waiting on it let it survive to the teardown's bare
+    # `wait`, where it was charged to the concurrent-stop timing and tripped
+    # the leaked-slot guard. Neither is fixable while a second process exists.
+    #
+    # With a fifo, sqlite3 is the only process and the lock is released on
+    # EOF, which arrives when the descriptor below is closed -- or when this
+    # shell dies, which makes the backstop automatic rather than a timer.
+    #
+    # .timeout so it waits for the lock rather than being refused outright:
+    # db_write_locked probes by taking the very same lock, and without this the
+    # probe could win the race and leave this BEGIN IMMEDIATE rejected, with
+    # nothing holding the lock for the rest of the step.
+    lock_fifo="$dbtmp/lock.fifo"
+    mkfifo "$lock_fifo" || fail "could not create the fifo feeding the stand-in writer"
+    sqlite3 "$CMGRD_DB" <"$lock_fifo" >/dev/null 2>&1 &
     DB_LOCK_PID=$!
+    exec {DB_LOCK_FD}>"$lock_fifo"
+    printf '.timeout 5000\nBEGIN IMMEDIATE;\n' >&"$DB_LOCK_FD"
     retry 10 "the write lock on $CMGRD_DB to be held by the stand-in writer" db_write_locked
 
     before_inst=$(instance_rows)
@@ -5105,10 +5153,21 @@ if (( FULL )); then
     grep -qi '^retry-after:' "$dbtmp/stop.head" ||
       fail "the 503 for a stop that lost the write lock carried no Retry-After"
 
-    kill "$DB_LOCK_PID" >/dev/null 2>&1 || true
+    # Closing the write end is what releases the lock: sqlite3 reads EOF and
+    # exits, rolling the open transaction back. wait is safe now -- there is
+    # exactly one process in this job and it is on its way out.
+    exec {DB_LOCK_FD}>&-
+    DB_LOCK_FD=""
     wait "$DB_LOCK_PID" 2>/dev/null || true
     DB_LOCK_PID=""
     retry 15 "the write lock on $CMGRD_DB to be free again" db_write_free
+
+    # A refused stop must leave the instance still RECORDED, whatever it did
+    # to the containers: that is what makes it retryable rather than a
+    # half-completed teardown the platform can never finish. Checked before
+    # the retry, because afterwards there is nothing left to distinguish.
+    [[ "$(api_status GET "/instances/$busy_id")" == 200 ]] ||
+      fail "the stop refused for a busy database removed instance $busy_id's record anyway: a 503 must leave the platform something to retry"
 
     # The retry the platform would make, for both verbs.
     inst=$(launch "$OD_BUILD" db-busy e2e) ||
@@ -5117,7 +5176,11 @@ if (( FULL )); then
     assert_on_worker "$(jq -r .worker <<<"$inst")" "$inst"
     [[ "$(api_status DELETE "/instances/$busy_id")" == 204 ]] ||
       fail "the stop retried after the write lock was released still failed"
-    assert_gone "$busy_id" "${INST_WORKER[$busy_id]}" "$busy_meta"
+    # Records only. The containers may already have gone with the refused
+    # attempt, so their absence is not evidence about this request.
+    [[ "$(api_status GET "/instances/$busy_id")" == 404 ]] ||
+      fail "instance $busy_id is still known to cmgrd after its stop was retried"
+    assert_gone_from_worker "${INST_WORKER[$busy_id]}" "$busy_id" "$busy_meta"
     forget "$busy_id"
     rm -rf "$dbtmp"
     ok "a launch and a stop that lost the race for the write lock were both 503 + Retry-After naming the database, the refused launch left no record and reached no daemon, and both requests went through unchanged once the lock was released"

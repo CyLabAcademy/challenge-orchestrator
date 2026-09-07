@@ -169,9 +169,15 @@ instance's container, and still mounted (docker points a container on a
 user-defined network at its embedded resolver by writing into that
 bind-mounted `resolv.conf`, so removing the mount would break resolution of
 sibling containers by name). Nothing else in the fleet makes those three
-read-only, so the assertion fails if the interceptor is out of the create path
-for any reason — including a `runtimeArgs` that puts docker's own
-non-exec'ing wrapper back in front of it.
+read-only, so it fails if the interceptor is out of the create path.
+
+That check deliberately says nothing about *how* the interceptor is invoked,
+because it cannot: docker's generated wrapper still runs the interceptor, so
+the spec is still rewritten and the mounts are read-only either way. The
+non-exec'ing wrapper — the thing that leaks shims — is caught in the
+fleet-wait step instead, which requires dockerd to have registered our own
+wrapper path with no `runtimeArgs`. A generated wrapper registers a path under
+`/var/lib/docker/runtimes/`, and that is the difference the fleet can see.
 
 Full mode adds, among others: a **multi-container** launch (two containers on
 one `cmgr-<id>` network, only the front box published, a per-stage `overrides:`
