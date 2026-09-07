@@ -1,0 +1,98 @@
+name: e2e
+
+# Manual only. The scenario brings up a seven-container fleet, builds cork and
+# the challenge images inside it, and takes minutes rather than seconds -- it is
+# not something to run on every push. Trigger it from the Actions tab, or:
+#   gh workflow run e2e.yml -f mode=full
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which steps to run"
+        type: choice
+        options:
+          - regular
+          - full
+        default: regular
+      chaos:
+        description: "Run the chaos steps (stop a sidecar, pause a worker's dockerd, restart cork)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.mode }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scenario:
+    name: ${{ inputs.mode }} mode
+    runs-on: ubuntu-latest
+    # Locally: regular ~5 min, full ~10 min, plus a few minutes to build cork,
+    # the worker image (which compiles oci-interceptor) and the challenge images.
+    # A hosted runner has fewer cores, so this is generous on purpose -- it is a
+    # backstop against a wedged fleet, not a target.
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # run.sh stamps the cork image with `git describe`, which the scenario
+          # prints and asserts against; a shallow clone has no tags to describe.
+          fetch-depth: 0
+
+      - name: Runner facts
+        run: |
+          echo "docker:  $(docker --version)"
+          echo "compose: $(docker compose version --short)"
+          echo "kernel:  $(uname -r)"
+          echo "cpus:    $(nproc)   mem: $(free -h | awk '/Mem:/{print $2}')"
+          df -h / | tail -1
+
+      - name: Run the scenario
+        working-directory: e2e
+        env:
+          # The chaos steps need the runner's own docker socket, which
+          # compose.yaml mounts into the scenario container. Turning this off
+          # makes them report `skip`, and the verdict says so.
+          E2E_CHAOS: ${{ inputs.chaos && '1' || '0' }}
+        run: |
+          if [ "${{ inputs.mode }}" = "full" ]; then
+            bash run.sh --full
+          else
+            bash run.sh
+          fi
+
+      # The scenario says which step failed; these say why. Every placement
+      # decision, pull and health transition cork made is in its log.
+      - name: Collect fleet logs
+        if: failure()
+        working-directory: e2e
+        run: |
+          mkdir -p ../e2e-logs
+          docker compose logs --no-color --timestamps > ../e2e-logs/compose.log 2>&1 || true
+          for s in cork builder zot worker-a worker-b worker-a-telemetry worker-b-telemetry; do
+            docker compose logs --no-color --timestamps "$s" > "../e2e-logs/$s.log" 2>&1 || true
+          done
+          docker compose ps --all > ../e2e-logs/ps.txt 2>&1 || true
+          echo "--- cork, last 100 lines ---"
+          tail -100 ../e2e-logs/cork.log || true
+
+      - name: Upload fleet logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-${{ inputs.mode }}-logs
+          path: e2e-logs/
+          retention-days: 7
+
+      # -v because the challenge volume is only seeded when it is empty, and the
+      # zot and builder volumes carry pushed tags: a fleet left standing makes
+      # the next run read stale state as a failure.
+      - name: Tear the fleet down
+        if: always()
+        working-directory: e2e
+        run: docker compose down -v --remove-orphans
