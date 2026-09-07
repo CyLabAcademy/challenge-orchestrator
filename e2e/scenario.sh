@@ -646,6 +646,20 @@ exec_in() {
     -d '{"Detach": false, "Tty": true}' | tr -d '\r'
 }
 
+# outer_exec <outer container id> <cmd...>: like exec_in, but on the daemon
+# this fleet runs on, so it can look inside a worker container rather than
+# inside a challenge container running on one. Chaos steps only: it needs the
+# outer socket.
+outer_exec() {
+  local cid=$1 eid req
+  shift
+  req=$(printf '%s\n' "$@" | jq -cRn '{AttachStdout: true, AttachStderr: true, Tty: true, Cmd: [inputs]}')
+  eid=$(outer "/containers/$cid/exec" -X POST -H 'Content-Type: application/json' -d "$req" | jq -r '.Id // empty')
+  [[ -n "$eid" ]] || return 1
+  outer "/exec/$eid/start" -X POST -H 'Content-Type: application/json' \
+    -d '{"Detach": false, "Tty": true}' | tr -d '\r'
+}
+
 # manual_builds <challenge> <seed>: the ids of hand-made builds (cmgrd-cli
 # build, not a schema's) of that challenge and seed. The full-mode registry
 # steps make one and destroy it again; a run killed before its EXIT trap leaves
@@ -750,11 +764,19 @@ for ip in "${WORKER_IPS[@]}"; do
   # A worker that fell back to iptables still passes every other step, while
   # behaving nothing like production: network setup there grows with the
   # number of challenge networks on the box.
-  backend=$(worker_api "$ip" /info | jq -r '.FirewallBackend.Driver // "unknown"')
+  info=$(worker_api "$ip" /info)
+  backend=$(jq -r '.FirewallBackend.Driver // "unknown"' <<<"$info")
   [[ "$backend" == "nftables" ]] || fail "worker $ip programs its firewall with $backend, not nftables"
+  # oci-interceptor is the default runtime on a production worker, so every
+  # container cmgrd creates goes through it. A worker running plain runc passes
+  # every other step here while exercising a different runtime chain -- and the
+  # chain is where the shim leak lived.
+  runtime=$(jq -r '.DefaultRuntime // "unknown"' <<<"$info")
+  [[ "$runtime" == "oci-interceptor" ]] ||
+    fail "worker $ip has default runtime '$runtime', not oci-interceptor: the fleet is not exercising the runtime chain production runs (e2e/worker/daemon.json, e2e/worker.Dockerfile)"
   sweep_worker "$ip"
 done
-ok "cmgrd $(api GET /version | jq -r .version), zot, builder, and $NWORKERS workers (dockerd on nftables + telemetry) answer"
+ok "cmgrd $(api GET /version | jq -r .version), zot, builder, and $NWORKERS workers (dockerd on nftables + oci-interceptor + telemetry) answer"
 
 ########################################################################
 # BLOCK 1 of 4 — after the "waiting for the fleet" step (see insertAfter)
@@ -1275,6 +1297,43 @@ for id in "${OD_IDS[@]}"; do
   note "instance $id: ${PUBLIC[${INST_WORKER[$id]}]} serves e2e-user-${INST_USER[$id]} with flag $OD_FLAG"
 done
 ok "every instance answers with its own user_id and env"
+
+# ------------------------------- 5c. the runtime shim is really in the path
+
+step "oci-interceptor: the runtime shim production runs is in the create path, and the networking mounts it makes read-only really are"
+# /info reporting the default runtime says only that dockerd was configured
+# with it. This says the interceptor actually ran for a container cmgrd
+# created, because the only thing that makes these three mounts read-only is
+# the interceptor rewriting the OCI spec on the way past.
+#
+# The property is not cosmetic. Docker bind-mounts /etc/hosts, /etc/hostname
+# and /etc/resolv.conf read/write, and where a container's writable layer is
+# capped by an XFS project quota those three files are outside it -- an escape
+# hatch for filling the host volume from inside a challenge. The mounts are
+# left in place rather than removed: docker points a container on a
+# user-defined network at its embedded resolver by writing
+# "nameserver 127.0.0.11" into that bind-mounted resolv.conf, so removing it
+# would break resolution of sibling containers by name.
+oci_id=${OD_IDS[0]}
+oci_meta=${INST_META[$oci_id]}
+oci_worker=${INST_WORKER[$oci_id]}
+oci_cid=$(jq -r '.containers[0]' <<<"$oci_meta")
+mounts=$(exec_in "$oci_worker" "$oci_cid" root \
+  sh -c "grep -E ' /etc/(hosts|hostname|resolv[.]conf) ' /proc/mounts") ||
+  fail "could not read /proc/mounts inside container $oci_cid of instance $oci_id on $oci_worker"
+for path in /etc/hosts /etc/hostname /etc/resolv.conf; do
+  opts=$(awk -v p="$path" '$2 == p {print $4}' <<<"$mounts")
+  [[ -n "$opts" ]] ||
+    fail "$path is not a mount inside container $oci_cid of instance $oci_id: expected docker's bind mount (seen: $(tr '\n' ';' <<<"$mounts"))"
+  [[ "$opts" == ro,* || "$opts" == ro ]] ||
+    fail "$path is mounted '$opts' inside container $oci_cid of instance $oci_id, not read-only: oci-interceptor did not rewrite this container's spec, so either it is not in the create path or docker generated a wrapper script for it (which happens whenever runtimeArgs is non-empty, and that wrapper does not exec)"
+done
+# And the effect a competitor would meet.
+wrote=$(exec_in "$oci_worker" "$oci_cid" root sh -c 'echo probe >> /etc/hosts 2>&1 && echo WROTE' || true)
+if [[ "$wrote" == *WROTE* ]]; then
+  fail "a write to /etc/hosts inside container $oci_cid of instance $oci_id succeeded although the mount reports read-only"
+fi
+ok "instance $oci_id went through oci-interceptor on $oci_worker: /etc/hosts, /etc/hostname and /etc/resolv.conf are all mounted read-only in its container, the mounts are still present (so docker's embedded resolver still works), and a write to /etc/hosts was refused"
 
 ############################################################################
 # BLOCK 2 -- full-mode step, goes after the on-demand-instances ok (line 687)

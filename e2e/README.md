@@ -162,6 +162,17 @@ pull, and health transition is logged there.
     builder and zot hold no tag of any generation, and the edited sources are
     restored.
 
+Regular mode asserts that a launched container really went through the
+interceptor, not merely that dockerd was configured with it: `/etc/hosts`,
+`/etc/hostname` and `/etc/resolv.conf` are mounted read-only in a live
+instance's container, and still mounted (docker points a container on a
+user-defined network at its embedded resolver by writing into that
+bind-mounted `resolv.conf`, so removing the mount would break resolution of
+sibling containers by name). Nothing else in the fleet makes those three
+read-only, so the assertion fails if the interceptor is out of the create path
+for any reason — including a `runtimeArgs` that puts docker's own
+non-exec'ing wrapper back in front of it.
+
 Full mode adds, among others: a **multi-container** launch (two containers on
 one `cmgr-<id>` network, only the front box published, a per-stage `overrides:`
 block giving each container its own CPU ceiling, the private `builder` stage
@@ -231,10 +242,22 @@ drive other content with `cmgrd-cli`.
 
 - The builder is reached over plain TCP inside the compose network instead of
   the orchestrator's unix socket, and it is a separate container.
-- Worker dockerds run the subset of `daemon.json` that matters to cork
-  (hosts, TLS, address pools, logging). No userns remap, oci-interceptor,
-  cgroup parent, XFS quotas, docker-reaper, or ufw. The address pool is
+- Worker dockerds run the subset of `daemon.json` that matters to cork: hosts,
+  TLS, address pools, logging, the **nftables firewall backend** and
+  **oci-interceptor as the default runtime**. Still absent: userns remap,
+  cgroup parent, XFS quotas, docker-reaper, ufw. The address pool is
   `10.201.0.0/16` rather than `192.168.0.0/16` to stay clear of home LANs.
+- The interceptor is built from source for musl (`worker.Dockerfile`) because
+  the project releases only a glibc binary and these workers are Alpine, and
+  `daemon.json` names **a wrapper script that execs**
+  (`worker/oci-interceptor-runtime.sh`), not the binary — the same shape the
+  `multihost_docker` role deploys, and for the same reason. Docker generates
+  its own wrapper for any runtime whose `runtimeArgs` is non-empty and that
+  generated wrapper does not `exec`, so it stays in the process tree between
+  the containerd shim and runc; a cancelled `runc delete` then orphans the
+  runtime and leaks its shim. Keep this file and the role's
+  `oci_interceptor_runtime.sh.j2` in step: the point of running the interceptor
+  here is that the fleet exercises the runtime chain production runs.
 - Telemetry samples the docker VM's `/proc`, not a per-worker host, so it only
   reports overloaded when the whole machine is.
 - The registry is `zot.internal` on 443 rather than `<host>:5000`: the address

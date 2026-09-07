@@ -9,6 +9,13 @@
 
     "firewall-backend": "nftables",
 
+    "default-runtime": "oci-interceptor",
+    "runtimes": {
+        "oci-interceptor": {
+            "path": "/usr/local/bin/oci-interceptor-runtime.sh"
+        }
+    },
+
     "default-address-pools": [
         {"base": "10.201.0.0/16", "size": 29}
     ],
