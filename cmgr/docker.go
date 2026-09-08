@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/docker/go-units"
 	"github.com/jmoiron/sqlx"
+	"github.com/moby/moby/api/types/build"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/api/types/strslice"
@@ -600,6 +601,11 @@ func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
 
 	// Setup build options
 	opts := client.ImageBuildOptions{
+		// BuildKit rather than the daemon's default. The API defaults to the
+		// legacy builder when no version is sent, and that builder is
+		// deprecated; it also keeps its cache as untagged images in the image
+		// store, which is what made cache and image lifetime the same problem.
+		Version:    build.BuilderBuildKit,
 		Remove:     true,
 		Tags:       []string{imageName},
 		Target:     "base",
@@ -680,6 +686,9 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 		// Setup build options
 		opts := client.ImageBuildOptions{
+			// See freezeBaseImage: BuildKit is selected explicitly, never
+			// inherited from the daemon default.
+			Version: build.BuilderBuildKit,
 			BuildArgs: map[string]*string{
 				"FLAG_FORMAT": &bMeta.Format,
 				"SEED":        &seedStr,
