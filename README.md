@@ -27,6 +27,8 @@ The minimal cork setup requires three servers:
 
 In theory you could run the workers using cork's local docker engine and run zot on the orchestrator as well. However, you'd still need to configure all three components.
 
+The orchestrator builds with BuildKit, pins its base images by digest, and publishes an inline layer cache to the registry. [BUILDER.md](BUILDER.md) covers how that works, how to move a base image, and what not to do to the builder.
+
 ## Setup
 
 There is no quickstart. This product is meant for deployment in production, not testing. If you're a challenge developer, please follow the readme in [cmgr](https://github.com/picoCTF/cmgr) instead.
@@ -224,6 +226,7 @@ If you would like to run your challenges manually, use the start and stop comman
 | CMGR_WORKER_CONTROL_TIMEOUT | Ceiling for one container/network call to a worker's dockerd; hitting it marks the worker down                                     | 30s                                                                      |
 | CMGR_WORKER_PULL_TIMEOUT | Ceiling for one image pull before a launch; hitting it fails the launch as retryable (503) only. A restart during an update pulls under a 5m ceiling, or this value when it is longer | 30s                                                                      |
 | CMGR_WORKER_LAUNCH_WAIT  | How long a launch waits for a launch slot before failing as retryable (503 with Retry-After); one that would evidently wait longer is refused at once | 10s                                                                      |
+| CMGR_BASE_PINS           | JSON map of base image reference to digest. When present, `FROM name:tag` is rewritten to the digest in the build context, so the builder never re-resolves a mutable tag. See [BUILDER.md](BUILDER.md) | \<CMGR_DIR\>/base-pins.json (commit it at the corpus root; see BUILDER.md)                       |
 | CMGR_REGISTRY            | Registry host location                                                                                                             | unset, set with an IP                                                    |
 | CMGR_REGISTRY_USER       | Unused                                                                                                                             | unset                                                                    |
 | CMGR_REGISTRY_TOKEN      | Unused, identity set by TLS cert                                                                                                   | unset                                                                    |
