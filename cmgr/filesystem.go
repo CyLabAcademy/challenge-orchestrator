@@ -274,6 +274,9 @@ func (m *Manager) createBuildContext(cm *ChallengeMetadata, dockerfile []byte) (
 	defer newCtx.Close()
 
 	if dockerfile != nil {
+		// Built-in challenge types: the embedded template is pinned on its way
+		// in, exactly like a challenge's own Dockerfile below.
+		dockerfile = m.pinBases(cm.Id, dockerfile)
 		hdr := tar.Header{Name: "Dockerfile", Mode: 0644, Size: int64(len(dockerfile))}
 
 		err = newCtx.WriteHeader(&hdr)
@@ -313,6 +316,23 @@ func (m *Manager) createBuildContext(cm *ChallengeMetadata, dockerfile []byte) (
 
 		archivePath := path[len(challengeDir)+1:]
 		hdr.Name = strings.ReplaceAll(archivePath, `\`, `/`)
+
+		// A custom challenge's own Dockerfile: pin its bases before it enters
+		// the context. The content changes, so the header size must be set
+		// from the rewritten bytes rather than from the file on disk.
+		if !info.IsDir() && hdr.Name == "Dockerfile" {
+			original, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			pinned := m.pinBases(cm.Id, original)
+			hdr.Size = int64(len(pinned))
+			if err = newCtx.WriteHeader(hdr); err != nil {
+				return err
+			}
+			_, err = newCtx.Write(pinned)
+			return err
+		}
 
 		err = newCtx.WriteHeader(hdr)
 		if err != nil {

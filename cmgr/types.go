@@ -63,7 +63,14 @@ type Manager struct {
 	// another's reference check and its ImageRemove. Content-addressed tags are
 	// shared across build rows, so these checks race under cmgrd's concurrent
 	// request handling.
-	imageMu            sync.Mutex
+	imageMu sync.Mutex
+	// basePins rewrites `FROM name:tag` to a digest as build contexts are
+	// synthesized, so BuildKit never re-resolves a mutable tag against the
+	// registry on every build (see basepins.go).
+	basePins *basePins
+	// purgeAfterPush drops the builder's local copy of a build's images once
+	// they are in the registry (see purge.go). Registry mode only.
+	purgeAfterPush     bool
 	challengeInterface string
 	challengeRegistry  string
 	authString         string

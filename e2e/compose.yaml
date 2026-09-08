@@ -138,6 +138,12 @@ services:
       CMGR_DIR: /challenges
       CMGR_DB: /var/lib/cork/cmgr.db
       CMGR_ARTIFACT_DIR: /var/lib/cork/artifacts
+      # Base image digest pins, at the corpus root as in production, where the
+      # file is committed to the challenge repository and versioned with the
+      # Dockerfiles it pins. Nothing creates it: absent means no pinning, which
+      # is how every step before the pin step runs. restore_sources removes it,
+      # so a volume reused across runs does not fail the seed-tree check.
+      CMGR_BASE_PINS: /challenges/base-pins.json
       CMGR_PORTS: "20000-20029"
       # Long enough that a slow run cannot prune the scenario's own
       # on-demand instances out from under it (production uses 1h).
@@ -148,8 +154,21 @@ services:
       # How long a request launch waits for one of a worker's two launch slots
       # before it is refused as busy, and the threshold admission control
       # measures a daemon's backlog against. Production leaves this at the 10s
-      # default; 2s here so one burst overflows inside a run.
-      CMGR_WORKER_LAUNCH_WAIT: 2s
+      # default; this fleet shortens it so a burst overflows inside a run.
+      #
+      # Whether one does is arithmetic, and the margin has to come from here.
+      # With two slots and a per-launch hold of h, the last of N simultaneous
+      # launches waits about (N-1)/2 x h, and the burst steps only prove
+      # anything if that exceeds this wait. h is a property of whatever host
+      # the fleet is on, and N cannot grow past CMGR_PORTS -- so the room is in
+      # this number being small, not in the bursts being large. At 500ms an
+      # 18-launch burst overflows on any host slower than 59ms per launch; at
+      # the 2s this used to be it needed 235ms, and a GitHub-hosted runner does
+      # it in 222, which is exactly how it failed there while passing locally.
+      #
+      # The scenario reads the same value (E2E_LAUNCH_WAIT_MS on the e2e
+      # service below) instead of hard-coding it, so the two cannot drift.
+      CMGR_WORKER_LAUNCH_WAIT: ${E2E_LAUNCH_WAIT_MS:-500}ms
     volumes:
       # The challenge tree lives in a volume so the scenario can edit a
       # challenge and run `update`; cork-entrypoint.sh seeds it from the
@@ -230,6 +249,10 @@ services:
       E2E_REGISTRY: zot.internal
       E2E_CHAOS: ${E2E_CHAOS:-1}
       E2E_FULL: ${E2E_FULL:-0}
+      # The same value the cork service turns into CMGR_WORKER_LAUNCH_WAIT, so
+      # the burst steps size themselves against what cmgrd is actually running
+      # with rather than a literal that has to be kept in step by hand.
+      E2E_LAUNCH_WAIT_MS: ${E2E_LAUNCH_WAIT_MS:-500}
       E2E_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-cork-e2e}
       E2E_IMAGE: cork-e2e/cork
       E2E_BUILDER: http://builder:2375

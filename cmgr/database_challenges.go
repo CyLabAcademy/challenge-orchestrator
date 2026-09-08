@@ -692,14 +692,23 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 					// the prune age would clear. Non-service challenges never run
 					// instances, so any found here are placeholders left by older
 					// versions of cmgr and are removed the same way.
+					//
+					// Both lookups below purge on their way out. The purge is
+					// held until after the restarts only to protect them, and
+					// neither path reaches a restart -- so there is nothing
+					// left to wait behind, and skipping it would leak this
+					// build's images for good: purgeBuiltImages is the only
+					// thing that reclaims them.
 					revPortMap, err := m.getReversePortMap(build.Challenge)
 					if err != nil {
 						errs = append(errs, err)
+						m.purgeBuiltImages(build)
 						continue
 					}
 					instances, err := m.getBuildInstances(build.Id)
 					if err != nil {
 						errs = append(errs, err)
+						m.purgeBuiltImages(build)
 						continue
 					}
 					for _, iid := range instances {
@@ -759,6 +768,19 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 							}
 						}
 					}
+
+					// The builder's copies are redundant once pushed
+					// (purge.go), but only after the restarts above.
+					// restartInstance goes through ensureImages, which pulls
+					// for whichever daemon hosts the instance -- and a pull
+					// that fails there does not merely cost time: the handler
+					// above removes the instance instead of restarting it. So
+					// purging first turns a registry blip in the middle of an
+					// update into destroyed instances that stay down until
+					// someone re-runs update-schema. Held until the instances
+					// this build serves are running again, the cost of a blip
+					// is back to what it was: nothing.
+					m.purgeBuiltImages(build)
 
 					// The displaced generation (two rebuilds back) leaves
 					// retention; the just-replaced one survives as the

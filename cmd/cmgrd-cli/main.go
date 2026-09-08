@@ -83,6 +83,10 @@ func main() {
 		exitCode = workerDownCommand(c, cmdArgs)
 	case "worker-list":
 		exitCode = workerListCommand(c, cmdArgs)
+	case "pin-list":
+		exitCode = pinListCommand(c, cmdArgs)
+	case "pin-refresh":
+		exitCode = pinRefreshCommand(c, cmdArgs)
 	case "artifacts":
 		exitCode = artifactsCommand(c, cmdArgs)
 	case "version":
@@ -155,6 +159,14 @@ Workers:
   worker-down <ip>
       mark the worker down, taking it out of placement but keeping its records
   worker-list
+
+Base image pins:
+  pin-list
+      show the pinned base images and how many challenges use each
+  pin-refresh
+      re-resolve every base image the challenge directory names to the digest
+      the registry serves now, and save it; this is the only time a mutable
+      tag is consulted, and it rebuilds nothing by itself
 
 Other:
   artifacts <build> [<output file>]
