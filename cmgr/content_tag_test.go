@@ -8,14 +8,14 @@ import (
 )
 
 func TestContentChecksum(t *testing.T) {
-	base := contentChecksum(0xdeadbeef, "flag{%s}")
-	if base != contentChecksum(0xdeadbeef, "flag{%s}") {
+	base := contentChecksum(0xdeadbeef, "flag{%s}", 0)
+	if base != contentChecksum(0xdeadbeef, "flag{%s}", 0) {
 		t.Error("contentChecksum is not deterministic")
 	}
-	if base == contentChecksum(0xdeadbef0, "flag{%s}") {
+	if base == contentChecksum(0xdeadbef0, "flag{%s}", 0) {
 		t.Error("expected different checksum for a different source checksum")
 	}
-	if base == contentChecksum(0xdeadbeef, "ctf{%s}") {
+	if base == contentChecksum(0xdeadbeef, "ctf{%s}", 0) {
 		t.Error("expected different checksum for a different flag format")
 	}
 }
@@ -204,7 +204,7 @@ func TestBuildsChecksumMigration(t *testing.T) {
 	if err := mgr.db.Get(&got, "SELECT checksum FROM builds WHERE id = 1;"); err != nil {
 		t.Fatalf("failed to read migrated checksum: %s", err)
 	}
-	if want := contentChecksum(sourceChecksum, format); got != want {
+	if want := contentChecksum(sourceChecksum, format, 0); got != want {
 		t.Errorf("migrated checksum = %#x, want %#x", got, want)
 	}
 
@@ -214,8 +214,8 @@ func TestBuildsChecksumMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookupBuildMetadata failed: %s", err)
 	}
-	if bMeta.Checksum != contentChecksum(sourceChecksum, format) {
-		t.Errorf("lookup returned checksum %#x, want %#x", bMeta.Checksum, contentChecksum(sourceChecksum, format))
+	if bMeta.Checksum != contentChecksum(sourceChecksum, format, 0) {
+		t.Errorf("lookup returned checksum %#x, want %#x", bMeta.Checksum, contentChecksum(sourceChecksum, format, 0))
 	}
 	if bMeta.PrevChecksum != 0 {
 		t.Errorf("lookup returned prevchecksum %#x, want 0", bMeta.PrevChecksum)

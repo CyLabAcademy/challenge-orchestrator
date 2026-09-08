@@ -44,6 +44,10 @@ func NewManager(logLevel LogLevel) *Manager {
 		return nil
 	}
 
+	if err := mgr.initBasePins(); err != nil {
+		return nil
+	}
+
 	if err := mgr.initDocker(); err != nil {
 		return nil
 	}

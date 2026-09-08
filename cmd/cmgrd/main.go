@@ -68,6 +68,7 @@ func main() {
 	http.HandleFunc("/instances/", s.instanceHandler)
 	http.HandleFunc("/workers", s.workersHandler)
 	http.HandleFunc("/workers/", s.workerHandler)
+	http.HandleFunc("/pins", s.pinsHandler)
 	http.HandleFunc("/schemas", s.schemaHandler)
 	http.HandleFunc("/schemas/", s.existingSchemaHandler)
 	http.HandleFunc("/update", s.updateHandler)
@@ -163,6 +164,14 @@ Relevant environment variables:
       set, images are pulled from it before each instance start (must match
       the value used by cmgr when building).
 
+  CMGR_BASE_PINS - path to a JSON map of base image reference to digest,
+      defaulting to <CMGR_DIR>/.base-pins.json; absent or empty disables
+      pinning. When set, cmgrd rewrites a FROM name:tag instruction to the
+      equivalent digest reference as it builds each build context, so the
+      builder never re-resolves a mutable tag against the registry and a base
+      only moves when the pins are refreshed (POST /pins). Challenge
+      Dockerfiles are never modified on disk.
+
 HTTP API:
   cmgrd owns all state; every action goes through its API (the cmgrd-cli
   binary is a thin wrapper around it). In addition to the challenge, build,
@@ -170,8 +179,9 @@ HTTP API:
   challenge directory (body: {"path": "<dir>", "dry_run": false,
   "prune_old": false} — prune_old removes image generations displaced from
   rollback retention, on the build daemon and in the registry),
-  GET /state dumps the full challenge/build/instance state, and
-  GET /version reports the server version.
+  GET /state dumps the full challenge/build/instance state,
+  GET /version reports the server version, and GET/POST /pins list the
+  base image pins and re-resolve them.
 
 Workers:
   When docker workers are configured (GET/POST/PATCH/DELETE on /workers or

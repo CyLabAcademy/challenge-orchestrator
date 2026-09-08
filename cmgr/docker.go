@@ -288,7 +288,15 @@ func dockerStreamError(messages []byte) error {
 }
 
 // contentChecksum derives the content identity of a build's images from the
-// challenge source checksum and the flag format. The source content reaches
+// challenge source checksum, the flag format, and the base image pins.
+//
+// The pins are folded in so that a build produced against a moved base is a
+// different image identity from one produced against the old base: the two
+// cannot collide on a tag, the rollback generation stays meaningful, and a
+// stale image is never reused for content it no longer matches. It is NOT a
+// rebuild trigger -- DetectChanges reads only the challenge directory, so
+// refreshing pins does not by itself cause anything to rebuild (see
+// basepins.go). The source content reaches
 // the image through the build context (and the frozen base image); the flag
 // format enters as a build arg. The seed also affects image content but is
 // carried explicitly in the docker tag, so it is not folded in here.
@@ -303,12 +311,19 @@ func dockerStreamError(messages []byte) error {
 // build-machinery version) in here would close that, but the migration
 // backfill cannot reconstruct a legacy row's historical Dockerfile, so it is
 // deferred.
-func contentChecksum(sourceChecksum uint32, format string) uint32 {
+func contentChecksum(sourceChecksum uint32, format string, basePins uint32) uint32 {
 	h := crc32.NewIEEE()
 	var src [4]byte
 	binary.BigEndian.PutUint32(src[:], sourceChecksum)
 	h.Write(src[:])
 	h.Write([]byte(format))
+	// Mixed in only when pinning is on, so switching it on is what re-stamps
+	// existing builds and switching it off restores their previous identity.
+	if basePins != 0 {
+		var bp [4]byte
+		binary.BigEndian.PutUint32(bp[:], basePins)
+		h.Write(bp[:])
+	}
 	sum := h.Sum32()
 	// 0 is reserved as the "unset / not-yet-migrated" sentinel: builds.checksum
 	// and prevchecksum default to 0, the migration backfill keys on checksum=0,
@@ -363,7 +378,7 @@ func (m *Manager) migrateBuildChecksums(db *sqlx.DB) error {
 	}
 
 	for _, row := range rows {
-		checksum := contentChecksum(row.SourceChecksum, row.Format)
+		checksum := contentChecksum(row.SourceChecksum, row.Format, m.basePinsChecksum())
 
 		// Retag first: checksum=0 is the resume marker, so it is stamped only
 		// once the images provably carry the new tag (or are shown to need no
@@ -649,7 +664,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 	// Stamp the build with the content identity its images are about to be
 	// produced from; dockerId (and therefore every tag below) depends on it.
-	bMeta.Checksum = contentChecksum(cMeta.SourceChecksum, bMeta.Format)
+	bMeta.Checksum = contentChecksum(cMeta.SourceChecksum, bMeta.Format, m.basePinsChecksum())
 
 	baseName := fmt.Sprintf("%s/%s:%x", m.challengeRegistry, challengeToFreezeName(cMeta.Id), cMeta.SourceChecksum)
 	pullOpts := client.ImagePullOptions{RegistryAuth: m.authString}

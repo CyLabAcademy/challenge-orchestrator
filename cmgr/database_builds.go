@@ -42,7 +42,7 @@ func (m *Manager) openBuild(build *BuildMetadata) error {
 	if build.Checksum == 0 {
 		var srcChecksum uint32
 		if err := m.db.Get(&srcChecksum, "SELECT sourcechecksum FROM challenges WHERE id = ?;", build.Challenge); err == nil {
-			build.Checksum = contentChecksum(srcChecksum, build.Format)
+			build.Checksum = contentChecksum(srcChecksum, build.Format, m.basePinsChecksum())
 		}
 	}
 
