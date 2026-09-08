@@ -1297,6 +1297,22 @@ func (m *Manager) stopContainers(instance *InstanceMetadata) error {
 			m.log.warnf("skipped removing container (not found): %s", cid)
 			continue
 		}
+		// "removal of container X is already in progress": another remover got
+		// there first — a concurrent stop of the same instance, or the reaper —
+		// and the container is on its way out. Gone and going are the same
+		// outcome for a stop, so this is tolerated exactly like a 404. Without
+		// it a rebuild that tears down an instance whose stop is already in
+		// flight fails the whole update.
+		//
+		// Safe only because the removal is forced: dockerd's other 409 on this
+		// endpoint is "you cannot remove a running container", which Force
+		// makes unreachable. stopNetwork deliberately does NOT do the same —
+		// its 409 means the network still has an endpoint attached, which is a
+		// real condition and not a benign race.
+		if errdefs.IsConflict(rmErr) {
+			m.log.warnf("skipped removing container (removal already in progress): %s", cid)
+			continue
+		}
 		m.log.errorf("failed to remove container: %s", rmErr)
 		m.noteWorkerTransportError(instance.Worker, cli, rmErr)
 		errs = append(errs, rmErr)
