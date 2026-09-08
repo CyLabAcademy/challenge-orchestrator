@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/picoCTF/cmgr/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
 )
 
 type WorkerAddRequest struct {

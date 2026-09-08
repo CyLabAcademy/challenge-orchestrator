@@ -3,7 +3,7 @@ package cmgr
 import (
 	"testing"
 
-	"github.com/picoCTF/cmgr/cmgr/dockerfiles"
+	"github.com/CyLabAcademy/challenge-orchestrator/cmgr/dockerfiles"
 )
 
 // TestDeriveDeliveryType covers the single source of truth for delivery-type

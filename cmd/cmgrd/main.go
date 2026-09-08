@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/picoCTF/cmgr/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
 )
 
 type state struct {

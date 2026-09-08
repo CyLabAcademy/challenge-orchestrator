@@ -48,7 +48,7 @@ version=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)
 case "${1:-}" in
   --ldflags)
     [ $# -eq 1 ] || { echo "usage: version.sh [--ldflags]" >&2; exit 2; }
-    printf -- '-X github.com/picoCTF/cmgr/cmgr.version=%s -X main.version=%s' "$version" "$version"
+    printf -- '-X github.com/CyLabAcademy/challenge-orchestrator/cmgr.version=%s -X main.version=%s' "$version" "$version"
     ;;
   '')
     printf '%s\n' "$version"

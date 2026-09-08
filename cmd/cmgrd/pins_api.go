@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/picoCTF/cmgr/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
 )
 
 // pinsHandler serves the base image pins (see cmgr/basepins.go). GET reports
