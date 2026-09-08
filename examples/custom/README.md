@@ -20,15 +20,19 @@ and, if applicable, `/challenge/artifacts.tar.gz` files.
 
 ### Build stage named 'base'
 
-If any stage in the Dockerfile is labeled `base`, then that stage can
-be "frozen" using `cmgr freeze`.  If all dependencies are downloaded by the
-end of the `base` stage, then freezing can ensure that the challenge does
-not "break" in the future from breaking changes in dependencies.  However,
-the configuration is frozen in its current state so future vulnerabilities in
-a major dependency (e.g., `node`) may cause the challenge to collect
-"alternate solutions" over time.  No checks are made to determine if other
- resources are downloaded after `base` so it is the challenge authors
- responsibility to obey this contract in their Dockerfile.
+A stage named `base` is a convention rather than something cork keys on.  It
+used to be: `cmgr freeze` pre-built that stage, pushed it, and other daemons
+reused it, which is how a challenge was held still against changes in its
+dependencies.  That command is gone, and what replaced it is neither opt-in nor
+per-stage -- cork rewrites every `FROM` to the digest the registry served when
+the pins were last refreshed, on every build, without touching the Dockerfile
+on disk.  See `BUILDER.md`.
+
+The trade the freeze made is still the trade: holding a base still means not
+picking up its security updates either, so a pinned `node` may collect
+"alternate solutions" over time.  The difference is that moving a base is now a
+deliberate act with a record (`cmgrd-cli pin-refresh`) rather than a property of
+whichever copy a builder happened to have cached.
 
 ### Publishing ports
 

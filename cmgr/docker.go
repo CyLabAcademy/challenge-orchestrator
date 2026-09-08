@@ -297,7 +297,7 @@ func dockerStreamError(messages []byte) error {
 // rebuild trigger -- DetectChanges reads only the challenge directory, so
 // refreshing pins does not by itself cause anything to rebuild (see
 // basepins.go). The source content reaches
-// the image through the build context (and the frozen base image); the flag
+// the image through the build context (and the pinned base image); the flag
 // format enters as a build arg. The seed also affects image content but is
 // carried explicitly in the docker tag, so it is not folded in here.
 //
@@ -479,10 +479,6 @@ func (m *Manager) retagLegacyImages(db *sqlx.DB, id BuildId, challenge string, s
 	return nil
 }
 
-func challengeToFreezeName(challenge ChallengeId) string {
-	return strings.ReplaceAll(string(challenge), "/", "_")
-}
-
 // instanceImageName returns the docker tag for a build's per-host image. When
 // CMGR_REGISTRY is set the name is registry-qualified so that images can be
 // pushed after building and pulled before launching; cmgr and cmgrd must be
@@ -493,6 +489,43 @@ func (m *Manager) instanceImageName(challenge ChallengeId, bMeta *BuildMetadata,
 		name = fmt.Sprintf("%s/%s", m.challengeRegistry, name)
 	}
 	return name
+}
+
+// cacheRefsFor picks the BuildKit cache sources for one image build.
+//
+// Registry deployments only, and that gate is the load-bearing part: BuildKit
+// reads CacheFrom entries as *registry* references, so without CMGR_REGISTRY
+// instanceImageName yields a bare `challenge:tag` which normalizes to
+// docker.io/library and sends a Docker Hub lookup per image per build -- the
+// exact exposure base pinning exists to remove. Single-host cmgr gets no cache
+// sources at all, which is what it had before inline caching existed.
+//
+// Two sources, and the order is the point. priorImageName is the generation
+// this build displaces: its layers are the ones the new build shares, and it is
+// already in the registry, so it is the entry with a real hit rate. imageName
+// is the tag this build is about to produce, which can only exist when the same
+// content was built before -- a builder recovering from a reclaimed cache, or a
+// source revert. Naming only the second (as this originally did) means every
+// rebuild triggered by a source change asks the registry for a tag that cannot
+// exist yet and imports nothing.
+//
+// A rebuild that reproduces the same content checksum yields priorImageName ==
+// imageName; it is offered once rather than twice.
+func cacheRefsFor(registry, host, imageName, priorImageName string) []string {
+	if registry == "" {
+		return nil
+	}
+	// The "builder" host's image is never pushed (see the push below), so both
+	// refs below name tags that cannot exist. Asking for them is two guaranteed
+	// 404s per build against the registry -- exactly the per-build chatter this
+	// branch exists to remove -- for a cache that could never hit.
+	if host == "builder" {
+		return nil
+	}
+	if priorImageName == "" || priorImageName == imageName {
+		return []string{imageName}
+	}
+	return []string{priorImageName, imageName}
 }
 
 // pushImage pushes the image to the configured registry under its
@@ -589,99 +622,19 @@ func (m *Manager) pullImage(cli *client.Client, imageName string, timeout time.D
 	return nil
 }
 
-func (m *Manager) freezeBaseImage(challenge ChallengeId, force bool) error {
-	cMeta, err := m.lookupChallengeMetadata(challenge)
-	if err != nil {
-		return err
-	}
-
-	imageName := fmt.Sprintf("%s/%s:%x", m.challengeRegistry, challengeToFreezeName(challenge), cMeta.SourceChecksum)
-
-	if !force {
-		// Do some check here to see if it already exists
-	}
-
-	buildCtxFile, err := m.createBuildContext(cMeta, m.GetDockerfile(cMeta.ChallengeType))
-	if err != nil {
-		m.log.errorf("failed to create build context: %s", err)
-		return err
-	}
-	defer os.Remove(buildCtxFile)
-	buildCtx, err := os.Open(buildCtxFile)
-	if err != nil {
-		m.log.errorf("failed to seek to beginning of file for %s: %s", cMeta.Id, err)
-		return err
-	}
-	defer buildCtx.Close()
-
-	// Setup build options
-	opts := client.ImageBuildOptions{
-		// BuildKit rather than the daemon's default. The API defaults to the
-		// legacy builder when no version is sent, and that builder is
-		// deprecated; it also keeps its cache as untagged images in the image
-		// store, which is what made cache and image lifetime the same problem.
-		Version:    build.BuilderBuildKit,
-		Remove:     true,
-		Tags:       []string{imageName},
-		Target:     "base",
-		NoCache:    force, // Require to use latest info on force
-		PullParent: force, // Update parent image as well on force
-		Labels: map[string]string{
-			"cmgr.managed":   "true",
-			"cmgr.challenge": string(challenge),
-		},
-	}
-
-	// Build the image
-	m.log.debugf("creating base image %s", imageName)
-	resp, err := m.cli.ImageBuild(m.ctx, buildCtx, opts)
-	if err != nil {
-		m.log.errorf("failed to build base image: %s", err)
-		return err
-	}
-
-	// Read the response because errors aren't propagated.
-	messages, err := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		m.log.errorf("failed to read build response from docker: %s", err)
-		return err
-	}
-
-	// Search the response for an error message
-	if streamErr := dockerStreamError(messages); streamErr != nil {
-		err = fmt.Errorf("failed to build image: %s", streamErr)
-		m.log.error(err)
-		return err
-	}
-
-	return m.pushImage(imageName)
-}
-
 func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, buildCtxFile string) error {
 
 	seedStr := fmt.Sprintf("%d", bMeta.Seed)
 
+	// The generation this build is about to displace, captured before the new
+	// content identity is stamped over it. Its images are in the registry and
+	// its layers are the ones this build shares, so it is the cache source with
+	// a hit rate; see cacheRefsFor.
+	priorMeta := *bMeta
+
 	// Stamp the build with the content identity its images are about to be
 	// produced from; dockerId (and therefore every tag below) depends on it.
 	bMeta.Checksum = contentChecksum(cMeta.SourceChecksum, bMeta.Format, m.basePinsChecksum())
-
-	baseName := fmt.Sprintf("%s/%s:%x", m.challengeRegistry, challengeToFreezeName(cMeta.Id), cMeta.SourceChecksum)
-	pullOpts := client.ImagePullOptions{RegistryAuth: m.authString}
-	var buildCache []string
-	pullResp, err := m.cli.ImagePull(m.ctx, baseName, pullOpts)
-	if err == nil {
-		// Read the response because errors aren't propagated.
-		messages, err := ioutil.ReadAll(pullResp)
-		pullResp.Close()
-		if err == nil {
-			// Search the response for an error message
-			if dockerStreamError(messages) == nil {
-				m.log.infof("Successfully pulled base image '%s'", baseName)
-				buildCache = append(buildCache, baseName)
-			}
-		}
-	}
 
 	images := []Image{}
 	var buildImage string
@@ -700,17 +653,43 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		}
 
 		// Setup build options
+		//
+		// Inline cache, registry deployments only: stamp the pushed image with
+		// BuildKit's cache metadata so a later build can import it, and offer
+		// the registry tags worth importing from (cacheRefsFor). A builder
+		// whose local cache was reclaimed then recovers the shared work -- the
+		// apt and pip layers every challenge repeats -- from the registry
+		// instead of re-running it once per challenge.
+		//
+		// The inline metadata is only useful to a build that names this tag as
+		// a cache source, which is why publishing it and importing it are
+		// switched together on the same condition.
+		buildArgs := map[string]*string{
+			"FLAG_FORMAT": &bMeta.Format,
+			"SEED":        &seedStr,
+			"FLAG":        bMeta.makeFlag(),
+		}
+		var priorName string
+		if priorMeta.Checksum != 0 {
+			priorName = m.instanceImageName(cMeta.Id, &priorMeta, image)
+		}
+		cacheRefs := cacheRefsFor(m.challengeRegistry, image.Host, imageName, priorName)
+		if m.challengeRegistry != "" {
+			inlineCache := "1"
+			buildArgs["BUILDKIT_INLINE_CACHE"] = &inlineCache
+		}
+
 		opts := client.ImageBuildOptions{
-			// See freezeBaseImage: BuildKit is selected explicitly, never
-			// inherited from the daemon default.
-			Version: build.BuilderBuildKit,
-			BuildArgs: map[string]*string{
-				"FLAG_FORMAT": &bMeta.Format,
-				"SEED":        &seedStr,
-				"FLAG":        bMeta.makeFlag(),
-			},
+			// BuildKit rather than the daemon's default, and this is now
+			// the only ImageBuild call in the tree. The API sends the
+			// legacy builder when no version is given, and that builder
+			// keeps its layer cache AS untagged images in the image
+			// store -- which is what made bounding disk and keeping the
+			// shared apt and pip layers the same knob.
+			Version:   build.BuilderBuildKit,
+			BuildArgs: buildArgs,
 			Remove:    true,
-			CacheFrom: buildCache,
+			CacheFrom: cacheRefs,
 			Tags:      []string{imageName},
 			Target:    host.Target,
 			Labels: map[string]string{
