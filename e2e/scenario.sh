@@ -1768,6 +1768,14 @@ slowest=$(printf '%s\n' "${admit_times[@]}" | jq -s -r '(. + [0] | max) * 1000 |
 (( slowest < ADMIT_MAX_MS )) ||
   fail "the slowest of $nadmit admission refusals took ${slowest}ms against a $LAUNCH_WAIT_H launch wait: it waited for a slot instead of being refused on the estimate"
 
+# Let the fleet read ok again first, exactly as the launch-burst step does
+# after its own burst. Forty concurrent launches spike the host's CPU, and on
+# a small box the telemetry agents report overloaded for a sample or two --
+# placement then skips every worker and the probe comes back "all workers are
+# overloaded", which says nothing about the ids this step is counting. It
+# costs the assertion nothing to wait: no id is consumed while the fleet
+# settles, because nothing else is launching.
+retry 30 "the fleet to read ok again after the burst" all_workers_ok
 timed_launch "$burst" probe2 "$OD_BUILD" "$BURST_BODY"
 code=000; t=0
 read -r code t <"$burst/probe2.code" || true
