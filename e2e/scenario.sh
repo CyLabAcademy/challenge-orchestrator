@@ -56,6 +56,11 @@ ONDEMAND_SRC=runtime_env_vars/server.py
 MAKE_META=remote-make/problem.md           # metadata only: the container-options step appends a "## Challenge Options" block here
 PORT_LOW=20000                             # CMGR_PORTS on cork
 PORT_HIGH=20029
+# CMGR_WORKER_LAUNCH_WAIT on cork, in milliseconds. compose.yaml derives both
+# this and cmgrd's own setting from one value, so the burst steps below measure
+# themselves against the wait the daemon is really running with.
+LAUNCH_WAIT_MS="${E2E_LAUNCH_WAIT_MS:-500}"
+LAUNCH_WAIT_H="${LAUNCH_WAIT_MS}ms"        # how it reads in a message
 
 # ---------------------------------------------------------------- helpers
 
@@ -1499,17 +1504,34 @@ down_worker "$WA" # $WB is the only worker up, so every launch below is placed t
 burst_before=$(api GET /workers | jq -r --arg ip "$WB" '.[] | select(.ip==$ip) | .instances')
 [[ "$burst_before" =~ ^[0-9]+$ ]] || fail "could not read the instance count of worker $WB before the burst"
 burst_dir=$(mktemp -d)
-t=$(date +%s)
+# A release barrier, because the depth of the queue at the moment the requests
+# land is the whole subject of this step. Spawning N subshells in a loop smears
+# their arrivals over however long the shell takes to fork N curls, and every
+# millisecond of that smear is a millisecond the two slots get to drain before
+# the next request turns up -- so the harness's own fork rate, which has nothing
+# to do with cork, silently sets how deep the queue gets. Each subshell is
+# spawned parked on a flag file and they are released together.
+#
+# A flag file rather than a FIFO: a reader that reaches its open() after the
+# writer has opened and closed blocks forever, and a subshell that loses its
+# slice for long enough would hang the run. A late reader here still sees the
+# flag. The poll costs at most one sleep of skew, two orders of magnitude under
+# the per-launch hold this is trying to outrun.
+burst_gate="$burst_dir/gate"
 for (( i = 30; i < 30 + BURST_N; i++ )); do
   # One subshell per request, each timed and captured whole. It ends on a
   # printf, so a curl that never answered cannot escape into `wait` and abort
   # the run under set -e: it is reported as the missing status it is.
   (
+    while [[ ! -e "$burst_gate" ]]; do sleep 0.01; done
     s=$(date +%s)
     out=$(try_launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i") || out=$'000\ncurl did not answer'
     printf '%s\n%s\n' "$(( $(date +%s) - s ))" "$out"
   ) >"$burst_dir/$i" &
 done
+sleep 1 # every subshell reaches its poll; forking N of them is the slow part
+t=$(date +%s)
+touch "$burst_gate"
 wait
 # Read the health first, before anything else can spend time: refusing a
 # launch touches no daemon at all, so a saturated queue must never look like
@@ -1538,7 +1560,7 @@ for (( i = 30; i < 30 + BURST_N; i++ )); do
       if grep -q "worker went down" <<<"$body"; then
         fail "the burst answered e2e-user-$i with a worker-down refusal after ${took}s: a busy daemon must be reported busy (ErrWorkerBusy), not given up on ($body)"
       fi
-      if grep -qE "no launch slot on worker $WB for instance [0-9]+ within 2s" <<<"$body"; then
+      if grep -qE "no launch slot on worker $WB for instance [0-9]+ within" <<<"$body"; then
         burst_slot=$(( burst_slot + 1 ))       # acquireSlot's expired arm, launch.go:243
       elif grep -q "launches already waiting on worker $WB" <<<"$body"; then
         burst_admit=$(( burst_admit + 1 ))     # admit refused before any record, launch.go:189
@@ -1558,7 +1580,7 @@ note "${#burst_ids[@]} accepted, $burst_slot refused for want of a slot, $burst_
 (( ${#burst_ids[@]} > 0 )) ||
   fail "not one of the $BURST_N launches on $WB was accepted: $WB was wedged, not busy"
 (( burst_503 > 0 )) ||
-  fail "all $BURST_N launches on $WB were accepted, so nothing here exercised the refusal: either its two launch slots emptied faster than the burst filled them (raise BURST_N; $WB has $(( PORT_HIGH - PORT_LOW + 1 )) ports), or cork is not running with CMGR_WORKER_LAUNCH_WAIT=2s"
+  fail "all $BURST_N launches on $WB were accepted, so nothing here exercised the refusal: either its two launch slots emptied faster than the burst filled them (raise BURST_N; CMGR_PORTS caps it at $(( PORT_HIGH - PORT_LOW + 1 ))), or cork is not running with CMGR_WORKER_LAUNCH_WAIT=$LAUNCH_WAIT_H"
 # The sharp one, and the only form-independent one that can be: the overflow
 # must come back as ErrWorkerBusy, by either of its two wordings. Which one
 # appears is a race between admit's view of the queue and how fast the
@@ -1571,9 +1593,9 @@ note "${#burst_ids[@]} accepted, $burst_slot refused for want of a slot, $burst_
 # more. An unbounded wait accepts the overflow late instead of refusing it,
 # and the 10s default would show here as a ~10s refusal; 6s leaves room for
 # the pre-slot work (three sqlite writes and one image inspect, all under
-# $BURST_N-way contention) on top of the 2s wait.
+# $BURST_N-way contention) on top of the wait itself.
 (( burst_worst <= 6 )) ||
-  fail "a burst launch was refused only after ${burst_worst}s: a refusal must arrive within the 2s launch wait plus overhead, never after queueing behind the daemon (cmgr/launch.go acquireSlot)"
+  fail "a burst launch was refused only after ${burst_worst}s: a refusal must arrive within the $LAUNCH_WAIT_H launch wait plus overhead, never after queueing behind the daemon (cmgr/launch.go acquireSlot)"
 # ok, not merely not-down: a burst that spikes the host's CPU can leave the
 # telemetry agent reporting overloaded for a sample or two, which clears by
 # itself, so this one is given a moment.
@@ -1622,10 +1644,13 @@ step "launch backlog: once a worker's launch queue is deeper than the launch wai
 # 503, but 2s later and with an id already burned. Telling those two apart is
 # the whole step, and the id arithmetic at the end is the half that still
 # bites if the wording of either message changes.
-LAUNCH_WAIT=2      # CMGR_WORKER_LAUNCH_WAIT on cork, set in compose.yaml
 BURST_N=32         # wave one: round robin puts 16 on each of the two workers
 PROBE_N=8          # wave two, fired while those queues are at their deepest
-ADMIT_MAX_MS=1500  # admission decides before any I/O; the wait is 2000ms
+# Admission decides on an estimate, before any I/O, so it must come back well
+# inside the wait a slot refusal would have cost. Three quarters of it: loose
+# enough for an HTTP round trip on a loaded box, tight enough that a refusal
+# which actually queued for a slot cannot pass as one.
+ADMIT_MAX_MS=$(( LAUNCH_WAIT_MS * 3 / 4 ))
 burst=$(mktemp -d)
 all_workers_ok ||
   fail "both workers must be ok before the burst: the queue depth below assumes placement round robins over two of them"
@@ -1719,7 +1744,7 @@ for ((i = 0; i < BURST_N + PROBE_N; i++)); do
       ;;
   esac
 done
-note "$(( BURST_N + PROBE_N )) burst launches: $n2xx started, $nadmit refused by admission, $nslot refused after the full ${LAUNCH_WAIT}s wait, $nother other"
+note "$(( BURST_N + PROBE_N )) burst launches: $n2xx started, $nadmit refused by admission, $nslot refused after the full $LAUNCH_WAIT_H wait, $nother other"
 
 # The substitution is the regression, and a slot refusal is what proves the
 # queue really was deeper than the wait: if one launch sat there for the whole
@@ -1728,20 +1753,20 @@ note "$(( BURST_N + PROBE_N )) burst launches: $n2xx started, $nadmit refused by
 # has tested nothing, which is a broken test rather than a broken cork -- so
 # it says so separately, and names the knob.
 if (( nadmit == 0 && nslot > 0 )); then
-  fail "$nslot burst launches waited the full ${LAUNCH_WAIT}s for a slot and not one was refused ahead of it: admit (cmgr/launch.go, a53e8d6) no longer runs before openInstance, so every refusal fell back to acquireSlot's 'no launch slot on ... within' form"
+  fail "$nslot burst launches waited the full $LAUNCH_WAIT_H for a slot and not one was refused ahead of it: admit (cmgr/launch.go, a53e8d6) no longer runs before openInstance, so every refusal fell back to acquireSlot's 'no launch slot on ... within' form"
 fi
 if (( nadmit == 0 )); then
   fail "the burst of $(( BURST_N + PROBE_N )) launches never queued deeply enough to refuse anything ($n2xx started, $nother other): the fleet worked them off faster than the estimate admit reads, so nothing was proved here. Raise BURST_N (CMGR_PORTS caps it near 25 per worker) or lower CMGR_WORKER_LAUNCH_WAIT"
 fi
-# Half the wait would do; ${ADMIT_MAX_MS}ms because these are 40 concurrent
-# curls in one container on a box that is also starting containers, and the
-# message already said which refusal each of these was. A refusal that really
-# waited for a slot cannot come back under ${LAUNCH_WAIT}s.
+# Half the wait would do; three quarters because these are 40 concurrent curls
+# in one container on a box that is also starting containers, and the message
+# already said which refusal each of these was. A refusal that really waited for
+# a slot cannot come back inside the wait at all.
 slowest=$(printf '%s\n' "${admit_times[@]}" | jq -s -r '(. + [0] | max) * 1000 | floor' || echo "")
 [[ "$slowest" =~ ^[0-9]+$ ]] ||
   fail "could not read the response times of the $nadmit admission refusals from curl: '$(printf '%s ' "${admit_times[@]}")'"
 (( slowest < ADMIT_MAX_MS )) ||
-  fail "the slowest of $nadmit admission refusals took ${slowest}ms against a ${LAUNCH_WAIT}s launch wait: it waited for a slot instead of being refused on the estimate"
+  fail "the slowest of $nadmit admission refusals took ${slowest}ms against a $LAUNCH_WAIT_H launch wait: it waited for a slot instead of being refused on the estimate"
 
 timed_launch "$burst" probe2 "$OD_BUILD" "$BURST_BODY"
 code=000; t=0
@@ -1802,7 +1827,7 @@ for ip in "$WA" "$WB"; do
   fi
 done
 retry 30 "both workers to be ok again after the burst" all_workers_ok
-ok "$nadmit of $(( BURST_N + PROBE_N )) burst launches were refused by admission in under ${ADMIT_MAX_MS}ms against a ${LAUNCH_WAIT}s wait, each naming the worker whose queue was full and carrying Retry-After; the burst consumed $consumed ids for the $(( BURST_N + PROBE_N - nadmit )) launches it let through, so a refusal cost no row, no port and no docker call"
+ok "$nadmit of $(( BURST_N + PROBE_N )) burst launches were refused by admission in under ${ADMIT_MAX_MS}ms against a $LAUNCH_WAIT_H wait, each naming the worker whose queue was full and carrying Retry-After; the burst consumed $consumed ids for the $(( BURST_N + PROBE_N - nadmit )) launches it let through, so a refusal cost no row, no port and no docker call"
 
 # -------------------------------------------------------- 6. remote-make
 
