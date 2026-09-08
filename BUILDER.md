@@ -26,6 +26,7 @@ Three things then sit on top:
 | Base image pinning | rewrites `FROM name:tag` to `FROM name@sha256:…` **in the build context tar**, never on disk | `cmgr/basepins.go` |
 | Pin fingerprint | the pin map's checksum is folded into a build's content identity | `contentChecksum`, `cmgr/docker.go` |
 | Inline cache | pushed images carry BuildKit cache metadata; a rebuild imports from the generation it displaces | `executeBuild` and `cacheRefsFor`, `cmgr/docker.go` |
+| Purge after push | the builder's local copy of a build's images is dropped once they are in the registry | `cmgr/purge.go` |
 
 ## Why pinning exists
 
@@ -209,6 +210,44 @@ One operational note for a builder that purges after every build: containerd can
 wedge (`dial unix:///run/containerd/containerd.sock: timeout`), after which every
 image removal fails while builds keep working. The failure mode is silent
 accumulation, not an error, and `systemctl restart containerd` clears it.
+
+## Purging after the push
+
+`CMGR_PURGE_AFTER_PUSH` — on by default in registry mode, off with
+`false`/`0`/`off`, and refused outright without a registry.
+
+Once a build's images are in the registry, nothing reads the builder's copies.
+Keeping them makes the image store grow with the whole fleet — challenges times
+seeds times retained generations — on a volume shared with the challenge
+checkout, the database and the artifact bundles. Purging after `finalizeBuild`
+bounds it to roughly one build in flight instead.
+
+The section above is what makes this safe rather than a trade: image removal
+does not touch BuildKit's cache, so the shared `apt` and `pip` layers survive
+and the next build downloads nothing. That is also why there is no "keep these"
+list to maintain — a question this design would otherwise have to answer, and
+the reason earlier attempts reached for a catalogue of hand-maintained base
+images.
+
+Nothing else needs the local copy:
+
+- a build's images are read exactly twice, both inside `executeBuild`: by the
+  artifact extraction container and by the push;
+- launches go through `ensureImages`, which pulls from the registry for
+  whichever daemon hosts the instance — **including the local one**, so an
+  instance that falls back to local placement (no workers registered) still
+  works;
+- the `builder` host's image is never pushed and never launched
+  (`startContainers` skips it); it exists only for extraction;
+- the retention paths only ever *remove* images and already tolerate absence.
+
+**Without a registry this is refused, not merely defaulted off.** Single-host
+cmgr never pushes and `ensureImages` does not pull, so the builder's copy is the
+only one there is; purging would break every launch.
+
+Turning it off is how you measure. An unpurged pass over the real corpus is the
+only way to learn what the image store actually costs at fleet scale, which no
+number in this document currently rests on.
 
 ## Limitations
 

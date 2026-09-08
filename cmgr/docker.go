@@ -103,6 +103,10 @@ func (m *Manager) initDocker() error {
 		m.authString = base64.StdEncoding.EncodeToString([]byte(authPayload))
 	}
 
+	// After challengeRegistry is known: without a registry there is nothing to
+	// push to and the local images are the only copy, so purging is refused.
+	m.initPurgeAfterPush()
+
 	m.portLow, m.portHigh, err = getPortRange()
 	if err != nil {
 		m.log.errorf("%s", err)
@@ -258,6 +262,10 @@ func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 		if err != nil {
 			return err
 		}
+
+		// After the row is committed, never before: the images are in the
+		// registry and nothing local reads them again (see purge.go).
+		m.purgeBuiltImages(build)
 	}
 
 	return nil
@@ -1435,7 +1443,13 @@ func (m *Manager) destroyImages(build BuildId) error {
 			imageName := m.instanceImageName(bMeta.Challenge, bMeta, image)
 			if _, err := m.cli.ImageRemove(m.ctx, imageName, iro); err != nil {
 				if errdefs.IsNotFound(err) {
-					m.log.warnf("skipped removing image (not found): %s", imageName)
+					// Debug, not warn: with purge-after-push on (the default
+					// in registry mode) the builder no longer holds these by
+					// the time a build is destroyed, so absence is the normal
+					// case. Warning on it would fire for every image of every
+					// destroyed build and bury the line below, which is the
+					// one that means something.
+					m.log.debugf("skipped removing image (not found): %s", imageName)
 				} else {
 					m.log.warnf("could not remove image %s (leaving it in place): %s", imageName, err)
 				}
