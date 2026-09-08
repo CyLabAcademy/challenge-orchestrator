@@ -131,7 +131,7 @@ pull, and health transition is logged there.
     launch serves generation 2.
 11. **Update, generation 3 with `--prune-old`.** A second edit of the
     on-demand challenge only rebuilds that one: generation 2 becomes the
-    rollback target, generation 1 is untagged on the builder and deleted from
+    rollback target, generation 1 is deleted from
     zot, the generation-2 instance is torn down, and four fresh launches
     across both workers serve generation 3.
 12. **worker-down.** After `cmgrd-cli worker-down`, new launches avoid that
@@ -157,7 +157,28 @@ pull, and health transition is logged there.
 17. **worker-remove.** The worker is purged: it disappears from the list, its
     instance records are gone, its containers are still running (reaped by the
     scenario), and it can be re-added clean.
-18. **Teardown.** Remaining instances are stopped, `remove-schema` destroys the
+18. **Base image pins** (full mode). `cmgrd-cli pin-refresh` resolves every base
+    the corpus names to a digest — `ubuntu:24.04` to a `sha256:`, and
+    `cmgr/examples-guestfish-base`, which the `disks` example builds locally and
+    no registry serves, reported and left unpinned without discarding the ones
+    that did resolve. A rebuild then runs through the pins: cork rewrites `FROM`
+    in the build context, the challenge `Dockerfile` on disk is checked to be
+    untouched, and the image is pushed. The pushed image config is fetched back
+    out of zot and required to carry `moby.buildkit.cache.v0`. Late on purpose:
+    a refresh moves the pin fingerprint, which enters every build's content
+    identity, so the steps that compare generations must not straddle it.
+19. **Inline cache import** (full mode). The step above proves only that the
+    metadata is *published*. This one proves it is *used*: the builder's build
+    cache is pruned until it holds zero records, one more generation is built,
+    and **every layer but the last** is required to carry the same digest as
+    before while the last is required to have moved. Re-running an instruction
+    produces a different digest — a layer tar carries the mtimes that run wrote
+    — so with the cache verifiably empty, identical digests can only have come
+    from the registry. The step asserts the image's exact layer count first,
+    because the comparison is only meaningful if it spans layers cork *built*:
+    base layers arrive from the registry either way. Without this, a `CacheFrom`
+    that names nothing importable passes every other assertion in the suite.
+20. **Teardown.** Remaining instances are stopped, `remove-schema` destroys the
     builds, the workers hold none of the instance containers or networks, the
     builder and zot hold no tag of any generation, and the edited sources are
     restored.

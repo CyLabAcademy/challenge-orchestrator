@@ -138,6 +138,12 @@ services:
       CMGR_DIR: /challenges
       CMGR_DB: /var/lib/cork/cmgr.db
       CMGR_ARTIFACT_DIR: /var/lib/cork/artifacts
+      # Base image digest pins, at the corpus root as in production, where the
+      # file is committed to the challenge repository and versioned with the
+      # Dockerfiles it pins. Nothing creates it: absent means no pinning, which
+      # is how every step before the pin step runs. restore_sources removes it,
+      # so a volume reused across runs does not fail the seed-tree check.
+      CMGR_BASE_PINS: /challenges/base-pins.json
       CMGR_PORTS: "20000-20029"
       # Long enough that a slow run cannot prune the scenario's own
       # on-demand instances out from under it (production uses 1h).

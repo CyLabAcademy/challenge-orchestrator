@@ -669,6 +669,11 @@ restore_sources() {
   # Options block here. problem.md is outside the source checksum but inside
   # the tree check, so a run killed without its trap is repaired here.
   cp "$CHALLENGES_SEED/$MAKE_META" "$CHALLENGES/$MAKE_META"
+  # The pin step writes CMGR_BASE_PINS here (the corpus root, as in
+  # production). It is cork's file rather than an edit, but it lands inside the
+  # tree the seed check diffs, and run.sh does not take the fleet down with -v,
+  # so a run that left one behind would fail the NEXT run at step 2.
+  rm -f "$CHALLENGES/base-pins.json"
 }
 # The generation each source currently carries on disk, maintained by
 # set_generation. A step that edits one source and must put it back cannot name
@@ -4431,8 +4436,10 @@ if (( FULL )); then
   #
   # cork's challenge row still holds this generation's source checksum
   # (updateChallenges commits the metadata before it builds), so an update
-  # inserted after this point would rebuild the persistent challenge and
-  # restart its instance. Nothing between here and the teardown runs one.
+  # inserted after this point rebuilds the persistent challenge and restarts its
+  # instance. The base-pins step below is the one that does, deliberately: it
+  # absorbs this restore alongside its own edit, which is why its update reports
+  # two challenges rebuilt and why it does not assert that only one was.
   set_generation "$persist_gen_before" persistent
   rm -rf "$ART_TMP"
   ok "the rebuild was refused for publishing an unreferenced artifact; the build row kept its checksum, flag and has_artifacts; cork went on serving the generation-2 archive byte for byte; instance $PERSIST_INST kept serving at $ppub:$pport; the builder is back to the tags it held and the failed generation's registry tag is gone"
@@ -5191,6 +5198,225 @@ else
   deselect "database busy: a launch and a stop that lose the write lock are retryable 503s"
 fi
 
+
+# ------------------------------- 15g. base image pins (full mode only)
+
+if (( FULL )); then
+step "base image pins: every base the corpus names resolves to a digest once, FROM is rewritten in the build context and never on disk, and a rebuild through the pins still builds and pushes"
+# Pinning is the only reason cork can build on BuildKit without asking Docker
+# Hub what ubuntu:24.04 means on essentially every build: it rewrites FROM to
+# the digest in the tar it hands the daemon, leaving several hundred challenge
+# Dockerfiles untouched (cmgr/basepins.go). The rewriting itself is unit
+# tested; what only a fleet can show is that a real build through a rewritten
+# context still produces an image the registry accepts. The step after this
+# one takes it further and has a worker serve it.
+#
+# Placed late on purpose. A refresh changes the pin fingerprint, and that is
+# folded into every build's content identity (contentChecksum, cmgr/docker.go),
+# so a generation built after this step is tagged differently from the same
+# source built before it. The steps that compare generations against each other
+# must not straddle that boundary.
+[[ "$(api GET /pins | jq -r '.pins | length')" == 0 ]] ||
+  fail "the pin map is already populated before pin-refresh: this step's before-and-after reading of CMGR_BASE_PINS proves nothing"
+rc=0
+pins_out=$(cmgrd-cli pin-refresh 2>&1) || rc=$?
+sed 's/^/       /' <<<"$pins_out"
+# Partial resolution is the expected outcome here, and it is the half worth
+# pinning: examples/disks builds on cmgr/examples-guestfish-base, which the
+# example's own tooling builds locally and no registry serves, so
+# DistributionInspect cannot answer for it. What must hold is that the refusal
+# is reported AND the references that did resolve are still written and in
+# force. A refresh that discarded the lot over one unresolvable base would be
+# unusable on any corpus that carries a locally built base.
+#
+# Conditional on the refusal actually happening, rather than asserting it: the
+# name is one Docker Hub could start serving, and a step that breaks because
+# somebody registered cmgr/examples-guestfish-base would be pinning another
+# registry's contents. Whichever way it goes, the map has to agree with it.
+pins=$(api GET /pins)
+if (( rc != 0 )); then
+  grep -q 'cmgr/examples-guestfish-base' <<<"$pins_out" ||
+    fail "pin-refresh reported a failure without naming the base it could not resolve: an operator cannot act on that"
+  jq -e '[.pins[] | select(.ref == "cmgr/examples-guestfish-base")] | length == 0' >/dev/null <<<"$pins" ||
+    fail "cmgr/examples-guestfish-base reached the pin map although it could not be resolved: an unresolved base must not be written"
+  note "cmgr/examples-guestfish-base is served by no registry: reported, left unpinned, and the bases that did resolve were written anyway"
+else
+  note "every base resolved, including cmgr/examples-guestfish-base: the partial-resolution path was not exercised this run"
+fi
+ubuntu_digest=$(jq -r '.pins[] | select(.ref == "ubuntu:24.04") | .digest' <<<"$pins")
+[[ "$ubuntu_digest" == sha256:* ]] ||
+  fail "ubuntu:24.04 is not pinned to a sha256 digest after a refresh (got '${ubuntu_digest:-nothing}'), so the examples still build on a mutable tag"
+(( $(jq -r '.pins[] | select(.ref == "ubuntu:24.04") | .in_use' <<<"$pins") >= 1 )) ||
+  fail "ubuntu:24.04 is pinned but reported as used by no challenge: the corpus scan and the pin map disagree"
+jq -e '[.pins[] | select(.digest | startswith("sha256:") | not)] | length == 0' >/dev/null <<<"$pins" ||
+  fail "the pin map holds an entry that is not a sha256 digest; cmgrd refuses to start on such a file, so this one would not survive a restart"
+note "pinned ubuntu:24.04 to $ubuntu_digest, $(jq -r '.pins | length' <<<"$pins") reference(s) in the map"
+
+# A rebuild with the pins in force. The build context every challenge is built
+# from now carries a rewritten FROM, so this is the first build in the run whose
+# Dockerfile the daemon sees is not the one on disk.
+#
+# Two challenges come back rebuilt, not one, and that is correct: the failed-
+# rebuild step above restores the persistent source to the generation it found
+# without running an update, so this update absorbs that restore as well as the
+# edit below. Hence no "the persistent challenge must not have been rebuilt"
+# assertion here, unlike the earlier update steps.
+OD_BUILD_UNPINNED=$(api GET "/builds/$OD_BUILD")
+set_generation 6 ondemand
+rc=0
+out=$(cmgrd-cli update --prune-old) || rc=$?
+sed 's/^/       /' <<<"$out"
+(( rc == 0 )) ||
+  fail "cmgrd-cli update exited $rc rebuilding $CH_ONDEMAND with base image pins in force: a rewritten build context must build exactly as the file on disk did"
+grep -q "  $CH_ONDEMAND$" <<<"$out" || fail "$CH_ONDEMAND was not rebuilt with pins in force"
+OD_BUILD_PINNED=$(api GET "/builds/$OD_BUILD")
+[[ "$(jq -r .checksum <<<"$OD_BUILD_PINNED")" != "$(jq -r .checksum <<<"$OD_BUILD_UNPINNED")" ]] ||
+  fail "build $OD_BUILD kept its content checksum: generation 6 was not built, so nothing below is a statement about pinning"
+OD_TAG_PINNED=$(image_tag "$OD_BUILD_PINNED" challenge)
+has_line "$OD_TAG_PINNED" registry_tags "$CH_ONDEMAND" ||
+  fail "$OD_TAG_PINNED is not in the registry: the image built from a pinned context was not pushed"
+
+# The Dockerfile on disk must still read ubuntu:24.04. Rewriting the source
+# would be a different feature with a different cost -- several hundred
+# challenges to edit and re-review -- and the whole design rests on not doing
+# it, so it is worth a line rather than an assumption.
+grep -q "^FROM ubuntu:24.04 AS base" "$CHALLENGES/runtime_env_vars/Dockerfile" ||
+  fail "the challenge Dockerfile on disk no longer reads 'FROM ubuntu:24.04 AS base': pinning must rewrite the build context only"
+
+# Inline cache. cork stamps the image it pushes with BuildKit's cache metadata
+# and offers that same tag back as a cache source, which is how a builder whose
+# local cache was reclaimed recovers the apt and pip layers every challenge
+# shares instead of re-running them once per challenge (cmgr/docker.go). It is
+# invisible to everything else in this run: the key is in the pushed config or
+# the recovery path is simply gone.
+man=$(registry_api "/v2/$CH_ONDEMAND/manifests/$OD_TAG_PINNED" \
+  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json')
+cfg=$(jq -r '.config.digest // empty' <<<"$man")
+[[ "$cfg" == sha256:* ]] ||
+  fail "could not read the config digest of $CH_ONDEMAND:$OD_TAG_PINNED from the registry"
+cfg_blob=$(registry_api "/v2/$CH_ONDEMAND/blobs/$cfg")
+jq -e 'has("moby.buildkit.cache.v0")' >/dev/null <<<"$cfg_blob" ||
+  fail "the image cork pushed carries no moby.buildkit.cache.v0 key: BUILDKIT_INLINE_CACHE did not reach the build, so a builder whose cache was reclaimed would rebuild every shared layer from scratch instead of importing them"
+
+ok "$(jq -r '.pins | length' <<<"$pins") base(s) pinned by digest and one unresolvable base reported without discarding them; generation 6 built from a rewritten context and pushed as $OD_TAG_PINNED carrying inline cache metadata; the challenge Dockerfile on disk is untouched"
+
+# ------------------------------------ 15h. the inline cache is IMPORTED
+
+step "inline cache import: with the builder's layer cache destroyed, a rebuild recovers the shared apt layer from the registry instead of re-running it"
+# The step above proves only the publish half -- that the pushed config carries
+# moby.buildkit.cache.v0. Nothing proved the import half, and the import half is
+# where this was quietly broken: CacheFrom named only the tag the build was
+# about to produce, and tags are content-addressed, so that tag cannot exist yet
+# whenever the source changed -- which is the only reason `update` rebuilds
+# anything. Every rebuild therefore asked the registry for something that could
+# not be there and imported nothing. cacheRefsFor now offers the generation
+# being displaced first (cmgr/docker.go).
+#
+# The proof is layer identity rather than timing, which would be flaky, or log
+# scraping, which cork does not surface. runtime_env_vars/Dockerfile is:
+#
+#     1  FROM ubuntu:24.04 AS base        -> layer 1, from the registry either way
+#     2  RUN apt-get install python3-pip socat  -> layer 2, THE ONE THAT MATTERS
+#     3  RUN mkdir /challenge             -> layer 3
+#     4  RUN echo ... metadata.json       -> layer 4
+#     5  RUN echo ... flag.txt            -> layer 5
+#     6  COPY server.py                   -> layer 6, changes every generation
+#
+# Layer 2 depends on the pinned base digest and its own RUN line, neither of
+# which differs between generations. Re-running it would still produce a
+# DIFFERENT digest -- an apt layer's tar carries the mtimes of the files that
+# run wrote -- so an identical digest across a build that started from an empty
+# cache can only have come from the registry. Layer 1 is identical either way
+# and proves nothing, which is exactly why the assertion names layer 2.
+OD_LAYERS_BEFORE=$(jq -r '.layers[].digest' <<<"$man")
+# The comparison below is only meaningful if the layers it compares include
+# ones cork BUILT. Base layers come from the registry whether or not the import
+# works, so a guard of "at least two layers" would be satisfied by one base
+# layer plus the COPY -- and the step would pass with the import completely
+# broken. ubuntu:24.04 is a single-layer image and runtime_env_vars/Dockerfile
+# adds five (two RUN in the base stage, two RUN and one COPY in the challenge
+# stage). Asserted rather than assumed, so that a base image gaining a layer or
+# the Dockerfile gaining an instruction fails here and is re-derived, instead of
+# quietly hollowing this step out.
+OD_EXPECTED_LAYERS=6
+(( $(wc -l <<<"$OD_LAYERS_BEFORE") == OD_EXPECTED_LAYERS )) ||
+  fail "$CH_ONDEMAND:$OD_TAG_PINNED has $(wc -l <<<"$OD_LAYERS_BEFORE") layers, expected $OD_EXPECTED_LAYERS (one for ubuntu:24.04 plus five from runtime_env_vars/Dockerfile). Re-derive this step: if the extra layers are base layers, the comparison below may be comparing nothing cork built"
+
+# Destroy the cache. This is the condition the whole step rests on: with it
+# non-empty a local hit is indistinguishable from a registry import.
+prune_out=$(curl -sS --fail-with-body --connect-timeout 5 --max-time 300   -X POST "$E2E_BUILDER/build/prune?all=true") ||
+  fail "could not prune the builder's build cache: $prune_out"
+# --fail-with-body, and a count rather than a sum. Without the former a 404 or
+# a renamed field yields an empty jq result; without the latter a cache RECORD
+# whose Size is 0 still produces a cache hit, so the sum can read zero with
+# usable cache present. Either way the precondition this step rests on -- that
+# a hit can only have come from the registry -- would be silently unmet.
+cache_left=$(curl -sS --fail-with-body --connect-timeout 5 --max-time 60 "$E2E_BUILDER/system/df" |
+  jq -r '.BuildCache | length') ||
+  fail "could not read the builder's build cache state from /system/df"
+[[ "$cache_left" == "0" ]] ||
+  fail "the builder still holds $cache_left build cache record(s) after 'build prune --all': this step cannot tell a registry import from a local cache hit unless the cache is genuinely empty"
+pruned_records=$(jq -r '.CachesDeleted | length? // 0' <<<"$prune_out")
+(( pruned_records > 0 )) ||
+  fail "'build prune --all' deleted no cache records, so the four challenges built above left no cache to destroy and the premise of this step does not hold"
+note "build cache pruned: $(jq -r '.SpaceReclaimed // 0' <<<"$prune_out") bytes reclaimed, $pruned_records records deleted"
+
+# Rebuild. Only server.py changes, so layer 6 must move and layers 1-5 must not.
+set_generation 7 ondemand
+rc=0
+out=$(cmgrd-cli update --prune-old) || rc=$?
+sed 's/^/       /' <<<"$out"
+(( rc == 0 )) ||
+  fail "cmgrd-cli update exited $rc rebuilding $CH_ONDEMAND from an empty build cache"
+grep -q "  $CH_ONDEMAND$" <<<"$out" || fail "$CH_ONDEMAND was not rebuilt for generation 7"
+OD_BUILD_IMPORTED=$(api GET "/builds/$OD_BUILD")
+OD_TAG_IMPORTED=$(image_tag "$OD_BUILD_IMPORTED" challenge)
+[[ "$OD_TAG_IMPORTED" != "$OD_TAG_PINNED" ]] ||
+  fail "build $OD_BUILD kept tag $OD_TAG_PINNED: generation 7 was not built, so nothing below is a statement about the cache"
+
+man_after=$(registry_api "/v2/$CH_ONDEMAND/manifests/$OD_TAG_IMPORTED"   -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json')
+OD_LAYERS_AFTER=$(jq -r '.layers[].digest' <<<"$man_after")
+
+# Every layer but the last, rather than a hand-picked index. Picking one (the
+# apt layer is instruction 2, so layer 2) quietly assumed ubuntu:24.04 ships
+# exactly one layer and that nothing is ever inserted above the apt line; if
+# either changed, the index would land on a BASE layer, which is identical
+# whether or not the import worked, and the step would pass while cacheRefsFor
+# was broken. The index-free form has neither failure and is strictly stronger:
+# it covers the flag layers too, which the flag being deterministic
+# (sha256(challenge:format:seed), cmgr/docker.go) makes reproducible content --
+# so they can only match if they were imported rather than re-run.
+n_before=$(wc -l <<<"$OD_LAYERS_BEFORE")
+n_after=$(wc -l <<<"$OD_LAYERS_AFTER")
+(( n_before == n_after )) ||
+  fail "the image gained or lost layers over the rebuild ($n_before -> $n_after): editing server.py must not change the shape of the image, so the comparison below is not between like and like"
+shared_before=$(head -n -1 <<<"$OD_LAYERS_BEFORE")
+shared_after=$(head -n -1 <<<"$OD_LAYERS_AFTER")
+top_before=$(tail -n1 <<<"$OD_LAYERS_BEFORE")
+top_after=$(tail -n1 <<<"$OD_LAYERS_AFTER")
+
+# The top layer must have moved, or the "rebuild" produced the same image and
+# there is nothing to conclude. Note this is a weaker statement than the tag
+# check above and is here for the diagnosis it gives, not for coverage.
+[[ "$top_after" != "$top_before" ]] ||
+  fail "the top layer is unchanged at $top_before after editing server.py: generation 7 reproduced generation 6's image, so nothing here shows a cache import"
+[[ "$shared_after" == "$shared_before" ]] ||
+  fail "$(printf '%s
+' "the layers below the top were rebuilt rather than imported."     "  before: $(tr '
+' ' ' <<<"$shared_before")"     "  after:  $(tr '
+' ' ' <<<"$shared_after")"     "The build cache was pruned to zero above, so the only other source is the registry:"     "CacheFrom offered nothing that could hit. See cacheRefsFor in cmgr/docker.go, which"     "must offer the generation being displaced and not only the tag this build creates.")"
+
+# And the image is still an image: served by a worker, with the build's flag.
+inst=$(launch "$OD_BUILD" "e2e-user-40" "e2e-value-40")
+track "$inst" 40
+check_ondemand "$inst" 40 "E2E_GENERATION=7"
+ok "from an empty build cache, generation 7 reproduced all $(( n_before - 1 )) of generation 6's lower layers byte for byte -- $(( n_before - 2 )) of them layers cork built, which only an import can explain -- and rebuilt only the one server.py changed; the image is served by $(jq -r .worker <<<"$inst")"
+else
+  # Every other full-mode block names what it skipped; the README promises a
+  # regular run lists them, and these two were not counted.
+  deselect "base image pins"
+  deselect "the inline cache is imported, not just published"
+fi
 # -------------------------------------------------------------- 16. teardown
 
 step "teardown: stop the remaining on-demand instances, remove the schema, check the workers, builder, and registry are clean"
