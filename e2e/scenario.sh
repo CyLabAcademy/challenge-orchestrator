@@ -168,6 +168,19 @@ builder_untag() {
   curl -sS --connect-timeout 5 --max-time 30 -o /dev/null -w '%{http_code}' \
     -X DELETE "$E2E_BUILDER/images/$1"
 }
+# builder_pull <repo> <tag>: pull an image onto the builder daemon.
+#
+# A fixture that deletes a registry tag needs a local copy to restore it from,
+# and it may not assume the builder still has one: with CMGR_PURGE_AFTER_PUSH on
+# (production's default) cork drops its copy the moment the push succeeds. The
+# create endpoint answers 200 and reports failures inside the stream, so the
+# body is what says whether this worked.
+builder_pull() {
+  local body
+  body=$(curl -sS --connect-timeout 5 --max-time 180 -X POST -H 'X-Registry-Auth: e30=' \
+    "$E2E_BUILDER/images/create?fromImage=$1&tag=$2" 2>&1) || return 1
+  ! grep -q '"error"' <<<"$body"
+}
 
 # has_line <line> <cmd...>: whether the command's output contains exactly that
 # line. Captures first: `cmd | grep -q` under pipefail fails spuriously when
@@ -1142,6 +1155,46 @@ for ip in "${WORKER_IPS[@]}"; do
   fi
 done
 ok "all instance images were pushed"
+
+# ------------------------------- 5b. purge after push
+
+step "purge after push: the builder keeps no copy of what it pushed, and keeps the layer cache that makes the next build cheap"
+# The two halves are one claim. Dropping the images is what stops the builder's
+# image store growing with the whole fleet -- challenges times seeds times
+# retained generations, on a volume it shares with the challenge tree, the
+# database and the artifacts. Keeping the cache is what makes that free rather
+# than a trade: under the legacy builder the cache WAS untagged images, so the
+# same reclaim re-ran every apt install in the fleet on the next build.
+#
+# This fleet always runs with CMGR_PURGE_AFTER_PUSH on, which is cmgrd's default
+# whenever a registry is configured. Turning it off is a supported setting but
+# not one any deployment uses -- and the case that genuinely needs the builder's
+# copies, single-host cmgr with no registry at all, cannot be run here because
+# every step of this fleet leans on zot.
+btags=$(builder_tags)
+held=""
+for id in "$CH_PERSISTENT" "$CH_ONDEMAND" "$CH_MAKE" "$CH_FLAGONLY"; do
+  if grep -q "^$E2E_REGISTRY/$id:" <<<"$btags"; then held="$held $id"; fi
+done
+[[ -z "$held" ]] ||
+  fail "the builder still holds images for$held after pushing them: purgeBuiltImages runs after finalizeBuild and should have dropped every one (cmgr/purge.go)"
+# The registry has to hold what the builder just gave up, or the purge threw
+# away the only copy rather than a redundant one. This is also what keeps the
+# check above from passing on a build that produced nothing.
+for id in "$CH_PERSISTENT" "$CH_ONDEMAND" "$CH_MAKE" "$CH_FLAGONLY"; do
+  has_line "${IMAGE_TAG[$id]}" registry_tags "$id" ||
+    fail "$id is neither on the builder nor in the registry: the purge dropped an image that was never pushed"
+done
+# The cache the purge must not have cost. Reported by the daemon rather than
+# read off disk, because the bytes live in overlay2 rather than under
+# /var/lib/docker/buildkit and du on the wrong directory would say zero.
+cache_bytes=$(curl -sS --connect-timeout 5 --max-time 60 "$E2E_BUILDER/system/df" |
+  jq -r '[.BuildCache[]?.Size] | add // 0')
+[[ "$cache_bytes" =~ ^[0-9]+$ ]] ||
+  fail "could not read the builder's build cache size from /system/df (got '$cache_bytes')"
+(( cache_bytes > 0 )) ||
+  fail "the builder's BuildKit cache is empty after building four challenges: image removal must not reach it, or every rebuild re-runs the shared apt and pip layers"
+ok "the builder holds no challenge images, the registry holds all four, and $(( cache_bytes / 1024 / 1024 ))MB of layer cache survived the purge"
 
 ############################################################################
 # BLOCK 1 -- full-mode step, goes after the registry step's ok (line 658)
@@ -2595,9 +2648,14 @@ tags=$(registry_tags "$CH_ONDEMAND")
 grep -qx "$OD_TAG_G3" <<<"$tags" || fail "generation 3 tag $OD_TAG_G3 was not pushed"
 grep -qx "$OD_TAG_G2" <<<"$tags" || fail "generation 2 tag $OD_TAG_G2 left the registry although it is the rollback target"
 if grep -qx "$OD_TAG_G1" <<<"$tags"; then fail "generation 1 tag $OD_TAG_G1 is still in the registry after --prune-old"; fi
+# Retention is asserted against the registry above, which is where it lives for
+# a registry deployment: the builder drops every generation at push, so its
+# copies say nothing about what cork retains. What the builder is still good
+# for is proving the purge ran at all.
 btags=$(builder_tags)
-if grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G1" <<<"$btags"; then fail "generation 1 image is still tagged on the builder after --prune-old"; fi
-grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3" <<<"$btags" || fail "generation 3 image is not on the builder"
+if grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3" <<<"$btags"; then
+  fail "generation 3 is tagged on the builder after the rebuild: purgeBuiltImages should have dropped it at push (cmgr/purge.go)"
+fi
 for id in "${OD_IDS[@]}"; do
   assert_torn_down "$id"
 done
@@ -2633,8 +2691,15 @@ if (( FULL )); then
     fail "$CH_MAKE builds $mk_images launchable images: this step deletes the one tag IMAGE_TAG[$CH_MAKE] names, which only makes the pull fail while the challenge has exactly one"
   has_line "$MK_REF" worker_tags "$MK_WORKER" ||
     fail "worker $MK_WORKER does not hold $MK_REF although the remote-make step launched an instance of it there: the warm half of this step would have nothing to prove"
+  # The restore path is a push from the builder, so it needs a local copy --
+  # and with CMGR_PURGE_AFTER_PUSH on there is none, because cork drops it the
+  # moment the push succeeds. Pull it back while the tag still resolves, which
+  # makes the delete below reversible whichever way the purge is configured
+  # rather than dependent on the builder having retained anything.
+  builder_pull "$E2E_REGISTRY/$CH_MAKE" "$MK_TAG" ||
+    fail "could not pull $MK_REF onto the builder, so the tag this step deletes from zot could not be pushed back afterwards; refusing to delete it rather than leave the registry short"
   has_line "$MK_REF" builder_tags ||
-    fail "the builder does not hold $MK_REF, so the tag this step deletes from zot could not be pushed back afterwards; refusing to delete it rather than leave the registry short"
+    fail "the builder does not hold $MK_REF after pulling it back from the registry"
   # Deterministic fixture: an earlier run may have placed binex101 on the other
   # worker too, and one leftover image there turns the cold half into a warm one.
   code=$(worker_status "$COLD_WORKER" "/images/$MK_REF" -X DELETE)
@@ -3057,12 +3122,10 @@ grep -qx "$OD_TAG_G5" <<<"$tags" || fail "generation 5 tag $OD_TAG_G5 was not pu
 grep -qx "$OD_TAG_G4" <<<"$tags" || fail "generation 4 tag $OD_TAG_G4 left the registry although it is the rollback target"
 grep -qx "$OD_TAG_G3" <<<"$tags" ||
   fail "an update without --prune-old untagged the displaced generation 3 ($OD_TAG_G3) in the registry: displaced tags are collected only when PruneOldImages is set (cmgr/api.go, cmgr/database_challenges.go), because a content tag may be referenced by another cmgr on the same daemon"
-btags=$(builder_tags)
-grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G5" <<<"$btags" || fail "generation 5 image is not on the builder"
-grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G4" <<<"$btags" || fail "generation 4 image left the builder although it is the rollback target"
-grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3" <<<"$btags" ||
-  fail "an update without --prune-old untagged the displaced generation 3 on the builder ($E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G3): pruneReplacedImages must only ever run for an update that asked for it (cmgr/database_challenges.go)"
-note "generation 3 ($OD_TAG_G3) is referenced by nothing cork retains and is still tagged on the builder and in zot"
+# The builder has no copy of any of these to check: cork drops each generation
+# at push, so "an update without --prune-old leaves the displaced generation
+# alone" is a claim about the registry here, which is the copy that matters.
+note "generation 3 ($OD_TAG_G3) is referenced by nothing cork retains and is still tagged in zot"
 # What the teardown reads, and what every later plant_orphan and the
 # incomplete-reconcile blocker build their container from. Set before the
 # relaunches, so the pulls below are the ones that put it on both boxes.
@@ -4818,8 +4881,14 @@ if (( FULL )); then
     # a build that was never tagged anywhere.
     has_line "$fo_tag" registry_tags "$CH_FLAGONLY" ||
       fail "build $fo_build did not push $E2E_REGISTRY/$CH_FLAGONLY:$fo_tag, so there is no tag for the destroy to leak"
-    has_line "$E2E_REGISTRY/$CH_FLAGONLY:$fo_tag" builder_tags ||
-      fail "build $fo_build is not tagged on the builder, so there is no local untag to assert"
+    # There is no second control on the builder to make: cork dropped its copy
+    # at push, so there is no local untag left to assert and the step rests on
+    # its registry half -- which is its actual subject anyway: a destroy that
+    # cannot reach the registry still answers 204, fast, and leaks exactly one
+    # recoverable tag.
+    if has_line "$E2E_REGISTRY/$CH_FLAGONLY:$fo_tag" builder_tags; then
+      fail "build $fo_build is tagged on the builder: it should have been dropped at push (cmgr/purge.go)"
+    fi
 
     zot=$(compose_container zot)
     [[ -n "$zot" ]] || fail "compose container for the registry (service zot) not found"
