@@ -8,7 +8,7 @@ import "testing"
 // real generation would be indistinguishable from "none" (default 0, the
 // migration's checksum=0 marker, and prevchecksum=0 meaning no rollback gen).
 func TestContentChecksumNeverZero(t *testing.T) {
-	if got := contentChecksum(0x05f16712, "flag{%s}", 0); got == 0 {
+	if got := contentChecksum(0x05f16712, "flag{%s}", 0, 0); got == 0 {
 		t.Fatal("contentChecksum returned 0 for a known CRC-32-zero input; 0 must be reserved as the unset sentinel")
 	}
 }
@@ -147,7 +147,7 @@ func TestOpenBuildStampsChecksum(t *testing.T) {
 	if err := mgr.openBuild(build); err != nil {
 		t.Fatalf("openBuild failed: %s", err)
 	}
-	if want := contentChecksum(sourceChecksum, format, 0); build.Checksum != want {
+	if want := contentChecksum(sourceChecksum, format, 0, 0); build.Checksum != want {
 		t.Errorf("openBuild stamped checksum %#x, want %#x", build.Checksum, want)
 	}
 }
@@ -220,7 +220,7 @@ func TestMigrateBuildChecksumsResumable(t *testing.T) {
 	if err := mgr.db.Get(&got, "SELECT checksum FROM builds WHERE id = ?;", id); err != nil {
 		t.Fatalf("failed to read checksum: %s", err)
 	}
-	if want := contentChecksum(sourceChecksum, format, 0); got != want {
+	if want := contentChecksum(sourceChecksum, format, 0, 0); got != want {
 		t.Errorf("resumed backfill checksum = %#x, want %#x", got, want)
 	}
 

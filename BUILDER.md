@@ -25,6 +25,7 @@ Three things then sit on top:
 |---|---|---|
 | Base image pinning | rewrites `FROM name:tag` to `FROM name@sha256:…` **in the build context tar**, never on disk | `cmgr/basepins.go` |
 | Pin fingerprint | the pin map's checksum is folded into a build's content identity | `contentChecksum`, `cmgr/docker.go` |
+| Type template | the built-in Dockerfile of a `flag-only`, `remote-make` or `static-make` challenge is folded into the identity too, so a cork release that changes one changes the identity of future builds (never a rebuild by itself; custom challenges carry their Dockerfile in their source) | `templateChecksum`, `cmgr/docker.go` |
 | Inline cache | pushed images carry BuildKit cache metadata; a rebuild imports from the generation it displaces | `executeBuild` and `cacheRefsFor`, `cmgr/docker.go` |
 | Purge after push | the builder's local copy of a build's images is dropped once they are in the registry | `cmgr/purge.go` |
 | Write-once publish | a build is pushed only once it has validated, and a tag already in the registry is never pushed over | `publishImages` and `registryTagExists`, `cmgr/docker.go`, `cmgr/registry.go` |

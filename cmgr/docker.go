@@ -303,30 +303,32 @@ func dockerStreamError(messages []byte) error {
 }
 
 // contentChecksum derives the content identity of a build's images from the
-// challenge source checksum, the flag format, and the base image pins.
+// challenge source checksum, the flag format, the base image pins, and the
+// built-in Dockerfile template of the challenge's type.
 //
 // The pins are folded in so that a build produced against a moved base is a
 // different image identity from one produced against the old base: the two
 // cannot collide on a tag, the rollback generation stays meaningful, and a
-// stale image is never reused for content it no longer matches. It is NOT a
-// rebuild trigger -- DetectChanges reads only the challenge directory, so
-// refreshing pins does not by itself cause anything to rebuild (see
-// basepins.go). The source content reaches
-// the image through the build context (and the pinned base image); the flag
-// format enters as a build arg. The seed also affects image content but is
-// carried explicitly in the docker tag, so it is not folded in here.
+// stale image is never reused for content it no longer matches. The template
+// is folded in for the same reason: a challenge-type change, or a cmgr
+// release shipping a different built-in Dockerfile, changes what the build
+// context contains and so must change the identity of the image built from
+// it. Neither is a rebuild trigger -- DetectChanges reads only the challenge
+// directory, and currency is kept on the source generation
+// (BuildMetadata.SourceChecksum), so refreshing pins or upgrading cmgr does
+// not by itself cause anything to rebuild; each changes the identity of
+// future builds only (see basepins.go). The source content reaches the image
+// through the build context (and the pinned base image); the flag format
+// enters as a build arg. The seed also affects image content but is carried
+// explicitly in the docker tag, so it is not folded in here.
 //
-// Caveat: the embedded per-type Dockerfile (m.GetDockerfile) is part of the
-// build context but NOT part of this checksum. So a rebuild whose only change
-// is the challenge type, or a cmgr release shipping a different built-in
-// Dockerfile (e.g. a base-image bump), yields different image content under an
-// unchanged tag. Within one database this is just the tag reuse the scheme
-// already tolerates; across databases sharing a daemon it means identical
-// tuples can resolve to differing content. Folding the type Dockerfile (or a
-// build-machinery version) in here would close that, but the migration
-// backfill cannot reconstruct a legacy row's historical Dockerfile, so it is
-// deferred.
-func contentChecksum(sourceChecksum uint32, format string, basePins uint32) uint32 {
+// template is templateChecksum of the challenge's type: 0 for a custom
+// challenge, whose Dockerfile is in its source tree and already in
+// sourceChecksum, so those identities are unchanged by its introduction. Rows
+// stamped before it keep their stored checksum: identities are recorded, not
+// recomputed, and the migration backfill (which cannot know a legacy row's
+// historical Dockerfile) presumes the current one, as it does for the pins.
+func contentChecksum(sourceChecksum uint32, format string, basePins uint32, template uint32) uint32 {
 	h := crc32.NewIEEE()
 	var src [4]byte
 	binary.BigEndian.PutUint32(src[:], sourceChecksum)
@@ -338,6 +340,13 @@ func contentChecksum(sourceChecksum uint32, format string, basePins uint32) uint
 		var bp [4]byte
 		binary.BigEndian.PutUint32(bp[:], basePins)
 		h.Write(bp[:])
+	}
+	// Likewise only for the built-in types, so a custom challenge's identity
+	// is exactly what it was.
+	if template != 0 {
+		var tp [4]byte
+		binary.BigEndian.PutUint32(tp[:], template)
+		h.Write(tp[:])
 	}
 	sum := h.Sum32()
 	// 0 is reserved as the "unset / not-yet-migrated" sentinel: builds.checksum
@@ -351,6 +360,18 @@ func contentChecksum(sourceChecksum uint32, format string, basePins uint32) uint
 		sum = 1
 	}
 	return sum
+}
+
+// templateChecksum is the content identity contribution of a challenge type's
+// built-in Dockerfile: a CRC-32 of the embedded template as shipped, before
+// the base pins are applied to it (the pins are in the identity already). 0
+// for a type without one (custom), which contentChecksum treats as absent.
+func (m *Manager) templateChecksum(challengeType string) uint32 {
+	template := m.GetDockerfile(challengeType)
+	if len(template) == 0 {
+		return 0
+	}
+	return crc32.ChecksumIEEE(template)
 }
 
 // dockerId is the docker tag for one of the build's images. It is derived
@@ -383,9 +404,10 @@ func (m *Manager) migrateBuildChecksums(db *sqlx.DB) error {
 		Seed           int
 		Format         string
 		Challenge      string
+		ChallengeType  string `db:"challengetype"`
 		SourceChecksum uint32 `db:"sourcechecksum"`
 	}{}
-	err := db.Select(&rows, `SELECT b.id, b.seed, b.format, b.challenge, c.sourcechecksum
+	err := db.Select(&rows, `SELECT b.id, b.seed, b.format, b.challenge, c.challengetype, c.sourcechecksum
 		FROM builds AS b JOIN challenges AS c ON b.challenge = c.id
 		WHERE b.checksum = 0;`)
 	if err != nil {
@@ -393,7 +415,7 @@ func (m *Manager) migrateBuildChecksums(db *sqlx.DB) error {
 	}
 
 	for _, row := range rows {
-		checksum := contentChecksum(row.SourceChecksum, row.Format, m.basePinsChecksum())
+		checksum := contentChecksum(row.SourceChecksum, row.Format, m.basePinsChecksum(), m.templateChecksum(row.ChallengeType))
 
 		// Retag first: checksum=0 is the resume marker, so it is stamped only
 		// once the images provably carry the new tag (or are shown to need no
@@ -691,7 +713,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	// The source generation is recorded alongside: it reaches the row only
 	// through finalizeBuild, so a build that fails below keeps the generation
 	// it still serves and stays detectable as stale.
-	bMeta.Checksum = contentChecksum(cMeta.SourceChecksum, bMeta.Format, m.basePinsChecksum())
+	bMeta.Checksum = contentChecksum(cMeta.SourceChecksum, bMeta.Format, m.basePinsChecksum(), m.templateChecksum(cMeta.ChallengeType))
 	bMeta.SourceChecksum = cMeta.SourceChecksum
 
 	images := []Image{}

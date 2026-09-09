@@ -40,9 +40,12 @@ func (m *Manager) openBuild(build *BuildMetadata) error {
 	// the challenge's source checksum is unavailable the row keeps its incoming
 	// value (finalizeBuild still stamps the real one on success).
 	if build.Checksum == 0 {
-		var srcChecksum uint32
-		if err := m.db.Get(&srcChecksum, "SELECT sourcechecksum FROM challenges WHERE id = ?;", build.Challenge); err == nil {
-			build.Checksum = contentChecksum(srcChecksum, build.Format, m.basePinsChecksum())
+		var challenge struct {
+			SourceChecksum uint32 `db:"sourcechecksum"`
+			ChallengeType  string `db:"challengetype"`
+		}
+		if err := m.db.Get(&challenge, "SELECT sourcechecksum, challengetype FROM challenges WHERE id = ?;", build.Challenge); err == nil {
+			build.Checksum = contentChecksum(challenge.SourceChecksum, build.Format, m.basePinsChecksum(), m.templateChecksum(challenge.ChallengeType))
 		}
 	}
 

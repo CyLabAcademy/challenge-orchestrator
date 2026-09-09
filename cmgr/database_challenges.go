@@ -867,12 +867,11 @@ func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId,
 
 		// Rotate the retention pair; a rebuild that reproduced the
 		// same content checksum leaves the rollback target untouched.
-		// Caveat: a checksum-stable but content-changing rebuild (a
-		// challenge-type change, or a cmgr release with a different
-		// built-in Dockerfile — see contentChecksum) is not rotated,
-		// so its displaced image is left dangling rather than
-		// retained; that class falls outside the {current, previous}
-		// retention guarantee.
+		// The checksum covers every input to the build context (source,
+		// flag format, base pins, the type's built-in Dockerfile — see
+		// contentChecksum), so a rebuild that changes the image changes
+		// the checksum and rotates; what is left is the build's own
+		// non-reproducibility (package installs), which the pins bound.
 		build.PrevChecksum = rotatedPrevChecksum(oldChecksum, build.Checksum, build.PrevChecksum)
 
 		// Update database
