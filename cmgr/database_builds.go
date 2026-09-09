@@ -345,3 +345,28 @@ func (m *Manager) queryForSchemas() ([]string, error) {
 	err := m.db.Select(&schemas, "SELECT DISTINCT schema FROM builds;")
 	return schemas, err
 }
+
+// staleBuildIds lists the builds of a challenge produced from a source
+// generation other than the one the challenge row records: their last rebuild
+// failed after updateChallenges had committed the new metadata, so they still
+// serve an earlier generation. Unbuilt rows (no flag, no generation) are not
+// stale — they have nothing to serve and are built by their schema's converge.
+func (m *Manager) staleBuildIds(cMeta *ChallengeMetadata) ([]BuildId, error) {
+	ids := []BuildId{}
+	err := m.db.Select(&ids,
+		"SELECT id FROM builds WHERE challenge=? AND flag != '' AND sourcechecksum != ? ORDER BY id;",
+		cMeta.Id, cMeta.SourceChecksum)
+	if err != nil {
+		m.log.errorf("failed to look up stale builds of %s: %s", cMeta.Id, err)
+		return nil, err
+	}
+	return ids, nil
+}
+
+// hasStaleBuilds reports whether staleBuildIds would name anything. A query
+// error counts as "not stale": the update goes on classifying by checksums as
+// it always has, and the error is logged where it happened.
+func (m *Manager) hasStaleBuilds(cMeta *ChallengeMetadata) bool {
+	ids, err := m.staleBuildIds(cMeta)
+	return err == nil && len(ids) > 0
+}

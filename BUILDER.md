@@ -125,6 +125,12 @@ challenge still costs a tag resolution on every build of it. Pin all of them.
 **Do**
 
 - Run `pin-refresh` immediately before a batch update, not after.
+- **Re-run `update` after one that failed.** A build whose rebuild failed keeps
+  serving the generation it had, while the challenge row already carries the
+  new source; each build records the source generation it was produced from
+  (`builds.sourcechecksum`), so the difference is reported as `Stale` by every
+  `update` and `update --dry-run` until a rebuild succeeds, and `update`
+  rebuilds exactly those builds. Nothing has to be edited to make it happen.
 - **Put the whole challenge fleet into maintenance for the rebuild.** cork
   serializes updates against each other, but nothing stops the platform from
   requesting launches of a build while that build is being replaced — and a
@@ -252,8 +258,9 @@ number in this document currently rests on.
 ## Limitations
 
 1. **No fleet-wide rebuild.** `update` rebuilds only what the challenge
-   directory says changed. There is no force-rebuild-everything path, so a base
-   bump propagates challenge by challenge as each one is next touched.
+   directory says changed, plus whatever an earlier rebuild failed to replace
+   (see Do). There is no force-rebuild-everything path, so a base bump
+   propagates challenge by challenge as each one is next touched.
 2. **The fingerprint is coarse.** The whole pin map is hashed, so moving any one
    base changes the content identity of every build, not just the ones on that
    base. Per-challenge precision was deferred. It costs nothing while nothing

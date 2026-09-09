@@ -628,187 +628,7 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 				continue
 			}
 
-			if len(buildIds) > 0 {
-				buildCtxFile, err := m.createBuildContext(metadata, m.GetDockerfile(metadata.ChallengeType))
-				if err != nil {
-					m.log.errorf("failed to create build context: %s", err)
-					errs = append(errs, err)
-					continue
-				}
-				defer os.Remove(buildCtxFile)
-
-				replaced := []replacedImages{}
-				for _, buildId := range buildIds {
-					build, err := m.lookupBuildMetadata(buildId)
-					if err != nil {
-						errs = append(errs, err)
-						continue
-					}
-					cMeta, err := m.lookupChallengeMetadata(build.Challenge)
-					if err != nil {
-						errs = append(errs, err)
-						continue
-					}
-
-					// Capture the retention pair before executeBuild stamps the
-					// new content checksum: the current generation becomes the
-					// retained rollback target (PrevChecksum) and the old
-					// rollback generation is displaced from retention.
-					oldChecksum := build.Checksum
-					displaced := build.PrevChecksum
-
-					// Resetting the flag signals to rebuild the Dockerfile
-					build.Flag = ""
-					err = m.executeBuild(metadata, build, buildCtxFile)
-					if err != nil {
-						errs = append(errs, err)
-						continue
-					}
-
-					// Rotate the retention pair; a rebuild that reproduced the
-					// same content checksum leaves the rollback target untouched.
-					// Caveat: a checksum-stable but content-changing rebuild (a
-					// challenge-type change, or a cmgr release with a different
-					// built-in Dockerfile — see contentChecksum) is not rotated,
-					// so its displaced image is left dangling rather than
-					// retained; that class falls outside the {current, previous}
-					// retention guarantee.
-					build.PrevChecksum = rotatedPrevChecksum(oldChecksum, build.Checksum, build.PrevChecksum)
-
-					// Update database
-					err = m.finalizeBuild(build)
-					if err != nil {
-						errs = append(errs, err)
-						continue
-					}
-
-					// Stop and tear down existing instances. Persistent (schema-managed)
-					// instances are restarted in place with the new image. On-demand
-					// (dynamic) instances are started per user with injected env vars
-					// that are not retained, so they cannot be restarted: they are
-					// removed entirely (containers, network and record), and the
-					// platform re-issues POST /builds/<id> for the ones it still wants,
-					// instead of being left as hollow records that only a later stop or
-					// the prune age would clear. Non-service challenges never run
-					// instances, so any found here are placeholders left by older
-					// versions of cmgr and are removed the same way.
-					//
-					// Both lookups below purge on their way out. The purge is
-					// held until after the restarts only to protect them, and
-					// neither path reaches a restart -- so there is nothing
-					// left to wait behind, and skipping it would leak this
-					// build's images for good: purgeBuiltImages is the only
-					// thing that reclaims them.
-					revPortMap, err := m.getReversePortMap(build.Challenge)
-					if err != nil {
-						errs = append(errs, err)
-						m.purgeBuiltImages(build)
-						continue
-					}
-					instances, err := m.getBuildInstances(build.Id)
-					if err != nil {
-						errs = append(errs, err)
-						m.purgeBuiltImages(build)
-						continue
-					}
-					for _, iid := range instances {
-						instance, err := m.lookupInstanceMetadata(iid)
-						if err != nil {
-							// The list above is a moment old and the platform
-							// stops on-demand instances continuously, so an id
-							// that has gone between the two is ordinary rather
-							// than a failure: for a dynamic build it is the
-							// outcome this loop was about to produce anyway, and
-							// for a persistent one the next converge relaunches
-							// it. Reporting it would fail an operator's
-							// update-schema for a race it cannot avoid.
-							if _, gone := err.(*UnknownIdentifierError); gone {
-								m.log.debugf("instance %d of %s went away before the rebuild reached it", iid, build.Challenge)
-								continue
-							}
-							errs = append(errs, err)
-							continue
-						}
-						// A row that has not finalized belongs to a launch still
-						// running: the row is there, its containers are not yet.
-						// Stopping it would delete the row under that launch —
-						// ON DELETE CASCADE takes its container rows with it — so
-						// the launch would fail on a foreign key, which cmgrd
-						// reports as a plain 500 rather than the 503 the platform
-						// retries. Leave it alone; it finishes on the generation
-						// it read (see Start).
-						if !instance.IsFinalized {
-							continue
-						}
-						if build.InstanceCount == DYNAMIC_INSTANCES || !cMeta.NeedsInstance() {
-							if err = m.stopInstance(instance); err != nil {
-								errs = append(errs, err)
-							}
-							continue
-						}
-						// Restart in place, or remove. The restart pulls the new generation
-						// first, while the old one keeps serving, then swaps. One that cannot
-						// happen (its worker down: every docker call to it would only time
-						// out) or that fails at any point removes the instance instead, like
-						// any stop on a down worker, and reports it: the next update-schema
-						// relaunches it fresh. Left in place it would either count as present
-						// while dead, or come back serving the old image once its box rejoins,
-						// since a later update finds nothing to rebuild.
-						if instance.Worker != "" && m.workerIsDown(instance.Worker) {
-							err = fmt.Errorf("worker %s is down", instance.Worker)
-						} else {
-							err = m.restartInstance(build, cMeta, instance, revPortMap)
-						}
-						if err != nil {
-							err = fmt.Errorf("instance %d of %s removed instead of restarted (%v); the next update-schema relaunches it", instance.Id, build.Challenge, err)
-							m.log.warn(err)
-							errs = append(errs, err)
-							if err = m.stopInstance(instance); err != nil {
-								errs = append(errs, err)
-							}
-						}
-					}
-
-					// The builder's copies are redundant once pushed
-					// (purge.go), but only after the restarts above.
-					// restartInstance goes through ensureImages, which pulls
-					// for whichever daemon hosts the instance -- and a pull
-					// that fails there does not merely cost time: the handler
-					// above removes the instance instead of restarting it. So
-					// purging first turns a registry blip in the middle of an
-					// update into destroyed instances that stay down until
-					// someone re-runs update-schema. Held until the instances
-					// this build serves are running again, the cost of a blip
-					// is back to what it was: nothing.
-					m.purgeBuiltImages(build)
-
-					// The displaced generation (two rebuilds back) leaves
-					// retention; the just-replaced one survives as the
-					// rollback target. Its tags are reconstructed over the
-					// current host set — a generation built with different
-					// hosts leaves strays for a future sweep to reclaim.
-					if pruneOldImages && displacedPruneCandidate(oldChecksum, build.Checksum, displaced) {
-						displacedMeta := BuildMetadata{
-							Challenge: build.Challenge,
-							Seed:      build.Seed,
-							Format:    build.Format,
-							Checksum:  displaced,
-						}
-						tags := make([]string, 0, len(build.Images))
-						for _, image := range build.Images {
-							tags = append(tags, m.instanceImageName(build.Challenge, &displacedMeta, image))
-						}
-						replaced = append(replaced, replacedImages{tags: tags, meta: displacedMeta})
-					}
-				}
-
-				// Pruning waits until every build of this challenge has been
-				// processed: other rows can still hold the displaced checksum
-				// as their current or rollback generation until their own
-				// rebuild lands (or if it failed above) — contentReferenced
-				// keeps the images alive in all of those cases.
-				m.pruneReplacedImages(replaced)
-			}
+			errs = append(errs, m.rebuildBuilds(metadata, buildIds, pruneOldImages)...)
 		}
 	}
 	return errs
@@ -992,3 +812,220 @@ const (
 		points = :points
 	WHERE id = :id;`
 )
+
+// rebuildBuilds rebuilds the given builds of a challenge from its current
+// source (the challenge row is expected to be persisted already): each is
+// built, finalized, and its instances restarted or removed; the builder's
+// copies are purged once the restarts are done; and, with pruneOldImages, the
+// generation displaced from rollback retention is untagged once every build
+// has been processed. A build whose rebuild fails is skipped: it keeps its
+// previous generation on record (finalizeBuild is never reached) and stays
+// reported as Stale until a later update rebuilds it. This is the whole of a
+// rebuild; updateChallenges hands it every build of a changed challenge and
+// rebuildStaleChallenges only the ones still at an earlier generation.
+func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId, pruneOldImages bool) []error {
+	errs := []error{}
+	if len(buildIds) == 0 {
+		return errs
+	}
+
+	buildCtxFile, err := m.createBuildContext(metadata, m.GetDockerfile(metadata.ChallengeType))
+	if err != nil {
+		m.log.errorf("failed to create build context: %s", err)
+		errs = append(errs, err)
+		return errs
+	}
+	defer os.Remove(buildCtxFile)
+
+	replaced := []replacedImages{}
+	for _, buildId := range buildIds {
+		build, err := m.lookupBuildMetadata(buildId)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		cMeta, err := m.lookupChallengeMetadata(build.Challenge)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		// Capture the retention pair before executeBuild stamps the
+		// new content checksum: the current generation becomes the
+		// retained rollback target (PrevChecksum) and the old
+		// rollback generation is displaced from retention.
+		oldChecksum := build.Checksum
+		displaced := build.PrevChecksum
+
+		// Resetting the flag signals to rebuild the Dockerfile
+		build.Flag = ""
+		err = m.executeBuild(metadata, build, buildCtxFile)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		// Rotate the retention pair; a rebuild that reproduced the
+		// same content checksum leaves the rollback target untouched.
+		// Caveat: a checksum-stable but content-changing rebuild (a
+		// challenge-type change, or a cmgr release with a different
+		// built-in Dockerfile — see contentChecksum) is not rotated,
+		// so its displaced image is left dangling rather than
+		// retained; that class falls outside the {current, previous}
+		// retention guarantee.
+		build.PrevChecksum = rotatedPrevChecksum(oldChecksum, build.Checksum, build.PrevChecksum)
+
+		// Update database
+		err = m.finalizeBuild(build)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		// Stop and tear down existing instances. Persistent (schema-managed)
+		// instances are restarted in place with the new image. On-demand
+		// (dynamic) instances are started per user with injected env vars
+		// that are not retained, so they cannot be restarted: they are
+		// removed entirely (containers, network and record), and the
+		// platform re-issues POST /builds/<id> for the ones it still wants,
+		// instead of being left as hollow records that only a later stop or
+		// the prune age would clear. Non-service challenges never run
+		// instances, so any found here are placeholders left by older
+		// versions of cmgr and are removed the same way.
+		//
+		// Both lookups below purge on their way out. The purge is
+		// held until after the restarts only to protect them, and
+		// neither path reaches a restart -- so there is nothing
+		// left to wait behind, and skipping it would leak this
+		// build's images for good: purgeBuiltImages is the only
+		// thing that reclaims them.
+		revPortMap, err := m.getReversePortMap(build.Challenge)
+		if err != nil {
+			errs = append(errs, err)
+			m.purgeBuiltImages(build)
+			continue
+		}
+		instances, err := m.getBuildInstances(build.Id)
+		if err != nil {
+			errs = append(errs, err)
+			m.purgeBuiltImages(build)
+			continue
+		}
+		for _, iid := range instances {
+			instance, err := m.lookupInstanceMetadata(iid)
+			if err != nil {
+				// The list above is a moment old and the platform
+				// stops on-demand instances continuously, so an id
+				// that has gone between the two is ordinary rather
+				// than a failure: for a dynamic build it is the
+				// outcome this loop was about to produce anyway, and
+				// for a persistent one the next converge relaunches
+				// it. Reporting it would fail an operator's
+				// update-schema for a race it cannot avoid.
+				if _, gone := err.(*UnknownIdentifierError); gone {
+					m.log.debugf("instance %d of %s went away before the rebuild reached it", iid, build.Challenge)
+					continue
+				}
+				errs = append(errs, err)
+				continue
+			}
+			// A row that has not finalized belongs to a launch still
+			// running: the row is there, its containers are not yet.
+			// Stopping it would delete the row under that launch —
+			// ON DELETE CASCADE takes its container rows with it — so
+			// the launch would fail on a foreign key, which cmgrd
+			// reports as a plain 500 rather than the 503 the platform
+			// retries. Leave it alone; it finishes on the generation
+			// it read (see Start).
+			if !instance.IsFinalized {
+				continue
+			}
+			if build.InstanceCount == DYNAMIC_INSTANCES || !cMeta.NeedsInstance() {
+				if err = m.stopInstance(instance); err != nil {
+					errs = append(errs, err)
+				}
+				continue
+			}
+			// Restart in place, or remove. The restart pulls the new generation
+			// first, while the old one keeps serving, then swaps. One that cannot
+			// happen (its worker down: every docker call to it would only time
+			// out) or that fails at any point removes the instance instead, like
+			// any stop on a down worker, and reports it: the next update-schema
+			// relaunches it fresh. Left in place it would either count as present
+			// while dead, or come back serving the old image once its box rejoins,
+			// since a later update finds nothing to rebuild.
+			if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+				err = fmt.Errorf("worker %s is down", instance.Worker)
+			} else {
+				err = m.restartInstance(build, cMeta, instance, revPortMap)
+			}
+			if err != nil {
+				err = fmt.Errorf("instance %d of %s removed instead of restarted (%v); the next update-schema relaunches it", instance.Id, build.Challenge, err)
+				m.log.warn(err)
+				errs = append(errs, err)
+				if err = m.stopInstance(instance); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+
+		// The builder's copies are redundant once pushed
+		// (purge.go), but only after the restarts above.
+		// restartInstance goes through ensureImages, which pulls
+		// for whichever daemon hosts the instance -- and a pull
+		// that fails there does not merely cost time: the handler
+		// above removes the instance instead of restarting it. So
+		// purging first turns a registry blip in the middle of an
+		// update into destroyed instances that stay down until
+		// someone re-runs update-schema. Held until the instances
+		// this build serves are running again, the cost of a blip
+		// is back to what it was: nothing.
+		m.purgeBuiltImages(build)
+
+		// The displaced generation (two rebuilds back) leaves
+		// retention; the just-replaced one survives as the
+		// rollback target. Its tags are reconstructed over the
+		// current host set — a generation built with different
+		// hosts leaves strays for a future sweep to reclaim.
+		if pruneOldImages && displacedPruneCandidate(oldChecksum, build.Checksum, displaced) {
+			displacedMeta := BuildMetadata{
+				Challenge: build.Challenge,
+				Seed:      build.Seed,
+				Format:    build.Format,
+				Checksum:  displaced,
+			}
+			tags := make([]string, 0, len(build.Images))
+			for _, image := range build.Images {
+				tags = append(tags, m.instanceImageName(build.Challenge, &displacedMeta, image))
+			}
+			replaced = append(replaced, replacedImages{tags: tags, meta: displacedMeta})
+		}
+	}
+
+	// Pruning waits until every build of this challenge has been
+	// processed: other rows can still hold the displaced checksum
+	// as their current or rollback generation until their own
+	// rebuild lands (or if it failed above) — contentReferenced
+	// keeps the images alive in all of those cases.
+	m.pruneReplacedImages(replaced)
+	return errs
+}
+
+// rebuildStaleChallenges is the update path for ChallengeUpdates.Stale. The
+// metadata is re-persisted first — idempotent, since the tree and the row
+// already agree, and it is what makes a Stale verdict a superset of Refreshed
+// — and then only the builds still serving an earlier generation are rebuilt;
+// the challenge's current builds are left alone.
+func (m *Manager) rebuildStaleChallenges(stale []*ChallengeMetadata, pruneOldImages bool) []error {
+	errs := m.updateChallenges(stale, false, false)
+	for _, metadata := range stale {
+		buildIds, err := m.staleBuildIds(metadata)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		m.log.infof("rebuilding %d build(s) of %s left at an earlier generation by a failed rebuild", len(buildIds), metadata.Id)
+		errs = append(errs, m.rebuildBuilds(metadata, buildIds, pruneOldImages)...)
+	}
+	return errs
+}

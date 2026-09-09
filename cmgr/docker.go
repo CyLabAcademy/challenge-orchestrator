@@ -204,6 +204,11 @@ func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 	metadataChanged := inList(updates.Refreshed)
 	removed := inList(updates.Removed)
 	modified := sourceChanged || metadataChanged || removed
+	// Stale is not drift in the tree — the source on disk is what the
+	// database records — but a build of this challenge still serves an
+	// earlier generation because its rebuild failed. Worth naming when there
+	// is nothing to build; not a reason to refuse a build that is wanted.
+	stale := inList(updates.Stale)
 
 	if buildsComplete {
 		// Nothing to build, but surface drift instead of returning silently:
@@ -217,6 +222,8 @@ func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 			m.log.warnf("source for '%s' has changed since last update; existing builds and images are stale until 'update' is run", cMeta.Id)
 		case metadataChanged:
 			m.log.warnf("metadata for '%s' has changed since last update; run 'update' to refresh it (images are unaffected)", cMeta.Id)
+		case stale:
+			m.log.warnf("a build of '%s' was produced from an earlier source generation (its rebuild failed); run 'update' to rebuild it", cMeta.Id)
 		case removed:
 			m.log.warnf("source for '%s' can no longer be found; its existing builds are stale", cMeta.Id)
 		}

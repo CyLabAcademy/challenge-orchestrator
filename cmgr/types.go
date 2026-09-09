@@ -218,10 +218,17 @@ func (cm *ChallengeMetadata) NeedsInstance() bool {
 	return cm.DeliveryType == "" || cm.DeliveryType == DeliveryService
 }
 
+// ChallengeUpdates is DetectChanges' verdict on each challenge, one bucket per
+// challenge: Added (on disk, not in the database), Updated (source changed:
+// rebuilt), Stale (source unchanged, but a build still serves an earlier
+// generation because its last rebuild failed: those builds are rebuilt),
+// Refreshed (metadata only: re-persisted, no rebuild), Unmodified, Removed.
+// Updated takes precedence over Stale, which takes precedence over Refreshed.
 type ChallengeUpdates struct {
 	Added      []*ChallengeMetadata `json:"added"`
 	Refreshed  []*ChallengeMetadata `json:"refreshed"`
 	Updated    []*ChallengeMetadata `json:"updated"`
+	Stale      []*ChallengeMetadata `json:"stale"`
 	Removed    []*ChallengeMetadata `json:"removed"`
 	Unmodified []*ChallengeMetadata `json:"unmodified"`
 	Errors     []error              `json:"errors"`

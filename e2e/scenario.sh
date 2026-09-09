@@ -4525,20 +4525,43 @@ if (( FULL )); then
     esac
   done
 
+  # What a later update would make of this, before the source is restored. On
+  # disk and in the challenge row the persistent challenge is at the failed
+  # generation (updateChallenges commits the metadata before it builds), and
+  # its build still serves generation 2. Compared by checksums alone that is
+  # "unmodified", and the failed rebuild would be invisible to every update
+  # after this one; the source generation recorded on the build
+  # (builds.sourcechecksum) is what keeps it reported, as Stale, until a
+  # rebuild succeeds. Nothing else may be affected: the on-demand challenge is
+  # current, and nothing changed on disk since the failing update, so no
+  # challenge is Updated.
+  out=$(cmgrd-cli update --dry-run 2>&1) ||
+    fail "cmgrd-cli update --dry-run failed after the failed rebuild: $out"
+  sed 's/^/       /' <<<"$out"
+  stale_section=$(sed -n '/^Stale:/,/^[A-Z]/p' <<<"$out")
+  grep -q "^  $CH_PERSISTENT\$" <<<"$stale_section" ||
+    fail "the dry run after the failed rebuild does not list $CH_PERSISTENT under Stale: build $PERSIST_BUILD serves generation 2 while the challenge row is at the failed generation, and an update that cannot see that leaves the challenge stale for good (DetectChanges, cmgr/api.go)"
+  if grep -q "^  $CH_ONDEMAND\$" <<<"$stale_section"; then
+    fail "the dry run lists $CH_ONDEMAND as Stale although every build of it is at the current generation"
+  fi
+  if grep -q "^Updated:" <<<"$out"; then
+    fail "the dry run after the failed rebuild reports a challenge as Updated although nothing changed on disk since the failing update: $(sed -n '/^Updated:/,/^[A-Z]/p' <<<"$out" | tr '\n' ' ')"
+  fi
+
   # The persistent source back exactly as this step found it, and the on-demand
   # source not touched at all -- this step never edits it, and the assertion
   # above is what says so. The generation is read from PERSIST_GEN rather than
   # named: which one the earlier steps left behind depends on the mode.
   #
-  # cork's challenge row still holds this generation's source checksum
-  # (updateChallenges commits the metadata before it builds), so an update
-  # inserted after this point rebuilds the persistent challenge and restarts its
+  # cork's challenge row still holds this generation's source checksum, so an
+  # update inserted after this point sees the source as changed and rebuilds
+  # the persistent challenge (Updated outranks Stale) and restarts its
   # instance. The base-pins step below is the one that does, deliberately: it
   # absorbs this restore alongside its own edit, which is why its update reports
   # two challenges rebuilt and why it does not assert that only one was.
   set_generation "$persist_gen_before" persistent
   rm -rf "$ART_TMP"
-  ok "the rebuild was refused for publishing an unreferenced artifact; the build row kept its checksum, flag and has_artifacts; cork went on serving the generation-2 archive byte for byte; instance $PERSIST_INST kept serving at $ppub:$pport; the builder is back to the tags it held and the failed generation's registry tag is gone"
+  ok "the rebuild was refused for publishing an unreferenced artifact; the build row kept its checksum, flag and has_artifacts; cork went on serving the generation-2 archive byte for byte; instance $PERSIST_INST kept serving at $ppub:$pport; a dry run named $CH_PERSISTENT Stale; the builder is back to the tags it held and the failed generation's registry tag is gone"
 else
   deselect "a failed rebuild keeps serving the previous archive"
 fi

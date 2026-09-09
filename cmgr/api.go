@@ -121,23 +121,33 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 		sourceChanged := curr.SourceChecksum != newMeta.SourceChecksum
 		metadataChanged := curr.MetadataChecksum != newMeta.MetadataChecksum
 		solvescriptChanged := curr.SolveScript != newMeta.SolveScript
-		if !sourceChanged && !metadataChanged && !solvescriptChanged {
-			if m.safeToRefresh(newMeta) {
-				cu.Unmodified = append(cu.Unmodified, curr)
-			} else {
-				// The checksums are unchanged but the persisted options disagree
-				// with what the current loader parses — e.g. a challenge that
-				// declared a seccomp profile before the binary understood the
-				// option, or a corrupt options row. Re-persist through the
-				// refresh path (no rebuild) so the declared options take effect.
-				m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
-				cu.Refreshed = append(cu.Refreshed, newMeta)
-			}
-		} else if !sourceChanged && m.safeToRefresh(newMeta) {
+		safe := m.safeToRefresh(newMeta)
+		switch {
+		case sourceChanged || ((metadataChanged || solvescriptChanged) && !safe):
+			cu.Updated = append(cu.Updated, newMeta)
+		case m.hasStaleBuilds(newMeta):
+			// The source on disk is what the database already records, but a
+			// build was produced from an earlier generation: its last rebuild
+			// failed after the challenge row had moved on (updateChallenges
+			// commits the metadata before it builds). Compared by checksums
+			// alone the challenge looks unmodified and the failure would be
+			// invisible to every later update; it stays reported, and
+			// rebuilt, until a rebuild succeeds. Outranks Refreshed: the
+			// stale path re-persists the metadata on its way to the rebuild.
+			cu.Stale = append(cu.Stale, newMeta)
+		case !metadataChanged && !solvescriptChanged && safe:
+			cu.Unmodified = append(cu.Unmodified, curr)
+		case !metadataChanged && !solvescriptChanged:
+			// The checksums are unchanged but the persisted options disagree
+			// with what the current loader parses — e.g. a challenge that
+			// declared a seccomp profile before the binary understood the
+			// option, or a corrupt options row. Re-persist through the
+			// refresh path (no rebuild) so the declared options take effect.
+			m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
+			cu.Refreshed = append(cu.Refreshed, newMeta)
+		default:
 			m.log.debugf("Marking %s as refresh", newMeta.Id)
 			cu.Refreshed = append(cu.Refreshed, newMeta)
-		} else {
-			cu.Updated = append(cu.Updated, newMeta)
 		}
 		delete(challenges, curr.Id)
 	}
@@ -173,11 +183,13 @@ type UpdateOptions struct {
 // modified should not be affected.
 //
 // In the presence of errors, this function will do addition and updates as
-// best it can in order to preserve a consistent system state.  However, if a
-// build fails, it will keep the existing instance running and rollback the
-// challenge metadata.  Additionally, in the presence of errors it will not
-// perform any removals of challenge metadata (removing a built challenge is
-// considered an error).
+// best it can in order to preserve a consistent system state.  If a build
+// fails, the build keeps its previous generation (row, images, instances)
+// while the challenge metadata is already updated; the challenge is then
+// reported as Stale by every later DetectChanges, and rebuilt by every later
+// update, until a rebuild succeeds.  Additionally, in the presence of errors
+// it will not perform any removals of challenge metadata (removing a built
+// challenge is considered an error).
 func (m *Manager) Update(fp string) *ChallengeUpdates {
 	return m.UpdateWithOptions(fp, UpdateOptions{})
 }
@@ -205,6 +217,11 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 	}
 
 	errs = m.updateChallenges(cu.Updated, true, options.PruneOldImages)
+	if len(errs) != 0 {
+		cu.Errors = append(cu.Errors, errs...)
+	}
+
+	errs = m.rebuildStaleChallenges(cu.Stale, options.PruneOldImages)
 	if len(errs) != 0 {
 		cu.Errors = append(cu.Errors, errs...)
 	}

@@ -664,6 +664,7 @@ type UpdateResponse struct {
 	Added      []cmgr.ChallengeId `json:"added"`
 	Refreshed  []cmgr.ChallengeId `json:"refreshed"`
 	Updated    []cmgr.ChallengeId `json:"updated"`
+	Stale      []cmgr.ChallengeId `json:"stale"`
 	Removed    []cmgr.ChallengeId `json:"removed"`
 	Unmodified []cmgr.ChallengeId `json:"unmodified"`
 	Errors     []string           `json:"errors"`
@@ -714,6 +715,7 @@ func (s state) updateHandler(w http.ResponseWriter, r *http.Request) {
 		Added:      challengeIds(updates.Added),
 		Refreshed:  challengeIds(updates.Refreshed),
 		Updated:    challengeIds(updates.Updated),
+		Stale:      challengeIds(updates.Stale),
 		Removed:    challengeIds(updates.Removed),
 		Unmodified: challengeIds(updates.Unmodified),
 		Errors:     make([]string, len(updates.Errors)),
