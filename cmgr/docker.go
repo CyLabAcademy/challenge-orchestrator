@@ -601,9 +601,15 @@ func (m *Manager) pushImage(imageName string) error {
 // cover), and that is repaired by removing the tag — destroy, prune, or a
 // manual delete — and building again, not by overwriting it in place under a
 // name that workers holding the old bytes would not notice had changed.
-func (m *Manager) publishImages(cMeta *ChallengeMetadata, bMeta *BuildMetadata) error {
+//
+// Returns the tags this call pushed -- and only those; tags found present
+// were someone else's -- so a build that fails afterwards can take them back
+// out (see executeBuild's failure block) rather than leave a generation in
+// the registry that no row will ever name.
+func (m *Manager) publishImages(cMeta *ChallengeMetadata, bMeta *BuildMetadata) ([]string, error) {
+	pushed := []string{}
 	if m.challengeRegistry == "" {
-		return nil
+		return pushed, nil
 	}
 	for _, image := range bMeta.Images {
 		if image.Host == "builder" {
@@ -614,17 +620,18 @@ func (m *Manager) publishImages(cMeta *ChallengeMetadata, bMeta *BuildMetadata) 
 		if err != nil {
 			err = fmt.Errorf("could not check the registry for %s before pushing: %w", imageName, err)
 			m.log.error(err)
-			return err
+			return pushed, err
 		}
 		if present {
 			m.log.infof("%s is already in the registry; the tag names its content, so the build's copy is not pushed over it", imageName)
 			continue
 		}
 		if err := m.pushImage(imageName); err != nil {
-			return err
+			return pushed, err
 		}
+		pushed = append(pushed, imageName)
 	}
-	return nil
+	return pushed, nil
 }
 
 // registryTimedOut reports whether a failed pull is the daemon's own timeout
@@ -717,13 +724,14 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	bMeta.SourceChecksum = cMeta.SourceChecksum
 
 	images := []Image{}
-	var buildImage string
+	var buildImage, buildImageHost string
 	for _, host := range cMeta.Hosts {
 		image := Image{Host: host.Name, Ports: []string{}}
 		imageName := m.instanceImageName(cMeta.Id, bMeta, image)
 
 		if host.Name == "builder" || (host.Name == "challenge" && buildImage == "") {
 			buildImage = imageName
+			buildImageHost = host.Name
 		}
 
 		for _, portInfo := range cMeta.PortMap {
@@ -817,6 +825,30 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		err := fmt.Errorf("aborting because no build image identified %s/%d", cMeta.Id, bMeta.Id)
 		m.log.error(err)
 		return err
+	}
+
+	// The registry is write-once (publishImages): if it already serves this
+	// identity, its image is the one the workers run, so the row is derived
+	// from that image and not from the copy just built. The pull replaces
+	// the local tag with the registry's manifest before anything is
+	// extracted from it; a build that is not reproducible byte for byte (a
+	// secret minted without the seed, package versions that moved) then
+	// cannot leave the flag, lookups and artifacts of one image on record
+	// while another serves. The builder-host image is never pushed, so a
+	// build that extracts from it always extracts from what it built.
+	if m.challengeRegistry != "" && buildImageHost != "builder" {
+		present, err := m.registryTagExists(buildImage)
+		if err != nil {
+			err = fmt.Errorf("could not check the registry for %s: %w", buildImage, err)
+			m.log.error(err)
+			return err
+		}
+		if present {
+			m.log.infof("%s is already in the registry; the row is derived from that image rather than the one just built", buildImage)
+			if err := m.pullImage(m.cli, buildImage, m.restartLimits().pullTimeout); err != nil {
+				return err
+			}
+		}
 	}
 
 	// This container is created only to copy the built /challenge tree out of the
@@ -930,9 +962,10 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	// one before it holds the generation, so nothing ever names a generation
 	// the workers cannot pull. A push that fails takes the failure path with
 	// everything else: the staged archive is dropped and the local images are
-	// untagged.
+	// untagged, and the tags this build pushed are removed from the registry.
+	var pushed []string
 	if err == nil {
-		err = m.publishImages(cMeta, bMeta)
+		pushed, err = m.publishImages(cMeta, bMeta)
 	}
 	if err == nil && stagedArtifactsPath != "" {
 		// Promote the validated archive into place; rename is atomic, so
@@ -972,6 +1005,16 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 			for _, image := range bMeta.Images {
 				imageName := m.instanceImageName(bMeta.Challenge, bMeta, image)
 				_, _ = m.cli.ImageRemove(m.ctx, imageName, iro)
+			}
+			// The same for the registry: a tag this build pushed (only those;
+			// one found present belonged to someone else) is taken back out,
+			// or a generation no row names would sit in the registry for good
+			// -- prune and destroy reconstruct tags from rows, so they would
+			// never find it. Best-effort, like every registry delete.
+			for _, imageName := range pushed {
+				if derr := m.registryDeleteTag(imageName); derr != nil {
+					m.log.warnf("could not remove %s, pushed by a build that then failed: %s", imageName, derr)
+				}
 			}
 		}
 		m.imageMu.Unlock()

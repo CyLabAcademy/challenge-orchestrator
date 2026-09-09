@@ -4868,7 +4868,7 @@ if (( FULL )); then
     # (cmgr/docker.go:1319-1325), only log what it returns, so an unreachable
     # registry may cost the operator a tag and nothing else: not the destroy,
     # not the local untag, and not the operator's time waiting out
-    # registryDeleteTimeout.
+    # registryRequestTimeout.
     FLAGONLY_SEED=55 # outside schema.yaml's seeds, as in the step above
     stale=$(manual_builds "$CH_FLAGONLY" "$FLAGONLY_SEED") ||
       fail "could not read the build list (cmgrd-cli system-dump) to look for a leftover probe build"
@@ -4909,7 +4909,7 @@ if (( FULL )); then
     zot=$(compose_container zot)
     [[ -n "$zot" ]] || fail "compose container for the registry (service zot) not found"
     # Stopped, not paused. A paused registry accepts the delete's connection
-    # and answers nothing, so the call burns the whole 30s registryDeleteTimeout
+    # and answers nothing, so the call burns the whole 30s registryRequestTimeout
     # (cmgr/registry.go:15) and this step would be timing that constant instead
     # of the contract; a stopped container takes its $E2E_REGISTRY alias with
     # it, so cork's delete fails on the name at once. That the operation
@@ -4929,11 +4929,11 @@ if (( FULL )); then
       fail "destroying build $fo_build with the registry down answered HTTP $code: the registry untag is best effort by contract (cmgr/registry.go:57-70) and must never fail the operation around it"
     PROBE_BUILD="" # cork no longer has the row; only the leaked tag is left
     # 20s rather than the ~10 the contract would allow: what must be caught is
-    # the 30s registryDeleteTimeout being waited out (or retried into a hang),
+    # the 30s registryRequestTimeout being waited out (or retried into a hang),
     # and a name lookup that has to be refused by an upstream resolver can
     # cost seconds of its own on a box with no working DNS.
     (( took < 20 )) ||
-      fail "the destroy took ${took}s with the registry down: a registry call that cannot even connect must not be waited out (registryDeleteTimeout is 30s) or retried"
+      fail "the destroy took ${took}s with the registry down: a registry call that cannot even connect must not be waited out (registryRequestTimeout is 30s) or retried"
     [[ "$(api_status GET "/builds/$fo_build")" == 404 ]] ||
       fail "build $fo_build is still known to cmgrd after a 204 destroy"
     if has_line "$E2E_REGISTRY/$CH_FLAGONLY:$fo_tag" builder_tags; then

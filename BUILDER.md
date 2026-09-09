@@ -32,11 +32,23 @@ Three things then sit on top:
 
 The publish order is registry, then artifact archive, then build row: each
 store is written only once the one before it holds the generation, so nothing
-ever names a generation the workers cannot pull, and a build that fails
-validation leaves no tag behind. A tag names its content, so one that is
-already there is left alone rather than overwritten; the repair for a tag
-that is wrong (a build input the checksum does not cover) is to remove it —
-`--prune-old`, `remove-schema`, or a manual delete — and build again.
+ever names a generation the workers cannot pull; a build that fails
+validation leaves no tag behind, and one that fails after pushing takes the
+tags it pushed back out. A tag names its content, so one that is already
+there is left alone rather than overwritten — and adopted: when the registry
+already serves the identity a build is about to produce, the build pulls that
+image and derives the row (flag, lookups, artifacts) from it rather than from
+the copy it just built, so what the row says and what the workers run cannot
+be two different images of one identity. The repair for a tag that is wrong
+(a build input the checksum does not cover) is to remove it — `--prune-old`,
+`remove-schema`, or a manual delete — and build again.
+
+For all of this cmgrd talks to the registry API itself, with the same
+`ca.crt` / `client.cert` / `client.key` dockerd uses (`CMGR_REGISTRY_CERT_DIR`,
+or `/etc/docker/certs.d/<registry host>`; the cork role deploys them). A
+registry that cannot be asked whether a tag exists fails the build rather
+than pushing on a guess, so that material is required in registry mode, not
+merely for `--prune-old` as before.
 
 ## Why pinning exists
 

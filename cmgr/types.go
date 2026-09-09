@@ -3,6 +3,7 @@ package cmgr
 import (
 	"context"
 	"math/rand"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,6 +77,11 @@ type Manager struct {
 	challengeInterface string
 	challengeRegistry  string
 	authString         string
+	// The registry API client (registry.go), built on first use and shared by
+	// the check before every push and the deletes after a prune or destroy.
+	registryClient     *http.Client
+	registryClientErr  error
+	registryClientOnce sync.Once
 	hostOSType         string // docker daemon OSType, cached once at initDocker (immutable for the daemon)
 	portLow            int
 	portHigh           int
