@@ -61,14 +61,21 @@ func (m *Manager) openBuild(build *BuildMetadata) error {
 	rows, err := m.db.NamedQuery("SELECT id, flag, hasartifacts, lastsolved, checksum, prevchecksum, sourcechecksum FROM builds WHERE schema=:schema AND format=:format AND challenge=:challenge AND seed=:seed;", build)
 	if err != nil {
 		m.log.errorf("failed to find build: %s", err)
-	} else if !rows.Next() {
-		m.log.error("found no rows when exactly one expected")
+		return err
 	}
+	defer rows.Close()
+	if !rows.Next() {
+		err = fmt.Errorf("found no rows when exactly one expected for build of %s", build.Challenge)
+		m.log.error(err)
+		return err
+	}
+	// Returned rather than logged: a caller left with build.Id == 0 would go
+	// on to build and finalize against a row that does not exist.
 	err = rows.Scan(&build.Id, &build.Flag, &build.HasArtifacts, &build.LastSolved, &build.Checksum, &build.PrevChecksum, &build.SourceChecksum)
 	if err != nil {
 		m.log.errorf("failed to read build ID: %s", err)
+		return err
 	}
-	defer rows.Close()
 	if rows.Next() {
 		m.log.error("found more rows than expected")
 	}
@@ -378,19 +385,23 @@ func (m *Manager) allBuildIds(cMeta *ChallengeMetadata) ([]BuildId, error) {
 	return ids, nil
 }
 
-// hasStaleBuilds reports whether staleBuildIds would name anything, as one
-// indexed existence probe: DetectChanges asks it for every challenge whose
-// source is unchanged, on every update, dry run and schema converge. A query
-// error counts as "not stale": the update goes on classifying by checksums as
-// it always has, and the error is logged here.
-func (m *Manager) hasStaleBuilds(cMeta *ChallengeMetadata) bool {
-	var stale bool
-	err := m.db.Get(&stale,
-		"SELECT EXISTS(SELECT 1 FROM builds WHERE challenge=? AND flag != '' AND sourcechecksum != ?);",
-		cMeta.Id, cMeta.SourceChecksum)
+// staleChallengeSet names every challenge with a build staleBuildIds would
+// list against the challenge's recorded source generation, in one query:
+// DetectChanges consults it for every challenge whose source is unchanged --
+// where the tree's generation is the recorded one, so the two predicates
+// agree -- on every update, dry run and schema converge.
+func (m *Manager) staleChallengeSet() (map[ChallengeId]bool, error) {
+	ids := []ChallengeId{}
+	err := m.db.Select(&ids, `SELECT DISTINCT b.challenge FROM builds AS b
+		JOIN challenges AS c ON c.id = b.challenge
+		WHERE b.flag != '' AND b.sourcechecksum != c.sourcechecksum;`)
 	if err != nil {
-		m.log.errorf("failed to check %s for stale builds: %s", cMeta.Id, err)
-		return false
+		m.log.errorf("failed to look up challenges with stale builds: %s", err)
+		return nil, err
 	}
-	return stale
+	stale := make(map[ChallengeId]bool, len(ids))
+	for _, id := range ids {
+		stale[id] = true
+	}
+	return stale, nil
 }

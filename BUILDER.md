@@ -35,20 +35,26 @@ store is written only once the one before it holds the generation, so nothing
 ever names a generation the workers cannot pull; a build that fails
 validation leaves no tag behind, and one that fails after pushing takes the
 tags it pushed back out. A tag names its content, so one that is already
-there is left alone rather than overwritten — and adopted: when the registry
-already serves the identity a build is about to produce, the build pulls that
-image and derives the row (flag, lookups, artifacts) from it rather than from
-the copy it just built, so what the row says and what the workers run cannot
-be two different images of one identity. The repair for a tag that is wrong
-(a build input the checksum does not cover) is to remove it — `--prune-old`,
-`remove-schema`, or a manual delete — and build again.
+there is left alone rather than overwritten — and adopted: every image is
+resolved against the registry before anything is built, an identity the
+registry already serves is not built here at all (the one the build extracts
+from is pulled), and the row (flag, lookups, artifacts) is derived from the
+registry's image, so what the row says and what the workers run cannot be two
+different images of one identity. The one residual is a challenge with a
+`builder` stage: that stage is never in the registry, so its extraction is
+always from a fresh local build while the challenge image is the registry's.
 
-For all of this cmgrd talks to the registry API itself, with the same
-`ca.crt` / `client.cert` / `client.key` dockerd uses (`CMGR_REGISTRY_CERT_DIR`,
-or `/etc/docker/certs.d/<registry host>`; the cork role deploys them). A
-registry that cannot be asked whether a tag exists fails the build rather
-than pushing on a guess, so that material is required in registry mode, not
-merely for `--prune-old` as before.
+The existence check goes through the local daemon (the same certs.d material
+and credentials it pushes and pulls with), so a registry dockerd can push to
+is one cork can ask; a registry that cannot be asked fails the build rather
+than pushing on a guess. Only tag deletes need cmgrd's own client
+certificate, as before.
+
+The repair for a tag that is wrong (a build input the checksum does not
+cover) is to remove it and build again — and "again" needs a trigger, since
+the identity is unchanged and nothing is stale: `--prune-old` on the next
+rebuild of the challenge, or `remove-schema` and `add-schema`, whose fresh
+rows build and push what the registry then lacks.
 
 ## Why pinning exists
 

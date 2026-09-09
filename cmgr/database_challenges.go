@@ -375,10 +375,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 		_, err := txn.NamedExec(challengeUpdateQuery, metadata)
 		if err != nil {
 			m.log.error(err)
-			err = txn.Rollback()
-			if err != nil { // If rollback fails, we're in trouble.
-				m.log.error(err)
-				return append(errs, err)
+			errs = append(errs, err)
+			if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+				m.log.error(rbErr)
+				return append(errs, rbErr)
 			}
 			continue
 		}
@@ -387,10 +387,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 		if err != nil {
 			m.log.error(err)
-			err = txn.Rollback()
-			if err != nil { // If rollback fails, we're in trouble.
-				m.log.error(err)
-				return append(errs, err)
+			errs = append(errs, err)
+			if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+				m.log.error(rbErr)
+				return append(errs, rbErr)
 			}
 			continue
 		}
@@ -403,10 +403,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 			if err != nil {
 				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
+				errs = append(errs, err)
+				if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+					m.log.error(rbErr)
+					return append(errs, rbErr)
 				}
 				break
 			}
@@ -419,10 +419,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 		if err != nil {
 			m.log.error(err)
-			err = txn.Rollback()
-			if err != nil { // If rollback fails, we're in trouble.
-				m.log.error(err)
-				return append(errs, err)
+			errs = append(errs, err)
+			if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+				m.log.error(rbErr)
+				return append(errs, rbErr)
 			}
 			continue
 		}
@@ -434,10 +434,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 			if err != nil {
 				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
+				errs = append(errs, err)
+				if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+					m.log.error(rbErr)
+					return append(errs, rbErr)
 				}
 				break
 			}
@@ -450,10 +450,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 		if err != nil {
 			m.log.error(err)
-			err = txn.Rollback()
-			if err != nil { // If rollback fails, we're in trouble.
-				m.log.error(err)
-				return append(errs, err)
+			errs = append(errs, err)
+			if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+				m.log.error(rbErr)
+				return append(errs, rbErr)
 			}
 			continue
 		}
@@ -466,10 +466,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 			if err != nil {
 				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
+				errs = append(errs, err)
+				if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+					m.log.error(rbErr)
+					return append(errs, rbErr)
 				}
 				break
 			}
@@ -482,10 +482,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 		if err != nil {
 			m.log.error(err)
-			err = txn.Rollback()
-			if err != nil { // If rollback fails, we're in trouble.
-				m.log.error(err)
-				return append(errs, err)
+			errs = append(errs, err)
+			if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+				m.log.error(rbErr)
+				return append(errs, rbErr)
 			}
 			continue
 		}
@@ -499,10 +499,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 			if err != nil {
 				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
+				errs = append(errs, err)
+				if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+					m.log.error(rbErr)
+					return append(errs, rbErr)
 				}
 				break
 			}
@@ -515,10 +515,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 		if err != nil {
 			m.log.error(err)
-			err = txn.Rollback()
-			if err != nil { // If rollback fails, we're in trouble.
-				m.log.error(err)
-				return append(errs, err)
+			errs = append(errs, err)
+			if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+				m.log.error(rbErr)
+				return append(errs, rbErr)
 			}
 			continue
 		}
@@ -532,10 +532,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 			if err != nil {
 				m.log.error(err)
-				err = txn.Rollback()
-				if err != nil { // If rollback fails, we're in trouble.
-					m.log.error(err)
-					return append(errs, err)
+				errs = append(errs, err)
+				if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+					m.log.error(rbErr)
+					return append(errs, rbErr)
 				}
 				break
 			}
@@ -576,10 +576,10 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selec
 
 		if err != nil {
 			m.log.error(err)
-			err = txn.Rollback()
-			if err != nil { // If rollback fails, we're in trouble.
-				m.log.error(err)
-				return append(errs, err)
+			errs = append(errs, err)
+			if rbErr := txn.Rollback(); rbErr != nil { // If rollback fails, we're in trouble.
+				m.log.error(rbErr)
+				return append(errs, rbErr)
 			}
 			continue
 		}
@@ -824,13 +824,14 @@ const (
 // has been processed. A build whose rebuild fails is skipped: it keeps its
 // previous generation on record (finalizeBuild is never reached) and stays
 // reported as Stale until a later update rebuilds it. This is the whole of a
-// rebuild; updateChallenges hands it every build of a changed challenge and
-// rebuildStaleChallenges only the ones still at an earlier generation.
+// rebuild; updateChallenges hands it the builds its selector picked
+// (allBuildIds for a source change, staleBuildIds otherwise).
 func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId, pruneOldImages bool) []error {
 	errs := []error{}
 	if len(buildIds) == 0 {
 		return errs
 	}
+	m.log.infof("rebuilding %d build(s) of %s", len(buildIds), metadata.Id)
 
 	buildCtxFile, err := m.createBuildContext(metadata, m.GetDockerfile(metadata.ChallengeType))
 	if err != nil {
@@ -841,8 +842,10 @@ func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId,
 	defer os.Remove(buildCtxFile)
 
 	// Every build here belongs to the one challenge, so what the restarts
-	// need of it -- the persisted metadata (delivery type, options) and the
-	// reverse port map -- is looked up once rather than per build.
+	// need of it is looked up once rather than per build: the persisted row
+	// (`metadata` is the tree's copy that was just written; the round trip is
+	// what every other launch path reads, and restarts are launches) and the
+	// reverse port map.
 	cMeta, err := m.lookupChallengeMetadata(metadata.Id)
 	if err != nil {
 		return append(errs, err)

@@ -9,11 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/containerd/errdefs"
+	"github.com/moby/moby/client"
 )
 
-// registryRequestTimeout bounds a single registry API call (a tag existence
-// check before a push, a tag delete after a prune or destroy); none of them
-// may hang an update on a wedged registry.
+// registryRequestTimeout bounds a single registry API call (a tag delete
+// after a prune, destroy or failed build); none may hang an update on a
+// wedged registry.
 const registryRequestTimeout = 30 * time.Second
 
 // registryEndpoint splits CMGR_REGISTRY into the host dockerd dials and the
@@ -26,19 +29,60 @@ func (m *Manager) registryEndpoint() (host, prefix string) {
 	return host, strings.Trim(prefix, "/")
 }
 
+// registryTagExists reports whether the challenge registry already serves a
+// manifest under imageName's tag. It is the guard that keeps the registry
+// write-once: a content-addressed tag is pushed at most once, and never over
+// whatever a tag already names (see executeBuild). The question goes through
+// the local daemon, which reaches the registry with the same certs.d material
+// and credentials it pushes and pulls with, so a registry dockerd can push to
+// is one this can ask. A registry that cannot be asked is an error, not
+// "absent": pushing on a guess is exactly what the guard exists to prevent.
+func (m *Manager) registryTagExists(imageName string) (bool, error) {
+	ctx, cancel := m.controlCtx()
+	defer cancel()
+	_, err := m.cli.DistributionInspect(ctx, imageName, client.DistributionInspectOptions{EncodedRegistryAuth: m.authString})
+	switch {
+	case err == nil:
+		return true, nil
+	case errdefs.IsNotFound(err) || manifestUnknown(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// manifestUnknown recognizes the registry's own "no such manifest" answers
+// where the daemon passes them through as text rather than as a not-found.
+func manifestUnknown(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{"manifest unknown", "no such manifest", "manifest not found"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // registryHTTPClient is an HTTP client trusting and authenticating with the
 // same TLS material dockerd uses for the challenge registry: ca.crt /
 // client.cert / client.key under /etc/docker/certs.d/<host> (overridable via
-// CMGR_REGISTRY_CERT_DIR). The registry requires mTLS for every operation, so
-// there is no anonymous fallback. Built once and shared: the check before
-// every push and the deletes after a prune all talk to the one registry, and
-// a client per call would read and parse the key material and open a fresh
-// TLS connection each time.
+// CMGR_REGISTRY_CERT_DIR). Needed only for what the daemon cannot do -- a
+// tag delete -- and best-effort by contract there. Built once and shared,
+// but only a client that was built successfully is kept: material that was
+// missing or unreadable when first asked for is read again next time, so a
+// late cert drop or a rotation heals without a restart.
 func (m *Manager) registryHTTPClient() (*http.Client, error) {
-	m.registryClientOnce.Do(func() {
-		m.registryClient, m.registryClientErr = m.newRegistryHTTPClient()
-	})
-	return m.registryClient, m.registryClientErr
+	m.registryClientMu.Lock()
+	defer m.registryClientMu.Unlock()
+	if m.registryClient != nil {
+		return m.registryClient, nil
+	}
+	httpClient, err := m.newRegistryHTTPClient()
+	if err != nil {
+		return nil, err
+	}
+	m.registryClient = httpClient
+	return httpClient, nil
 }
 
 func (m *Manager) newRegistryHTTPClient() (*http.Client, error) {
@@ -81,10 +125,9 @@ func (m *Manager) newRegistryHTTPClient() (*http.Client, error) {
 // manifest that imageName's tag names: <method>
 // https://<host>/v2/<prefix/><repo>/manifests/<tag>. imageName must be the
 // registry-qualified reference the fork uses everywhere (see
-// instanceImageName). The registry's credentials, when configured
-// (CMGR_REGISTRY_USER/TOKEN, the ones dockerd is handed for pushes and
-// pulls), go along as basic auth; the mTLS client identity is on the
-// transport.
+// instanceImageName). The registry's credentials, when configured (the
+// CMGR_REGISTRY_USER/TOKEN pair dockerd is handed for pushes and pulls), go
+// along as basic auth; the mTLS client identity is on the transport.
 func (m *Manager) registryManifestRequest(method, imageName string) (*http.Request, error) {
 	repoAndTag, ok := strings.CutPrefix(imageName, m.challengeRegistry+"/")
 	if !ok {
@@ -104,16 +147,16 @@ func (m *Manager) registryManifestRequest(method, imageName string) (*http.Reque
 	if err != nil {
 		return nil, err
 	}
-	if user := os.Getenv(REGISTRY_USER_ENV); user != "" {
-		req.SetBasicAuth(user, os.Getenv(REGISTRY_TOKEN_ENV))
+	if m.registryUser != "" {
+		req.SetBasicAuth(m.registryUser, m.registryToken)
 	}
 	return req, nil
 }
 
 // registryDeleteTag removes a tag from the challenge registry so pruned or
-// destroyed generations do not accumulate there (content-addressed tags are
-// never overwritten, so without this the registry grows one tag per content
-// generation forever).
+// destroyed generations, and the tags of a build that failed after pushing,
+// do not accumulate there (content-addressed tags are never overwritten, so
+// without this the registry grows one tag per content generation forever).
 //
 // The delete is issued strictly BY TAG (OCI distribution spec 1.1 tag
 // deletion, which zot supports): a manifest-digest delete would remove every
@@ -149,44 +192,5 @@ func (m *Manager) registryDeleteTag(imageName string) error {
 		return fmt.Errorf("registry %s does not accept tag deletes (405); tag %s leaked", m.challengeRegistry, imageName)
 	default:
 		return fmt.Errorf("registry delete of %s returned %s", imageName, resp.Status)
-	}
-}
-
-// registryTagExists reports whether the challenge registry already serves a
-// manifest under imageName's tag. It is the guard that keeps the registry
-// write-once: a content-addressed tag is pushed at most once, and never over
-// whatever a tag already names (see publishImages). A registry that cannot be
-// asked is an error, not "absent": pushing on a guess is exactly what the guard
-// exists to prevent.
-func (m *Manager) registryTagExists(imageName string) (bool, error) {
-	httpClient, err := m.registryHTTPClient()
-	if err != nil {
-		return false, err
-	}
-	req, err := m.registryManifestRequest(http.MethodHead, imageName)
-	if err != nil {
-		return false, err
-	}
-	// Every manifest type a docker push can leave behind: a HEAD without an
-	// Accept a registry can satisfy is answered 404 for a tag that exists.
-	req.Header.Set("Accept", strings.Join([]string{
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/vnd.oci.image.index.v1+json",
-		"application/vnd.docker.distribution.manifest.v2+json",
-		"application/vnd.docker.distribution.manifest.list.v2+json",
-	}, ", "))
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return false, err
-	}
-	resp.Body.Close()
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-		return true, nil
-	case http.StatusNotFound:
-		return false, nil
-	default:
-		return false, fmt.Errorf("registry check of %s returned %s", imageName, resp.Status)
 	}
 }

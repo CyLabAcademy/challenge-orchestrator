@@ -109,6 +109,14 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 		return cu
 	}
 
+	// One query for every challenge with a build left at an earlier
+	// generation, rather than one per unchanged challenge below; a probe
+	// that fails is an error of the scan, not a clean tree.
+	stale, err := m.staleChallengeSet()
+	if err != nil {
+		errs = append(errs, err)
+	}
+
 	for _, curr := range db_metadata {
 		newMeta, ok := challenges[curr.Id]
 		if !ok {
@@ -141,7 +149,7 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 			// refresh path (no rebuild) so the declared options take effect.
 			m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
 			cu.Refreshed = append(cu.Refreshed, newMeta)
-		case m.hasStaleBuilds(newMeta):
+		case stale[curr.Id]:
 			// Nothing changed on disk, but a build was produced from an
 			// earlier generation: its last rebuild failed after the challenge
 			// row had moved on (updateChallenges commits the metadata before
@@ -219,21 +227,10 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 	// A source change rebuilds every build of the challenge; the other two
 	// persisted verdicts rebuild only what an earlier rebuild left at a
 	// previous generation, which for a Refreshed challenge is normally
-	// nothing.
-	errs = m.updateChallenges(cu.Refreshed, m.staleBuildIds, options.PruneOldImages)
-	if len(errs) != 0 {
-		cu.Errors = append(cu.Errors, errs...)
-	}
-
-	errs = m.updateChallenges(cu.Updated, m.allBuildIds, options.PruneOldImages)
-	if len(errs) != 0 {
-		cu.Errors = append(cu.Errors, errs...)
-	}
-
-	errs = m.updateChallenges(cu.Stale, m.staleBuildIds, options.PruneOldImages)
-	if len(errs) != 0 {
-		cu.Errors = append(cu.Errors, errs...)
-	}
+	// nothing. The buckets are disjoint, so the two share one pass.
+	leftovers := append(append([]*ChallengeMetadata{}, cu.Refreshed...), cu.Stale...)
+	cu.Errors = append(cu.Errors, m.updateChallenges(leftovers, m.staleBuildIds, options.PruneOldImages)...)
+	cu.Errors = append(cu.Errors, m.updateChallenges(cu.Updated, m.allBuildIds, options.PruneOldImages)...)
 
 	if len(cu.Errors) == 0 {
 		err := m.removeChallenges(cu.Removed)

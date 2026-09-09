@@ -77,19 +77,25 @@ type Manager struct {
 	challengeInterface string
 	challengeRegistry  string
 	authString         string
-	// The registry API client (registry.go), built on first use and shared by
-	// the check before every push and the deletes after a prune or destroy.
-	registryClient     *http.Client
-	registryClientErr  error
-	registryClientOnce sync.Once
-	hostOSType         string // docker daemon OSType, cached once at initDocker (immutable for the daemon)
-	portLow            int
-	portHigh           int
-	lastPruneUnix      atomic.Int64 // atomic UnixNano timestamp used as CAS gate for prune interval
-	pruneInterval      time.Duration
-	pruneAge           time.Duration
-	localQueue         *daemonQueue // slots of the local daemon (instances with no worker)
-	policy             managerPolicy
+	// The registry API client (registry.go) for tag deletes, built on first
+	// successful use and shared; and the credentials handed to dockerd for
+	// pushes and pulls, sent along with it. Existence checks go through the
+	// daemon and need neither.
+	registryClient   *http.Client
+	registryClientMu sync.Mutex
+	registryUser     string
+	registryToken    string
+	// templateSums memoizes templateChecksum per challenge type: the embedded
+	// templates never change while the process runs.
+	templateSums  sync.Map
+	hostOSType    string // docker daemon OSType, cached once at initDocker (immutable for the daemon)
+	portLow       int
+	portHigh      int
+	lastPruneUnix atomic.Int64 // atomic UnixNano timestamp used as CAS gate for prune interval
+	pruneInterval time.Duration
+	pruneAge      time.Duration
+	localQueue    *daemonQueue // slots of the local daemon (instances with no worker)
+	policy        managerPolicy
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
 	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run

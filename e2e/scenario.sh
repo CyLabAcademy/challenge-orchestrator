@@ -4514,8 +4514,12 @@ if (( FULL )); then
   done <<<"$rtags_before"
   while read -r tg; do
     [[ -n "$tg" ]] || continue
-    grep -qxF -- "$tg" <<<"$rtags_before" ||
+    if ! grep -qxF -- "$tg" <<<"$rtags_before"; then
+      # Removed before failing: the teardown only looks for named tags, so a
+      # leak left here would outlive this run and skew the next one's counts.
+      registry_status "/v2/$CH_PERSISTENT/manifests/$tg" -X DELETE >/dev/null || true
       fail "tag $E2E_REGISTRY/$CH_PERSISTENT:$tg appeared in the registry over a rebuild that failed validation: the push must wait for the build to validate (publishImages, cmgr/docker.go), or every failed generation leaves a tag in zot that no row names"
+    fi
   done <<<"$rtags_after"
 
   # What a later update would make of this, before the source is restored. On
@@ -4531,7 +4535,9 @@ if (( FULL )); then
   out=$(cmgrd-cli update --dry-run 2>&1) ||
     fail "cmgrd-cli update --dry-run failed after the failed rebuild: $out"
   sed 's/^/       /' <<<"$out"
-  stale_section=$(sed -n '/^Stale:/,/^[A-Z]/p' <<<"$out")
+  # Only the indented ids under the Stale heading, not the heading that ends
+  # the range.
+  stale_section=$(sed -n '/^Stale:/,/^[A-Z]/{/^  /p}' <<<"$out")
   grep -q "^  $CH_PERSISTENT\$" <<<"$stale_section" ||
     fail "the dry run after the failed rebuild does not list $CH_PERSISTENT under Stale: build $PERSIST_BUILD serves generation 2 while the challenge row is at the failed generation, and an update that cannot see that leaves the challenge stale for good (DetectChanges, cmgr/api.go)"
   if grep -q "^  $CH_ONDEMAND\$" <<<"$stale_section"; then
