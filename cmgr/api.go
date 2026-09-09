@@ -121,23 +121,19 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 		sourceChanged := curr.SourceChecksum != newMeta.SourceChecksum
 		metadataChanged := curr.MetadataChecksum != newMeta.MetadataChecksum
 		solvescriptChanged := curr.SolveScript != newMeta.SolveScript
-		safe := m.safeToRefresh(newMeta)
+		// safeToRefresh is a full metadata lookup, so it is asked only where
+		// its answer can change the verdict: never for a source change.
 		switch {
-		case sourceChanged || ((metadataChanged || solvescriptChanged) && !safe):
+		case sourceChanged:
 			cu.Updated = append(cu.Updated, newMeta)
-		case m.hasStaleBuilds(newMeta):
-			// The source on disk is what the database already records, but a
-			// build was produced from an earlier generation: its last rebuild
-			// failed after the challenge row had moved on (updateChallenges
-			// commits the metadata before it builds). Compared by checksums
-			// alone the challenge looks unmodified and the failure would be
-			// invisible to every later update; it stays reported, and
-			// rebuilt, until a rebuild succeeds. Outranks Refreshed: the
-			// stale path re-persists the metadata on its way to the rebuild.
-			cu.Stale = append(cu.Stale, newMeta)
-		case !metadataChanged && !solvescriptChanged && safe:
-			cu.Unmodified = append(cu.Unmodified, curr)
-		case !metadataChanged && !solvescriptChanged:
+		case metadataChanged || solvescriptChanged:
+			if m.safeToRefresh(newMeta) {
+				m.log.debugf("Marking %s as refresh", newMeta.Id)
+				cu.Refreshed = append(cu.Refreshed, newMeta)
+			} else {
+				cu.Updated = append(cu.Updated, newMeta)
+			}
+		case !m.safeToRefresh(newMeta):
 			// The checksums are unchanged but the persisted options disagree
 			// with what the current loader parses — e.g. a challenge that
 			// declared a seccomp profile before the binary understood the
@@ -145,9 +141,18 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 			// refresh path (no rebuild) so the declared options take effect.
 			m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
 			cu.Refreshed = append(cu.Refreshed, newMeta)
+		case m.hasStaleBuilds(newMeta):
+			// Nothing changed on disk, but a build was produced from an
+			// earlier generation: its last rebuild failed after the challenge
+			// row had moved on (updateChallenges commits the metadata before
+			// it builds). Compared by checksums alone the challenge looks
+			// unmodified and the failure would be invisible to every later
+			// update; it stays reported, and rebuilt, until a rebuild
+			// succeeds. A challenge that is also Refreshed is reported as
+			// that, and its stale builds are rebuilt on that path all the same.
+			cu.Stale = append(cu.Stale, newMeta)
 		default:
-			m.log.debugf("Marking %s as refresh", newMeta.Id)
-			cu.Refreshed = append(cu.Refreshed, newMeta)
+			cu.Unmodified = append(cu.Unmodified, curr)
 		}
 		delete(challenges, curr.Id)
 	}
@@ -211,17 +216,21 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 		cu.Errors = append(cu.Errors, errs...)
 	}
 
-	errs = m.updateChallenges(cu.Refreshed, false, false)
+	// A source change rebuilds every build of the challenge; the other two
+	// persisted verdicts rebuild only what an earlier rebuild left at a
+	// previous generation, which for a Refreshed challenge is normally
+	// nothing.
+	errs = m.updateChallenges(cu.Refreshed, m.staleBuildIds, options.PruneOldImages)
 	if len(errs) != 0 {
 		cu.Errors = append(cu.Errors, errs...)
 	}
 
-	errs = m.updateChallenges(cu.Updated, true, options.PruneOldImages)
+	errs = m.updateChallenges(cu.Updated, m.allBuildIds, options.PruneOldImages)
 	if len(errs) != 0 {
 		cu.Errors = append(cu.Errors, errs...)
 	}
 
-	errs = m.rebuildStaleChallenges(cu.Stale, options.PruneOldImages)
+	errs = m.updateChallenges(cu.Stale, m.staleBuildIds, options.PruneOldImages)
 	if len(errs) != 0 {
 		cu.Errors = append(cu.Errors, errs...)
 	}

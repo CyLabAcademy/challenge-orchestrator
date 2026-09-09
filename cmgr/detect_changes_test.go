@@ -123,8 +123,25 @@ func TestDetectChangesStale(t *testing.T) {
 		t.Errorf("expected only build %d to be stale, got %v", built, ids)
 	}
 
-	// The source changes as well: Updated outranks Stale (every build is
-	// rebuilt by the update path anyway).
+	// A metadata-only edit on top of the stale build: Refreshed outranks
+	// Stale, so a schema converge still sees the metadata drift, and the
+	// stale build is rebuilt on the Refreshed path all the same.
+	edited := detectChangesProblem + "\n## Hints\n\n- Think about ordering.\n"
+	if err := os.WriteFile(filepath.Join(chalDir, "problem.md"), []byte(edited), 0o644); err != nil {
+		t.Fatalf("rewrite problem.md: %s", err)
+	}
+	cu = mgr.DetectChanges(root)
+	expectOnly(t, cu, id, "Refreshed")
+	ids, err = mgr.staleBuildIds(cu.Refreshed[0])
+	if err != nil {
+		t.Fatalf("staleBuildIds: %s", err)
+	}
+	if len(ids) != 1 || ids[0] != built {
+		t.Errorf("expected the Refreshed path to still find build %d stale, got %v", built, ids)
+	}
+
+	// The source changes as well: Updated outranks everything (every build
+	// is rebuilt by the update path anyway).
 	if err := os.WriteFile(filepath.Join(chalDir, "extra.txt"), []byte("new\n"), 0o644); err != nil {
 		t.Fatalf("write extra.txt: %s", err)
 	}

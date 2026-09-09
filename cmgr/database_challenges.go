@@ -361,7 +361,13 @@ func displacedPruneCandidate(oldChecksum, newChecksum, displaced uint32) bool {
 	return newChecksum != oldChecksum && displaced != 0 && displaced != newChecksum
 }
 
-func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebuild bool, pruneOldImages bool) []error {
+// updateChallenges persists each challenge's metadata and then, when
+// selectBuilds is given, rebuilds the builds it selects (see rebuildBuilds):
+// allBuildIds for a source change, staleBuildIds to bring back whatever an
+// earlier rebuild left at a previous generation, nil for a metadata-only
+// refresh. A challenge whose metadata fails to persist is skipped before any
+// rebuild, so a rebuild never runs against a row that does not match the tree.
+func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, selectBuilds func(*ChallengeMetadata) ([]BuildId, error), pruneOldImages bool) []error {
 	errs := []error{}
 	for _, metadata := range updatedChallenges {
 		txn := m.db.MustBegin()
@@ -619,15 +625,12 @@ func (m *Manager) updateChallenges(updatedChallenges []*ChallengeMetadata, rebui
 			continue // next challenge
 		}
 
-		if rebuild {
-			buildIds := []BuildId{}
-			err = m.db.Select(&buildIds, "SELECT id FROM builds WHERE challenge=?;", metadata.Id)
+		if selectBuilds != nil {
+			buildIds, err := selectBuilds(metadata)
 			if err != nil {
-				m.log.error(err)
 				errs = append(errs, err)
 				continue
 			}
-
 			errs = append(errs, m.rebuildBuilds(metadata, buildIds, pruneOldImages)...)
 		}
 	}
@@ -837,14 +840,21 @@ func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId,
 	}
 	defer os.Remove(buildCtxFile)
 
+	// Every build here belongs to the one challenge, so what the restarts
+	// need of it -- the persisted metadata (delivery type, options) and the
+	// reverse port map -- is looked up once rather than per build.
+	cMeta, err := m.lookupChallengeMetadata(metadata.Id)
+	if err != nil {
+		return append(errs, err)
+	}
+	revPortMap, err := m.getReversePortMap(metadata.Id)
+	if err != nil {
+		return append(errs, err)
+	}
+
 	replaced := []replacedImages{}
 	for _, buildId := range buildIds {
 		build, err := m.lookupBuildMetadata(buildId)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		cMeta, err := m.lookupChallengeMetadata(build.Challenge)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -892,18 +902,12 @@ func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId,
 		// instances, so any found here are placeholders left by older
 		// versions of cmgr and are removed the same way.
 		//
-		// Both lookups below purge on their way out. The purge is
-		// held until after the restarts only to protect them, and
-		// neither path reaches a restart -- so there is nothing
-		// left to wait behind, and skipping it would leak this
-		// build's images for good: purgeBuiltImages is the only
-		// thing that reclaims them.
-		revPortMap, err := m.getReversePortMap(build.Challenge)
-		if err != nil {
-			errs = append(errs, err)
-			m.purgeBuiltImages(build)
-			continue
-		}
+		// The lookup below purges on its way out. The purge is held
+		// until after the restarts only to protect them, and this
+		// path reaches no restart -- so there is nothing left to
+		// wait behind, and skipping it would leak this build's
+		// images for good: purgeBuiltImages is the only thing that
+		// reclaims them.
 		instances, err := m.getBuildInstances(build.Id)
 		if err != nil {
 			errs = append(errs, err)
@@ -960,12 +964,20 @@ func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId,
 				err = m.restartInstance(build, cMeta, instance, revPortMap)
 			}
 			if err != nil {
-				err = fmt.Errorf("instance %d of %s removed instead of restarted (%v); relaunched through placement by this update", instance.Id, build.Challenge, err)
+				// Two outcomes, told apart for the operator: removed, and
+				// so relaunched by the converge below (its ports may differ,
+				// which is why this stays an error of the update and not a
+				// warning); or not even removable, in which case the record
+				// survives, the converge counts it, and it has to be stopped
+				// by hand.
+				restartErr := err
+				if err = m.stopInstance(instance); err != nil {
+					err = fmt.Errorf("instance %d of %s could not be restarted (%v) nor removed (%v); it stays on record and must be stopped by hand before a converge can replace it", instance.Id, build.Challenge, restartErr, err)
+				} else {
+					err = fmt.Errorf("instance %d of %s removed instead of restarted (%v); relaunched through placement by this update, possibly on other ports", instance.Id, build.Challenge, restartErr)
+				}
 				m.log.warn(err)
 				errs = append(errs, err)
-				if err = m.stopInstance(instance); err != nil {
-					errs = append(errs, err)
-				}
 			}
 		}
 
@@ -1018,24 +1030,5 @@ func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId,
 	// rebuild lands (or if it failed above) — contentReferenced
 	// keeps the images alive in all of those cases.
 	m.pruneReplacedImages(replaced)
-	return errs
-}
-
-// rebuildStaleChallenges is the update path for ChallengeUpdates.Stale. The
-// metadata is re-persisted first — idempotent, since the tree and the row
-// already agree, and it is what makes a Stale verdict a superset of Refreshed
-// — and then only the builds still serving an earlier generation are rebuilt;
-// the challenge's current builds are left alone.
-func (m *Manager) rebuildStaleChallenges(stale []*ChallengeMetadata, pruneOldImages bool) []error {
-	errs := m.updateChallenges(stale, false, false)
-	for _, metadata := range stale {
-		buildIds, err := m.staleBuildIds(metadata)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		m.log.infof("rebuilding %d build(s) of %s left at an earlier generation by a failed rebuild", len(buildIds), metadata.Id)
-		errs = append(errs, m.rebuildBuilds(metadata, buildIds, pruneOldImages)...)
-	}
 	return errs
 }

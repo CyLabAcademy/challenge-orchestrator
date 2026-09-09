@@ -199,15 +199,16 @@ func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 	// The buckets are distinct: only Updated implies changed image content (and
 	// hence stale images); Refreshed is a metadata/solve-script change with the
 	// source checksum unchanged, so its images are current. modified drives the
-	// pending-build error path below (anything not Unmodified is drift).
+	// pending-build error path below (any drift in the tree).
 	sourceChanged := inList(updates.Updated)
 	metadataChanged := inList(updates.Refreshed)
 	removed := inList(updates.Removed)
 	modified := sourceChanged || metadataChanged || removed
-	// Stale is not drift in the tree — the source on disk is what the
-	// database records — but a build of this challenge still serves an
-	// earlier generation because its rebuild failed. Worth naming when there
-	// is nothing to build; not a reason to refuse a build that is wanted.
+	// Stale is not drift in the tree — nothing changed on disk, or the
+	// verdict would have been one of the above — but a build of this
+	// challenge still serves an earlier generation because its rebuild
+	// failed. Worth naming when there is nothing to build; not a reason to
+	// refuse a build that is wanted, which is built from the current tree.
 	stale := inList(updates.Stale)
 
 	if buildsComplete {

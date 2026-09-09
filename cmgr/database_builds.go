@@ -366,10 +366,31 @@ func (m *Manager) staleBuildIds(cMeta *ChallengeMetadata) ([]BuildId, error) {
 	return ids, nil
 }
 
-// hasStaleBuilds reports whether staleBuildIds would name anything. A query
+// allBuildIds lists every build of a challenge: the rebuild selector for a
+// source change, where every image is out of date.
+func (m *Manager) allBuildIds(cMeta *ChallengeMetadata) ([]BuildId, error) {
+	ids := []BuildId{}
+	err := m.db.Select(&ids, "SELECT id FROM builds WHERE challenge=? ORDER BY id;", cMeta.Id)
+	if err != nil {
+		m.log.errorf("failed to look up the builds of %s: %s", cMeta.Id, err)
+		return nil, err
+	}
+	return ids, nil
+}
+
+// hasStaleBuilds reports whether staleBuildIds would name anything, as one
+// indexed existence probe: DetectChanges asks it for every challenge whose
+// source is unchanged, on every update, dry run and schema converge. A query
 // error counts as "not stale": the update goes on classifying by checksums as
-// it always has, and the error is logged where it happened.
+// it always has, and the error is logged here.
 func (m *Manager) hasStaleBuilds(cMeta *ChallengeMetadata) bool {
-	ids, err := m.staleBuildIds(cMeta)
-	return err == nil && len(ids) > 0
+	var stale bool
+	err := m.db.Get(&stale,
+		"SELECT EXISTS(SELECT 1 FROM builds WHERE challenge=? AND flag != '' AND sourcechecksum != ?);",
+		cMeta.Id, cMeta.SourceChecksum)
+	if err != nil {
+		m.log.errorf("failed to check %s for stale builds: %s", cMeta.Id, err)
+		return false
+	}
+	return stale
 }

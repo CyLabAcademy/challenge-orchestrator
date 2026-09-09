@@ -109,6 +109,7 @@ const schemaQuery string = `
 	);
 
 	CREATE INDEX IF NOT EXISTS schemaIndex on builds(schema);
+	CREATE INDEX IF NOT EXISTS buildChallengeIndex on builds(challenge);
 
 	CREATE TABLE IF NOT EXISTS images (
 		id INTEGER PRIMARY KEY,

@@ -228,10 +228,12 @@ func (cm *ChallengeMetadata) NeedsInstance() bool {
 
 // ChallengeUpdates is DetectChanges' verdict on each challenge, one bucket per
 // challenge: Added (on disk, not in the database), Updated (source changed:
-// rebuilt), Stale (source unchanged, but a build still serves an earlier
-// generation because its last rebuild failed: those builds are rebuilt),
-// Refreshed (metadata only: re-persisted, no rebuild), Unmodified, Removed.
-// Updated takes precedence over Stale, which takes precedence over Refreshed.
+// every build rebuilt), Refreshed (metadata only: re-persisted), Stale
+// (nothing changed on disk, but a build still serves an earlier generation
+// because its last rebuild failed), Unmodified, Removed. Updated outranks
+// Refreshed outranks Stale. Whatever a failed rebuild left behind is rebuilt
+// on the Refreshed and Stale paths alike, so a Stale verdict is only ever
+// given when there is nothing else to report.
 type ChallengeUpdates struct {
 	Added      []*ChallengeMetadata `json:"added"`
 	Refreshed  []*ChallengeMetadata `json:"refreshed"`
