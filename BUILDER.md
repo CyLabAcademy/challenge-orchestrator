@@ -141,7 +141,8 @@ challenge still costs a tag resolution on every build of it. Pin all of them.
   `update` and `update --dry-run` until a rebuild succeeds, and `update`
   rebuilds exactly those builds. Nothing has to be edited to make it happen.
 - **Put the whole challenge fleet into maintenance for the rebuild.** cork
-  serializes updates against each other, but nothing stops the platform from
+  serializes updates and schema operations against each other (one at a time,
+  the rest wait), but nothing stops the platform from
   requesting launches of a build while that build is being replaced — and a
   launch in flight can collide with the update's own teardown of the instances
   it is displacing (`removal of container ... is already in progress`), which

@@ -478,7 +478,21 @@ func (m *Manager) ListSchemas() ([]string, error) {
 // other API calls unless explicitly allowed by the schema.  This call is
 // likely to be extremely time and resource intensive as it will start creating
 // all of the requested builds immediately and not return until complete.
+//
+// Schema operations share updateMu with rebuilds (UpdateWithOptions): a
+// converge builds, stops and launches instances of the same builds an update
+// rebuilds and restarts, and the two interleaved would work over each other's
+// instances just as two updates would. The lock is taken here, at the API
+// boundary, and never inside: the unlocked helpers below are what the
+// operations call each other through.
 func (m *Manager) CreateSchema(schema *Schema) []error {
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+	return m.createSchema(schema)
+}
+
+// createSchema is CreateSchema without the lock; the caller holds updateMu.
+func (m *Manager) createSchema(schema *Schema) []error {
 	exists, err := m.schemaExists(schema.Name)
 	if err != nil {
 		return []error{err}
@@ -492,14 +506,18 @@ func (m *Manager) CreateSchema(schema *Schema) []error {
 // Updates the definition of the schema internally and then converges to the
 // new definition.  Certain updates are more expensive than others.  In
 // particular, updating the flag format will cause a complete rebuild of the
-// state.
+// state.  Serialized with rebuilds and other schema operations; see
+// CreateSchema.
 func (m *Manager) UpdateSchema(schema *Schema) []error {
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+
 	exists, err := m.schemaExists(schema.Name)
 	if err != nil {
 		return []error{err}
 	} else if !exists {
 		m.log.warnf("schema '%s' does not exist, creating...", schema.Name)
-		return m.CreateSchema(schema)
+		return m.createSchema(schema)
 	}
 
 	return m.convergeSchema(schema)
@@ -611,8 +629,12 @@ func (m *Manager) convergeSchema(schema *Schema) []error {
 	return errs
 }
 
-// Tears down all instances and builds belonging to the schema.
+// Tears down all instances and builds belonging to the schema.  Serialized
+// with rebuilds and other schema operations; see CreateSchema.
 func (m *Manager) DeleteSchema(name string) error {
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+
 	err := m.lockSchema(name)
 	if err != nil {
 		return err

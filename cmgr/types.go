@@ -54,8 +54,10 @@ type Manager struct {
 	challengeDockerfiles map[string][]byte
 	rand                 *rand.Rand
 	randMu               sync.Mutex
-	// updateMu serializes rebuilds (UpdateWithOptions): two of them would
-	// tear down and relaunch the same instances against each other.
+	// updateMu serializes rebuilds (UpdateWithOptions) and schema operations
+	// (CreateSchema, UpdateSchema, DeleteSchema) against each other: any two
+	// of them would tear down and relaunch the same instances against each
+	// other. Taken at the API boundary only; internal helpers assume it held.
 	updateMu sync.Mutex
 	// imageMu serializes the "is this content still referenced? if not, untag"
 	// critical sections (executeBuild cleanup, pruneReplacedImages,
