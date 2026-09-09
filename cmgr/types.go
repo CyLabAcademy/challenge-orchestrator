@@ -247,12 +247,22 @@ type BuildMetadata struct {
 	// `rollback` operation would swap it with Checksum, re-extract /challenge
 	// from that image (see executeBuild's extraction step), and restart
 	// instances. Same-row rollback is format- and seed-stable by construction.
-	PrevChecksum uint32              `json:"prev_checksum,omitempty" db:"prevchecksum"`
-	Images       []Image             `json:"images"`
-	HasArtifacts bool                `json:"has_artifacts"`
-	LastSolved   int64               `json:"last_solved"`
-	Challenge    ChallengeId         `json:"challenge_id"`
-	Instances    []*InstanceMetadata `json:"instances,omitempty"`
+	PrevChecksum uint32 `json:"prev_checksum,omitempty" db:"prevchecksum"`
+	// SourceChecksum is the challenge source generation (ChallengeMetadata.
+	// SourceChecksum) this build's images were produced from; 0 until the
+	// build has been built. A build is current exactly when it equals the
+	// challenge's recorded source checksum, so a rebuild that failed — the
+	// challenge row already carries the new generation, the build still
+	// serves the old one — is visible as the difference rather than lost.
+	// It is deliberately the source generation and not Checksum: base-image
+	// pins are folded into Checksum and a pin refresh must not make every
+	// build look stale.
+	SourceChecksum uint32              `json:"source_checksum,omitempty" db:"sourcechecksum"`
+	Images         []Image             `json:"images"`
+	HasArtifacts   bool                `json:"has_artifacts"`
+	LastSolved     int64               `json:"last_solved"`
+	Challenge      ChallengeId         `json:"challenge_id"`
+	Instances      []*InstanceMetadata `json:"instances,omitempty"`
 
 	Schema        string `json:"schema"`
 	InstanceCount int    `json:"instance_count"`

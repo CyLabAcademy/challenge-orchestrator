@@ -55,13 +55,13 @@ func (m *Manager) openBuild(build *BuildMetadata) error {
 	}
 
 	m.log.debug("Running select...")
-	rows, err := m.db.NamedQuery("SELECT id, flag, hasartifacts, lastsolved, checksum, prevchecksum FROM builds WHERE schema=:schema AND format=:format AND challenge=:challenge AND seed=:seed;", build)
+	rows, err := m.db.NamedQuery("SELECT id, flag, hasartifacts, lastsolved, checksum, prevchecksum, sourcechecksum FROM builds WHERE schema=:schema AND format=:format AND challenge=:challenge AND seed=:seed;", build)
 	if err != nil {
 		m.log.errorf("failed to find build: %s", err)
 	} else if !rows.Next() {
 		m.log.error("found no rows when exactly one expected")
 	}
-	err = rows.Scan(&build.Id, &build.Flag, &build.HasArtifacts, &build.LastSolved, &build.Checksum, &build.PrevChecksum)
+	err = rows.Scan(&build.Id, &build.Flag, &build.HasArtifacts, &build.LastSolved, &build.Checksum, &build.PrevChecksum, &build.SourceChecksum)
 	if err != nil {
 		m.log.errorf("failed to read build ID: %s", err)
 	}
@@ -81,6 +81,7 @@ const finalizeBuildQuery string = `
 		hasartifacts = :hasartifacts,
 		checksum = :checksum,
 		prevchecksum = :prevchecksum,
+		sourcechecksum = :sourcechecksum,
 		lastsolved = 0
 	WHERE id = :id;`
 

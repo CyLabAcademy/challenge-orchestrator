@@ -642,7 +642,11 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 	// Stamp the build with the content identity its images are about to be
 	// produced from; dockerId (and therefore every tag below) depends on it.
+	// The source generation is recorded alongside: it reaches the row only
+	// through finalizeBuild, so a build that fails below keeps the generation
+	// it still serves and stays detectable as stale.
 	bMeta.Checksum = contentChecksum(cMeta.SourceChecksum, bMeta.Format, m.basePinsChecksum())
+	bMeta.SourceChecksum = cMeta.SourceChecksum
 
 	images := []Image{}
 	var buildImage string

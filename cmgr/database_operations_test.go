@@ -245,13 +245,19 @@ func TestDatabaseBuildLifecycle(t *testing.T) {
 		t.Error("expected non-zero build ID")
 	}
 
-	// Finalize the build
+	if build.SourceChecksum != 0 {
+		t.Errorf("expected an unbuilt row to record no source generation, got %#x", build.SourceChecksum)
+	}
+
+	// Finalize the build, recording the source generation it was built from
+	// the way executeBuild stamps it.
 	build.Flag = "flag{test_flag_123}"
 	build.HasArtifacts = false
 	build.LookupData = map[string]string{"key1": "val1"}
 	build.Images = []Image{
 		{Host: "challenge", Ports: []string{"8080/tcp"}},
 	}
+	build.SourceChecksum = 0xdeadbeef
 
 	err = mgr.finalizeBuild(build)
 	if err != nil {
@@ -266,6 +272,28 @@ func TestDatabaseBuildLifecycle(t *testing.T) {
 
 	if got.Flag != "flag{test_flag_123}" {
 		t.Errorf("expected flag 'flag{test_flag_123}', got %q", got.Flag)
+	}
+	if got.SourceChecksum != 0xdeadbeef {
+		t.Errorf("expected the recorded source generation 0xdeadbeef, got %#x", got.SourceChecksum)
+	}
+
+	// Re-opening the same build (a schema converge) reads the recorded
+	// generation back rather than resetting it.
+	reopened := &BuildMetadata{
+		Seed:          12345,
+		Format:        "flag{%s}",
+		Challenge:     "test/build-test",
+		Schema:        "manual-test",
+		InstanceCount: DYNAMIC_INSTANCES,
+	}
+	if err = mgr.openBuild(reopened); err != nil {
+		t.Fatalf("openBuild (reopen) failed: %s", err)
+	}
+	if reopened.Id != build.Id {
+		t.Errorf("expected reopen to find build %d, got %d", build.Id, reopened.Id)
+	}
+	if reopened.SourceChecksum != 0xdeadbeef {
+		t.Errorf("expected reopen to read back source generation 0xdeadbeef, got %#x", reopened.SourceChecksum)
 	}
 	if got.Seed != 12345 {
 		t.Errorf("expected seed 12345, got %d", got.Seed)
@@ -2016,11 +2044,12 @@ func TestInitDatabaseRepairsStaleIsFinalizedDefault(t *testing.T) {
 	}
 	// Mirror the pre-rebuild schema: created_at present, is_finalized added with
 	// the legacy DEFAULT 1. Seed one already-launched instance (default 1).
-	// The builds stub carries the seed/format/challenge columns every real
-	// pre-checksum database has, so the builds.checksum migration's backfill
-	// query can run against it (its challenges join simply matches nothing).
+	// The builds stub carries the flag/seed/format/challenge columns every real
+	// pre-checksum database has, so the builds.checksum and
+	// builds.sourcechecksum migrations' backfill queries can run against it
+	// (their challenges joins simply match nothing).
 	legacy := `
-	CREATE TABLE builds (id INTEGER PRIMARY KEY, schema TEXT, seed INTEGER, format TEXT, challenge TEXT);
+	CREATE TABLE builds (id INTEGER PRIMARY KEY, flag TEXT NOT NULL DEFAULT '', schema TEXT, seed INTEGER, format TEXT, challenge TEXT);
 	CREATE TABLE instances (
 		id INTEGER PRIMARY KEY,
 		lastsolved INTEGER,
@@ -2246,5 +2275,90 @@ func TestReassignPortsKeepsAddressAcrossRestart(t *testing.T) {
 	mgr.portLow = 0
 	if err := mgr.reassignPorts(build, instance, revPortMap, previous); err != nil {
 		t.Fatalf("reassignPorts without a range failed: %v", err)
+	}
+}
+
+// TestBuildSourceChecksumBackfill verifies that a database predating
+// builds.sourcechecksum is migrated in place: the column is added, built rows
+// are stamped with their challenge's current source generation (presumed
+// current, as migrateBuildChecksums presumes), unbuilt rows stay at 0, and a
+// second start changes nothing.
+func TestBuildSourceChecksumBackfill(t *testing.T) {
+	dbFile, err := os.CreateTemp("", "cmgr-srcchecksum-migrate-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %s", err)
+	}
+	dbFile.Close()
+	t.Cleanup(func() { removeDBFiles(dbFile.Name()) })
+
+	os.Setenv(DB_ENV, dbFile.Name())
+	defer os.Unsetenv(DB_ENV)
+
+	// Seed a current-schema database, then drop the column to leave the shape
+	// an older cmgr wrote: the rows it holds are exactly those a legacy
+	// database would hold, with nothing recorded about their generation.
+	seedMgr := new(Manager)
+	seedMgr.log = newLogger(DISABLED)
+	if err := seedMgr.initDatabase(); err != nil {
+		t.Fatalf("initDatabase (seed) failed: %s", err)
+	}
+	challenge := &ChallengeMetadata{
+		Id:             "test/legacy-generation",
+		Name:           "Legacy Generation",
+		Namespace:      "test",
+		ChallengeType:  "custom",
+		SourceChecksum: 0x1234abcd,
+		Hosts:          []HostInfo{{Name: "challenge", Target: ""}},
+		PortMap:        map[string]PortInfo{},
+		Tags:           []string{},
+		Attributes:     map[string]string{},
+		Path:           "/tmp/test/problem.md",
+		ChallengeOptions: ChallengeOptions{
+			Overrides: map[string]ContainerOptions{"": {}},
+		},
+	}
+	if errs := seedMgr.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
+		t.Fatalf("addChallenges failed: %v", errs)
+	}
+	built := insertTestBuild(t, seedMgr, "schema-a", string(challenge.Id), "flag{%s}", 1, 0x1111)
+	res, err := seedMgr.db.Exec(
+		`INSERT INTO builds(flag, format, seed, checksum, hasartifacts, lastsolved, challenge, schema, instancecount)
+		 VALUES ('', 'flag{%s}', 2, 0x2222, 0, 0, ?, 'schema-a', 1);`, challenge.Id)
+	if err != nil {
+		t.Fatalf("failed to insert unbuilt row: %s", err)
+	}
+	unbuiltId, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("failed to read build id: %s", err)
+	}
+	unbuilt := BuildId(unbuiltId)
+	if _, err := seedMgr.db.Exec("ALTER TABLE builds DROP COLUMN sourcechecksum;"); err != nil {
+		t.Fatalf("failed to drop column: %s", err)
+	}
+	seedMgr.db.Close()
+
+	for _, pass := range []string{"migration", "idempotence"} {
+		mgr := new(Manager)
+		mgr.log = newLogger(DISABLED)
+		if err := mgr.initDatabase(); err != nil {
+			t.Fatalf("initDatabase failed (%s pass): %s", pass, err)
+		}
+
+		got, err := mgr.lookupBuildMetadata(built)
+		if err != nil {
+			t.Fatalf("lookupBuildMetadata (%s pass) failed: %s", pass, err)
+		}
+		if got.SourceChecksum != challenge.SourceChecksum {
+			t.Errorf("%s pass: expected the built row backfilled to %#x, got %#x", pass, challenge.SourceChecksum, got.SourceChecksum)
+		}
+
+		got, err = mgr.lookupBuildMetadata(unbuilt)
+		if err != nil {
+			t.Fatalf("lookupBuildMetadata (%s pass) failed: %s", pass, err)
+		}
+		if got.SourceChecksum != 0 {
+			t.Errorf("%s pass: expected the unbuilt row left at 0, got %#x", pass, got.SourceChecksum)
+		}
+		mgr.db.Close()
 	}
 }
