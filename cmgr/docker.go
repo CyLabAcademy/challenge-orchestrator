@@ -566,6 +566,45 @@ func (m *Manager) pushImage(imageName string) error {
 	return nil
 }
 
+// publishImages pushes a validated build's instance images to the challenge
+// registry, where the workers pull them from. The "builder" image is only
+// used locally for artifact extraction and stays local. Registry mode only.
+//
+// The registry is write-once: a tag names its content (challenge, seed,
+// checksum, host — see dockerId), so a tag that is already there is the same
+// content by construction and is left as it is, never pushed over. Two rows
+// that share a tuple, a rebuild that reproduces a generation, or a second
+// builder publishing the same content all converge on the one push. The tag
+// is only wrong if the identity is (a build input the checksum does not
+// cover), and that is repaired by removing the tag — destroy, prune, or a
+// manual delete — and building again, not by overwriting it in place under a
+// name that workers holding the old bytes would not notice had changed.
+func (m *Manager) publishImages(cMeta *ChallengeMetadata, bMeta *BuildMetadata) error {
+	if m.challengeRegistry == "" {
+		return nil
+	}
+	for _, image := range bMeta.Images {
+		if image.Host == "builder" {
+			continue
+		}
+		imageName := m.instanceImageName(cMeta.Id, bMeta, image)
+		present, err := m.registryTagExists(imageName)
+		if err != nil {
+			err = fmt.Errorf("could not check the registry for %s before pushing: %w", imageName, err)
+			m.log.error(err)
+			return err
+		}
+		if present {
+			m.log.infof("%s is already in the registry; the tag names its content, so the build's copy is not pushed over it", imageName)
+			continue
+		}
+		if err := m.pushImage(imageName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // registryTimedOut reports whether a failed pull is the daemon's own timeout
 // talking to the registry rather than ours running out.
 //
@@ -745,14 +784,10 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 			return err
 		}
 
-		// Registry mode: workers pull instance images from the registry, so
-		// every image a worker may run must be pushed at build time. The
-		// "builder" image is only used locally for artifact extraction.
-		if m.challengeRegistry != "" && image.Host != "builder" {
-			if err := m.pushImage(imageName); err != nil {
-				return err
-			}
-		}
+		// Built, not yet published: the push waits until the whole build has
+		// validated (publishImages, below). A generation that fails extraction
+		// or validation then never reaches the registry, instead of leaving a
+		// tag there that no row will ever name.
 		images = append(images, image)
 	}
 
@@ -869,6 +904,14 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	bMeta.HasArtifacts = len(files) > 0
 
 	err = m.validateBuild(cMeta, bMeta, files)
+	// Registry, then archive, then row: each store is written only once the
+	// one before it holds the generation, so nothing ever names a generation
+	// the workers cannot pull. A push that fails takes the failure path with
+	// everything else: the staged archive is dropped and the local images are
+	// untagged.
+	if err == nil {
+		err = m.publishImages(cMeta, bMeta)
+	}
 	if err == nil && stagedArtifactsPath != "" {
 		// Promote the validated archive into place; rename is atomic, so
 		// concurrent downloads see either the old or the new archive, never a

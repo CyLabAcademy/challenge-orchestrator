@@ -107,3 +107,53 @@ func (m *Manager) registryDeleteTag(imageName string) error {
 		return fmt.Errorf("registry delete of %s returned %s", imageName, resp.Status)
 	}
 }
+
+// registryTagExists reports whether the challenge registry already serves a
+// manifest under imageName's tag. It is the guard that keeps the registry
+// write-once: a content-addressed tag is pushed at most once, and never over
+// whatever a tag already names (see publishImages). A registry that cannot be
+// asked is an error, not "absent": pushing on a guess is exactly what the guard
+// exists to prevent.
+func (m *Manager) registryTagExists(imageName string) (bool, error) {
+	repoAndTag, ok := strings.CutPrefix(imageName, m.challengeRegistry+"/")
+	if !ok {
+		return false, fmt.Errorf("image %s is not qualified with registry %s", imageName, m.challengeRegistry)
+	}
+	repo, tag, ok := strings.Cut(repoAndTag, ":")
+	if !ok {
+		return false, fmt.Errorf("image %s has no tag", imageName)
+	}
+
+	httpClient, err := m.registryHTTPClient()
+	if err != nil {
+		return false, err
+	}
+
+	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", m.challengeRegistry, repo, tag)
+	req, err := http.NewRequestWithContext(m.ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return false, err
+	}
+	// Every manifest type a docker push can leave behind: a HEAD without an
+	// Accept a registry can satisfy is answered 404 for a tag that exists.
+	req.Header.Set("Accept", strings.Join([]string{
+		"application/vnd.oci.image.manifest.v1+json",
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+	}, ", "))
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("registry check of %s returned %s", imageName, resp.Status)
+	}
+}

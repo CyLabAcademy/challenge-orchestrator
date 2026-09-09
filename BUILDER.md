@@ -27,6 +27,15 @@ Three things then sit on top:
 | Pin fingerprint | the pin map's checksum is folded into a build's content identity | `contentChecksum`, `cmgr/docker.go` |
 | Inline cache | pushed images carry BuildKit cache metadata; a rebuild imports from the generation it displaces | `executeBuild` and `cacheRefsFor`, `cmgr/docker.go` |
 | Purge after push | the builder's local copy of a build's images is dropped once they are in the registry | `cmgr/purge.go` |
+| Write-once publish | a build is pushed only once it has validated, and a tag already in the registry is never pushed over | `publishImages` and `registryTagExists`, `cmgr/docker.go`, `cmgr/registry.go` |
+
+The publish order is registry, then artifact archive, then build row: each
+store is written only once the one before it holds the generation, so nothing
+ever names a generation the workers cannot pull, and a build that fails
+validation leaves no tag behind. A tag names its content, so one that is
+already there is left alone rather than overwritten; the repair for a tag
+that is wrong (a build input the checksum does not cover) is to remove it —
+`--prune-old`, `remove-schema`, or a manual delete — and build again.
 
 ## Why pinning exists
 
