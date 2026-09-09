@@ -950,23 +950,34 @@ func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId,
 			// first, while the old one keeps serving, then swaps. One that cannot
 			// happen (its worker down: every docker call to it would only time
 			// out) or that fails at any point removes the instance instead, like
-			// any stop on a down worker, and reports it: the next update-schema
-			// relaunches it fresh. Left in place it would either count as present
-			// while dead, or come back serving the old image once its box rejoins,
-			// since a later update finds nothing to rebuild.
+			// any stop on a down worker, and reports it; the converge below
+			// relaunches it fresh, through placement. Left in place it would
+			// either count as present while dead, or come back serving the old
+			// image once its box rejoins, since a later update finds nothing to
+			// rebuild.
 			if instance.Worker != "" && m.workerIsDown(instance.Worker) {
 				err = fmt.Errorf("worker %s is down", instance.Worker)
 			} else {
 				err = m.restartInstance(build, cMeta, instance, revPortMap)
 			}
 			if err != nil {
-				err = fmt.Errorf("instance %d of %s removed instead of restarted (%v); the next update-schema relaunches it", instance.Id, build.Challenge, err)
+				err = fmt.Errorf("instance %d of %s removed instead of restarted (%v); relaunched through placement by this update", instance.Id, build.Challenge, err)
 				m.log.warn(err)
 				errs = append(errs, err)
 				if err = m.stopInstance(instance); err != nil {
 					errs = append(errs, err)
 				}
 			}
+		}
+
+		// A persistent build is brought back to its instance count here, by
+		// the update that just rebuilt it, rather than by whoever next runs
+		// update-schema: whatever the restarts above could not keep is
+		// relaunched through placement (on another worker, if the one it
+		// lived on is down). Dynamic and locked builds have no count to
+		// converge to, and a non-service challenge runs no instances.
+		if build.InstanceCount > 0 && cMeta.NeedsInstance() {
+			errs = append(errs, m.convergeBuildInstances(build, cMeta, build.InstanceCount)...)
 		}
 
 		// The builder's copies are redundant once pushed

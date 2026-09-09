@@ -235,9 +235,10 @@ Workers:
   while the old containers keep serving, then swaps them, waiting for its
   slot as long as it takes. One that cannot be restarted (its worker down,
   the pull or the start failed) is removed instead, like any stop on a down
-  worker, reported as an error of the update, and relaunched by the next
-  update-schema. The schema converge (add-schema, update-schema) launches
-  persistent instances under the same limits.
+  worker, reported as an error of the update, and relaunched through
+  placement by the same update once the build's restarts are done. The
+  schema converge (add-schema, update-schema) launches persistent instances
+  under the same limits.
 
   Workers have two addresses: the private IP cmgrd dials, and an optional
   player-facing public address ("public" in the POST /workers body).

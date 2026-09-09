@@ -593,36 +593,54 @@ func (m *Manager) convergeSchema(schema *Schema) []error {
 				continue
 			}
 
-			instances, err := m.getBuildInstances(buildMeta.Id)
-			m.log.debugf("converging %s/%d: %d found, need %d", buildMeta.Challenge, buildMeta.Id, len(instances), target)
-			for i := target; i < len(instances); i++ {
-				iMeta, err := m.lookupInstanceMetadata(instances[i])
-				if err != nil {
-					errs = append(errs, err)
-					continue
-				}
+			errs = append(errs, m.convergeBuildInstances(buildMeta, cMeta, target)...)
+		}
+	}
 
-				err = m.stopInstance(iMeta)
-				if err != nil {
-					errs = append(errs, err)
-				}
-			}
+	return errs
+}
 
-			for i := len(instances); i < target; i++ {
-				if len(buildMeta.Images) == 0 {
-					// Lazy lookup for case where we resized
-					buildMeta, err = m.lookupBuildMetadata(buildMeta.Id)
-					if err != nil {
-						errs = append(errs, err)
-						break
-					}
-				}
-				_, err = m.newInstance(buildMeta, nil, m.restartLimits())
-				if err != nil {
-					errs = append(errs, err)
-					break
-				}
+// convergeBuildInstances brings the number of instances of one build to
+// target: surplus ones are stopped, missing ones launched through placement
+// under the restart limits. It is the instance half of a schema converge, and
+// what a rebuild runs for a persistent build once its restarts are done, so an
+// instance the restart could not keep is relaunched by the same update that
+// removed it. The caller resolves target (0 for a non-service challenge, and
+// nothing to do for DYNAMIC_INSTANCES or LOCKED) and holds updateMu.
+func (m *Manager) convergeBuildInstances(buildMeta *BuildMetadata, cMeta *ChallengeMetadata, target int) []error {
+	errs := []error{}
+
+	instances, err := m.getBuildInstances(buildMeta.Id)
+	if err != nil {
+		return append(errs, err)
+	}
+	m.log.debugf("converging %s/%d: %d found, need %d", buildMeta.Challenge, buildMeta.Id, len(instances), target)
+	for i := target; i < len(instances); i++ {
+		iMeta, err := m.lookupInstanceMetadata(instances[i])
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		err = m.stopInstance(iMeta)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	for i := len(instances); i < target; i++ {
+		if len(buildMeta.Images) == 0 {
+			// Lazy lookup for case where we resized
+			buildMeta, err = m.lookupBuildMetadata(buildMeta.Id)
+			if err != nil {
+				errs = append(errs, err)
+				break
 			}
+		}
+		_, err = m.newInstance(buildMeta, nil, m.restartLimits())
+		if err != nil {
+			errs = append(errs, err)
+			break
 		}
 	}
 
