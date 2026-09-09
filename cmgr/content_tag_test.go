@@ -76,13 +76,20 @@ func TestDockerIdContentAddressed(t *testing.T) {
 	}
 }
 
-// insertTestBuild inserts a builds row directly and returns its id.
+// insertTestBuild inserts a built builds row directly and returns its id.
 func insertTestBuild(t *testing.T, mgr *Manager, schema, challenge, format string, seed int, checksum uint32) BuildId {
+	t.Helper()
+	return insertTestBuildRow(t, mgr, "flag{x}", schema, challenge, format, seed, checksum)
+}
+
+// insertTestBuildRow is insertTestBuild with the flag chosen by the caller:
+// an empty flag is a row that has been opened but not built.
+func insertTestBuildRow(t *testing.T, mgr *Manager, flag, schema, challenge, format string, seed int, checksum uint32) BuildId {
 	t.Helper()
 	res, err := mgr.db.Exec(
 		`INSERT INTO builds(flag, format, seed, checksum, hasartifacts, lastsolved, challenge, schema, instancecount)
-		 VALUES ('flag{x}', ?, ?, ?, 0, 0, ?, ?, 1);`,
-		format, seed, checksum, challenge, schema)
+		 VALUES (?, ?, ?, ?, 0, 0, ?, ?, 1);`,
+		flag, format, seed, checksum, challenge, schema)
 	if err != nil {
 		t.Fatalf("failed to insert build: %s", err)
 	}

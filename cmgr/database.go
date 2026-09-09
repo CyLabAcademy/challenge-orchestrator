@@ -525,14 +525,14 @@ func (m *Manager) initDatabase() error {
 // migrateBuildChecksums makes. A legacy row whose last rebuild had failed is
 // therefore presumed current once, exactly as it was before the column
 // existed; every rebuild from here on records the truth. Unbuilt rows stay at
-// 0 — there is no generation to record — as do rows without a challenge,
-// which the correlated subquery would otherwise set to NULL. Called from
-// initDatabase before m.db is assigned, so the handle is passed in.
+// 0 — there is no generation to record — and the join leaves a row without a
+// challenge alone. Called from initDatabase before m.db is assigned, so the
+// handle is passed in.
 func (m *Manager) migrateBuildSourceChecksums(db *sqlx.DB) error {
 	res, err := db.Exec(`UPDATE builds
-		SET sourcechecksum = (SELECT c.sourcechecksum FROM challenges AS c WHERE c.id = builds.challenge)
-		WHERE flag != '' AND sourcechecksum = 0
-			AND EXISTS (SELECT 1 FROM challenges AS c WHERE c.id = builds.challenge);`)
+		SET sourcechecksum = c.sourcechecksum
+		FROM challenges AS c
+		WHERE c.id = builds.challenge AND builds.flag != '' AND builds.sourcechecksum = 0;`)
 	if err != nil {
 		return err
 	}

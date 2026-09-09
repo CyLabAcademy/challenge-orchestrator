@@ -45,7 +45,7 @@ func (m *Manager) openBuild(build *BuildMetadata) error {
 			ChallengeType  string `db:"challengetype"`
 		}
 		if err := m.db.Get(&challenge, "SELECT sourcechecksum, challengetype FROM challenges WHERE id = ?;", build.Challenge); err == nil {
-			build.Checksum = contentChecksum(challenge.SourceChecksum, build.Format, m.basePinsChecksum(), m.templateChecksum(challenge.ChallengeType))
+			build.Checksum = m.buildContentChecksum(challenge.SourceChecksum, build.Format, challenge.ChallengeType)
 		}
 	}
 

@@ -98,11 +98,7 @@ func TestDetectChangesStale(t *testing.T) {
 	if _, err := mgr.db.Exec("UPDATE builds SET sourcechecksum = ? WHERE id = ?;", current, built); err != nil {
 		t.Fatalf("stamp build: %s", err)
 	}
-	if _, err := mgr.db.Exec(
-		`INSERT INTO builds(flag, format, seed, checksum, hasartifacts, lastsolved, challenge, schema, instancecount)
-		 VALUES ('', 'flag{%s}', 2, 0x2222, 0, 0, ?, 'schema-a', 1);`, id); err != nil {
-		t.Fatalf("insert unbuilt row: %s", err)
-	}
+	insertTestBuildRow(t, mgr, "", "schema-a", string(id), "flag{%s}", 2, 0x2222)
 	expectOnly(t, mgr.DetectChanges(root), id, "Unmodified")
 
 	// The build's last rebuild failed: the row (and the tree) moved on, the

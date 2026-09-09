@@ -375,6 +375,14 @@ func (m *Manager) templateChecksum(challengeType string) uint32 {
 	return crc32.ChecksumIEEE(template)
 }
 
+// buildContentChecksum is contentChecksum with the Manager-held inputs (the
+// pin fingerprint, the type's template) composed in one place: every site
+// that stamps an identity goes through it, so a new identity input is added
+// here and in the pure function, nowhere else.
+func (m *Manager) buildContentChecksum(sourceChecksum uint32, format string, challengeType string) uint32 {
+	return contentChecksum(sourceChecksum, format, m.basePinsChecksum(), m.templateChecksum(challengeType))
+}
+
 // dockerId is the docker tag for one of the build's images. It is derived
 // from portable build identity — seed plus content checksum — rather than the
 // local autoincrement build id, so the same challenge content yields the same
@@ -416,7 +424,7 @@ func (m *Manager) migrateBuildChecksums(db *sqlx.DB) error {
 	}
 
 	for _, row := range rows {
-		checksum := contentChecksum(row.SourceChecksum, row.Format, m.basePinsChecksum(), m.templateChecksum(row.ChallengeType))
+		checksum := m.buildContentChecksum(row.SourceChecksum, row.Format, row.ChallengeType)
 
 		// Retag first: checksum=0 is the resume marker, so it is stamped only
 		// once the images provably carry the new tag (or are shown to need no
@@ -721,7 +729,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	// The source generation is recorded alongside: it reaches the row only
 	// through finalizeBuild, so a build that fails below keeps the generation
 	// it still serves and stays detectable as stale.
-	bMeta.Checksum = contentChecksum(cMeta.SourceChecksum, bMeta.Format, m.basePinsChecksum(), m.templateChecksum(cMeta.ChallengeType))
+	bMeta.Checksum = m.buildContentChecksum(cMeta.SourceChecksum, bMeta.Format, cMeta.ChallengeType)
 	bMeta.SourceChecksum = cMeta.SourceChecksum
 
 	images := []Image{}

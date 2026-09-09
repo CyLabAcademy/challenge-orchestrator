@@ -2321,17 +2321,7 @@ func TestBuildSourceChecksumBackfill(t *testing.T) {
 		t.Fatalf("addChallenges failed: %v", errs)
 	}
 	built := insertTestBuild(t, seedMgr, "schema-a", string(challenge.Id), "flag{%s}", 1, 0x1111)
-	res, err := seedMgr.db.Exec(
-		`INSERT INTO builds(flag, format, seed, checksum, hasartifacts, lastsolved, challenge, schema, instancecount)
-		 VALUES ('', 'flag{%s}', 2, 0x2222, 0, 0, ?, 'schema-a', 1);`, challenge.Id)
-	if err != nil {
-		t.Fatalf("failed to insert unbuilt row: %s", err)
-	}
-	unbuiltId, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("failed to read build id: %s", err)
-	}
-	unbuilt := BuildId(unbuiltId)
+	unbuilt := insertTestBuildRow(t, seedMgr, "", "schema-a", string(challenge.Id), "flag{%s}", 2, 0x2222)
 	if _, err := seedMgr.db.Exec("ALTER TABLE builds DROP COLUMN sourcechecksum;"); err != nil {
 		t.Fatalf("failed to drop column: %s", err)
 	}
