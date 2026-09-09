@@ -4384,11 +4384,10 @@ if (( FULL )); then
   pport=$(jq -r .ports.socat <<<"$pm_before")
   pworker=$(jq -r .worker <<<"$pm_before")
   # What the builder and the registry hold for this challenge before the failed
-  # rebuild. The images are pushed inside the per-host build loop, before the
-  # metadata is even extracted (cmgr/docker.go:692), so a failed generation does
-  # reach zot; the local untag on the failure path (cmgr/docker.go:838-853) is
-  # the only reclamation there is, and this step has to leave both as it found
-  # them either way.
+  # rebuild. The push waits for validation (publishImages, cmgr/docker.go), so
+  # a generation that fails it never reaches zot; the local untag on the
+  # failure path (executeBuild's failure block) is the only reclamation on the
+  # builder, and this step has to leave both as it found them.
   persist_local_tags() {
     local btags
     btags=$(builder_tags)
@@ -4496,49 +4495,72 @@ if (( FULL )); then
       fail "on-demand instance ${OD_IDS[0]} was torn down by an update that only rebuilt $CH_PERSISTENT, and failed at that"
   fi
 
-  # Housekeeping, with two assertions inside it. The failed generation's images
-  # are untagged locally on the failure path (cmgr/docker.go:838-853), so the
-  # builder must hold exactly what it held; nothing on that path may touch the
-  # registry, so every tag that was there must still be there. The failed
-  # generation's own tag, pushed before the build was ever validated, is the one
-  # thing legitimately new, and it is removed here with cork's identity or it
-  # would outlive the run in zot (the teardown only looks for named tags).
+  # Two assertions about what the failure left behind. The failed generation's
+  # images are untagged locally on the failure path (executeBuild's failure
+  # block), so the builder must hold exactly what it held. The registry must
+  # hold exactly what it held too, in both directions: nothing on the failure
+  # path touches it, so no tag may have left; and the push waits for
+  # validation (publishImages), so the failed generation's tag must never have
+  # arrived. Before that ordering, the tag was pushed inside the build loop and
+  # this step had to delete it by hand.
   btags_after=$(persist_local_tags)
   [[ "$btags_after" == "$btags_before" ]] ||
-    fail "the builder's tags for $CH_PERSISTENT changed over a rebuild that failed validation ('$(tr '\n' ' ' <<<"$btags_before")' -> '$(tr '\n' ' ' <<<"$btags_after")'): a failed generation no row retains must be untagged again (cmgr/docker.go:838-853)"
+    fail "the builder's tags for $CH_PERSISTENT changed over a rebuild that failed validation ('$(tr '\n' ' ' <<<"$btags_before")' -> '$(tr '\n' ' ' <<<"$btags_after")'): a failed generation no row retains must be untagged again (executeBuild's failure block, cmgr/docker.go)"
   rtags_after=$(registry_tags "$CH_PERSISTENT")
   while read -r tg; do
     [[ -n "$tg" ]] || continue
     grep -qxF -- "$tg" <<<"$rtags_after" ||
       fail "tag $E2E_REGISTRY/$CH_PERSISTENT:$tg left the registry over a rebuild that failed validation: the failure path untags locally, never remotely, and that tag is still a generation cork serves"
   done <<<"$rtags_before"
-  leaked=()
   while read -r tg; do
     [[ -n "$tg" ]] || continue
-    if ! grep -qxF -- "$tg" <<<"$rtags_before"; then leaked+=("$tg"); fi
+    if ! grep -qxF -- "$tg" <<<"$rtags_before"; then
+      # Removed before failing: the teardown only looks for named tags, so a
+      # leak left here would outlive this run and skew the next one's counts.
+      registry_status "/v2/$CH_PERSISTENT/manifests/$tg" -X DELETE >/dev/null || true
+      fail "tag $E2E_REGISTRY/$CH_PERSISTENT:$tg appeared in the registry over a rebuild that failed validation: the push must wait for the build to validate (publishImages, cmgr/docker.go), or every failed generation leaves a tag in zot that no row names"
+    fi
   done <<<"$rtags_after"
-  for tg in ${leaked[@]+"${leaked[@]}"}; do
-    code=$(registry_status "/v2/$CH_PERSISTENT/manifests/$tg" -X DELETE)
-    case "$code" in
-      202|404) note "removed $E2E_REGISTRY/$CH_PERSISTENT:$tg, the failed generation's tag: it was pushed before the build was validated (cmgr/docker.go:692) and no failure path untags it remotely" ;;
-      *) fail "could not remove the failed generation's tag $E2E_REGISTRY/$CH_PERSISTENT:$tg from the registry: HTTP $code" ;;
-    esac
-  done
+
+  # What a later update would make of this, before the source is restored. On
+  # disk and in the challenge row the persistent challenge is at the failed
+  # generation (updateChallenges commits the metadata before it builds), and
+  # its build still serves generation 2. Compared by checksums alone that is
+  # "unmodified", and the failed rebuild would be invisible to every update
+  # after this one; the source generation recorded on the build
+  # (builds.sourcechecksum) is what keeps it reported, as Stale, until a
+  # rebuild succeeds. Nothing else may be affected: the on-demand challenge is
+  # current, and nothing changed on disk since the failing update, so no
+  # challenge is Updated.
+  out=$(cmgrd-cli update --dry-run 2>&1) ||
+    fail "cmgrd-cli update --dry-run failed after the failed rebuild: $out"
+  sed 's/^/       /' <<<"$out"
+  # Only the indented ids under the Stale heading, not the heading that ends
+  # the range.
+  stale_section=$(sed -n '/^Stale:/,/^[A-Z]/{/^  /p}' <<<"$out")
+  grep -q "^  $CH_PERSISTENT\$" <<<"$stale_section" ||
+    fail "the dry run after the failed rebuild does not list $CH_PERSISTENT under Stale: build $PERSIST_BUILD serves generation 2 while the challenge row is at the failed generation, and an update that cannot see that leaves the challenge stale for good (DetectChanges, cmgr/api.go)"
+  if grep -q "^  $CH_ONDEMAND\$" <<<"$stale_section"; then
+    fail "the dry run lists $CH_ONDEMAND as Stale although every build of it is at the current generation"
+  fi
+  if grep -q "^Updated:" <<<"$out"; then
+    fail "the dry run after the failed rebuild reports a challenge as Updated although nothing changed on disk since the failing update: $(sed -n '/^Updated:/,/^[A-Z]/p' <<<"$out" | tr '\n' ' ')"
+  fi
 
   # The persistent source back exactly as this step found it, and the on-demand
   # source not touched at all -- this step never edits it, and the assertion
   # above is what says so. The generation is read from PERSIST_GEN rather than
   # named: which one the earlier steps left behind depends on the mode.
   #
-  # cork's challenge row still holds this generation's source checksum
-  # (updateChallenges commits the metadata before it builds), so an update
-  # inserted after this point rebuilds the persistent challenge and restarts its
+  # cork's challenge row still holds this generation's source checksum, so an
+  # update inserted after this point sees the source as changed and rebuilds
+  # the persistent challenge (Updated outranks Stale) and restarts its
   # instance. The base-pins step below is the one that does, deliberately: it
   # absorbs this restore alongside its own edit, which is why its update reports
   # two challenges rebuilt and why it does not assert that only one was.
   set_generation "$persist_gen_before" persistent
   rm -rf "$ART_TMP"
-  ok "the rebuild was refused for publishing an unreferenced artifact; the build row kept its checksum, flag and has_artifacts; cork went on serving the generation-2 archive byte for byte; instance $PERSIST_INST kept serving at $ppub:$pport; the builder is back to the tags it held and the failed generation's registry tag is gone"
+  ok "the rebuild was refused for publishing an unreferenced artifact; the build row kept its checksum, flag and has_artifacts; cork went on serving the generation-2 archive byte for byte; instance $PERSIST_INST kept serving at $ppub:$pport; a dry run named $CH_PERSISTENT Stale; the builder is back to the tags it held and the registry holds exactly the tags it held"
 else
   deselect "a failed rebuild keeps serving the previous archive"
 fi
@@ -4852,7 +4874,7 @@ if (( FULL )); then
     # (cmgr/docker.go:1319-1325), only log what it returns, so an unreachable
     # registry may cost the operator a tag and nothing else: not the destroy,
     # not the local untag, and not the operator's time waiting out
-    # registryDeleteTimeout.
+    # registryRequestTimeout.
     FLAGONLY_SEED=55 # outside schema.yaml's seeds, as in the step above
     stale=$(manual_builds "$CH_FLAGONLY" "$FLAGONLY_SEED") ||
       fail "could not read the build list (cmgrd-cli system-dump) to look for a leftover probe build"
@@ -4893,7 +4915,7 @@ if (( FULL )); then
     zot=$(compose_container zot)
     [[ -n "$zot" ]] || fail "compose container for the registry (service zot) not found"
     # Stopped, not paused. A paused registry accepts the delete's connection
-    # and answers nothing, so the call burns the whole 30s registryDeleteTimeout
+    # and answers nothing, so the call burns the whole 30s registryRequestTimeout
     # (cmgr/registry.go:15) and this step would be timing that constant instead
     # of the contract; a stopped container takes its $E2E_REGISTRY alias with
     # it, so cork's delete fails on the name at once. That the operation
@@ -4913,11 +4935,11 @@ if (( FULL )); then
       fail "destroying build $fo_build with the registry down answered HTTP $code: the registry untag is best effort by contract (cmgr/registry.go:57-70) and must never fail the operation around it"
     PROBE_BUILD="" # cork no longer has the row; only the leaked tag is left
     # 20s rather than the ~10 the contract would allow: what must be caught is
-    # the 30s registryDeleteTimeout being waited out (or retried into a hang),
+    # the 30s registryRequestTimeout being waited out (or retried into a hang),
     # and a name lookup that has to be refused by an upstream resolver can
     # cost seconds of its own on a box with no working DNS.
     (( took < 20 )) ||
-      fail "the destroy took ${took}s with the registry down: a registry call that cannot even connect must not be waited out (registryDeleteTimeout is 30s) or retried"
+      fail "the destroy took ${took}s with the registry down: a registry call that cannot even connect must not be waited out (registryRequestTimeout is 30s) or retried"
     [[ "$(api_status GET "/builds/$fo_build")" == 404 ]] ||
       fail "build $fo_build is still known to cmgrd after a 204 destroy"
     if has_line "$E2E_REGISTRY/$CH_FLAGONLY:$fo_tag" builder_tags; then
@@ -5042,7 +5064,7 @@ if (( FULL )); then
 
   # The private stage is built like the others -- buildImages appends an Image
   # for every host (cmgr/docker.go:697) -- but it is local to the builder
-  # daemon: the push skips it (cmgr/docker.go:692) and so does the launch
+  # daemon: the push skips it (publishImages, cmgr/docker.go) and so does the launch
   # (cmgr/api.go:353). So all three stages are in the build...
   hosts=$(jq -r '[.images[].host] | sort | join(" ")' <<<"$MULTI_META")
   for host in "$MULTI_FRONT" "$MULTI_BACK" "$MULTI_PRIVATE"; do

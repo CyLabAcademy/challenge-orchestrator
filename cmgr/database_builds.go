@@ -40,9 +40,12 @@ func (m *Manager) openBuild(build *BuildMetadata) error {
 	// the challenge's source checksum is unavailable the row keeps its incoming
 	// value (finalizeBuild still stamps the real one on success).
 	if build.Checksum == 0 {
-		var srcChecksum uint32
-		if err := m.db.Get(&srcChecksum, "SELECT sourcechecksum FROM challenges WHERE id = ?;", build.Challenge); err == nil {
-			build.Checksum = contentChecksum(srcChecksum, build.Format, m.basePinsChecksum())
+		var challenge struct {
+			SourceChecksum uint32 `db:"sourcechecksum"`
+			ChallengeType  string `db:"challengetype"`
+		}
+		if err := m.db.Get(&challenge, "SELECT sourcechecksum, challengetype FROM challenges WHERE id = ?;", build.Challenge); err == nil {
+			build.Checksum = m.buildContentChecksum(challenge.SourceChecksum, build.Format, challenge.ChallengeType)
 		}
 	}
 
@@ -55,17 +58,24 @@ func (m *Manager) openBuild(build *BuildMetadata) error {
 	}
 
 	m.log.debug("Running select...")
-	rows, err := m.db.NamedQuery("SELECT id, flag, hasartifacts, lastsolved, checksum, prevchecksum FROM builds WHERE schema=:schema AND format=:format AND challenge=:challenge AND seed=:seed;", build)
+	rows, err := m.db.NamedQuery("SELECT id, flag, hasartifacts, lastsolved, checksum, prevchecksum, sourcechecksum FROM builds WHERE schema=:schema AND format=:format AND challenge=:challenge AND seed=:seed;", build)
 	if err != nil {
 		m.log.errorf("failed to find build: %s", err)
-	} else if !rows.Next() {
-		m.log.error("found no rows when exactly one expected")
-	}
-	err = rows.Scan(&build.Id, &build.Flag, &build.HasArtifacts, &build.LastSolved, &build.Checksum, &build.PrevChecksum)
-	if err != nil {
-		m.log.errorf("failed to read build ID: %s", err)
+		return err
 	}
 	defer rows.Close()
+	if !rows.Next() {
+		err = fmt.Errorf("found no rows when exactly one expected for build of %s", build.Challenge)
+		m.log.error(err)
+		return err
+	}
+	// Returned rather than logged: a caller left with build.Id == 0 would go
+	// on to build and finalize against a row that does not exist.
+	err = rows.Scan(&build.Id, &build.Flag, &build.HasArtifacts, &build.LastSolved, &build.Checksum, &build.PrevChecksum, &build.SourceChecksum)
+	if err != nil {
+		m.log.errorf("failed to read build ID: %s", err)
+		return err
+	}
 	if rows.Next() {
 		m.log.error("found more rows than expected")
 	}
@@ -81,6 +91,7 @@ const finalizeBuildQuery string = `
 		hasartifacts = :hasartifacts,
 		checksum = :checksum,
 		prevchecksum = :prevchecksum,
+		sourcechecksum = :sourcechecksum,
 		lastsolved = 0
 	WHERE id = :id;`
 
@@ -343,4 +354,54 @@ func (m *Manager) queryForSchemas() ([]string, error) {
 	schemas := []string{}
 	err := m.db.Select(&schemas, "SELECT DISTINCT schema FROM builds;")
 	return schemas, err
+}
+
+// staleBuildIds lists the builds of a challenge produced from a source
+// generation other than the one the challenge row records: their last rebuild
+// failed after updateChallenges had committed the new metadata, so they still
+// serve an earlier generation. Unbuilt rows (no flag, no generation) are not
+// stale — they have nothing to serve and are built by their schema's converge.
+func (m *Manager) staleBuildIds(cMeta *ChallengeMetadata) ([]BuildId, error) {
+	ids := []BuildId{}
+	err := m.db.Select(&ids,
+		"SELECT id FROM builds WHERE challenge=? AND flag != '' AND sourcechecksum != ? ORDER BY id;",
+		cMeta.Id, cMeta.SourceChecksum)
+	if err != nil {
+		m.log.errorf("failed to look up stale builds of %s: %s", cMeta.Id, err)
+		return nil, err
+	}
+	return ids, nil
+}
+
+// allBuildIds lists every build of a challenge: the rebuild selector for a
+// source change, where every image is out of date.
+func (m *Manager) allBuildIds(cMeta *ChallengeMetadata) ([]BuildId, error) {
+	ids := []BuildId{}
+	err := m.db.Select(&ids, "SELECT id FROM builds WHERE challenge=? ORDER BY id;", cMeta.Id)
+	if err != nil {
+		m.log.errorf("failed to look up the builds of %s: %s", cMeta.Id, err)
+		return nil, err
+	}
+	return ids, nil
+}
+
+// staleChallengeSet names every challenge with a build staleBuildIds would
+// list against the challenge's recorded source generation, in one query:
+// DetectChanges consults it for every challenge whose source is unchanged --
+// where the tree's generation is the recorded one, so the two predicates
+// agree -- on every update, dry run and schema converge.
+func (m *Manager) staleChallengeSet() (map[ChallengeId]bool, error) {
+	ids := []ChallengeId{}
+	err := m.db.Select(&ids, `SELECT DISTINCT b.challenge FROM builds AS b
+		JOIN challenges AS c ON c.id = b.challenge
+		WHERE b.flag != '' AND b.sourcechecksum != c.sourcechecksum;`)
+	if err != nil {
+		m.log.errorf("failed to look up challenges with stale builds: %s", err)
+		return nil, err
+	}
+	stale := make(map[ChallengeId]bool, len(ids))
+	for _, id := range ids {
+		stale[id] = true
+	}
+	return stale, nil
 }

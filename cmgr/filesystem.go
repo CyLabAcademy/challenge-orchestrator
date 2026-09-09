@@ -125,6 +125,12 @@ func (m *Manager) findChallenges(challengeMap *map[ChallengeId]*ChallengeMetadat
 			return nil
 		}
 		metadata.SourceChecksum = h.Sum32()
+		// 0 is reserved: on a build row it means "not built yet"
+		// (BuildMetadata.SourceChecksum), so a tree whose CRC happens to be
+		// 0 takes 1 instead, as contentChecksum does for its own sentinel.
+		if metadata.SourceChecksum == 0 {
+			metadata.SourceChecksum = 1
+		}
 
 		metadata.Path = path
 		m.log.infof("found challenge %s", metadata.Id)

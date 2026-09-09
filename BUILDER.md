@@ -25,8 +25,36 @@ Three things then sit on top:
 |---|---|---|
 | Base image pinning | rewrites `FROM name:tag` to `FROM name@sha256:…` **in the build context tar**, never on disk | `cmgr/basepins.go` |
 | Pin fingerprint | the pin map's checksum is folded into a build's content identity | `contentChecksum`, `cmgr/docker.go` |
+| Type template | the built-in Dockerfile of a `flag-only`, `remote-make` or `static-make` challenge is folded into the identity too, so a cork release that changes one changes the identity of future builds (never a rebuild by itself; custom challenges carry their Dockerfile in their source) | `templateChecksum`, `cmgr/docker.go` |
 | Inline cache | pushed images carry BuildKit cache metadata; a rebuild imports from the generation it displaces | `executeBuild` and `cacheRefsFor`, `cmgr/docker.go` |
 | Purge after push | the builder's local copy of a build's images is dropped once they are in the registry | `cmgr/purge.go` |
+| Write-once publish | a build is pushed only once it has validated, and a tag already in the registry is never pushed over | `publishImages` and `registryTagExists`, `cmgr/docker.go`, `cmgr/registry.go` |
+
+The publish order is registry, then artifact archive, then build row: each
+store is written only once the one before it holds the generation, so nothing
+ever names a generation the workers cannot pull; a build that fails
+validation leaves no tag behind, and one that fails after pushing takes the
+tags it pushed back out. A tag names its content, so one that is already
+there is left alone rather than overwritten — and adopted: every image is
+resolved against the registry before anything is built, an identity the
+registry already serves is not built here at all (the one the build extracts
+from is pulled), and the row (flag, lookups, artifacts) is derived from the
+registry's image, so what the row says and what the workers run cannot be two
+different images of one identity. The one residual is a challenge with a
+`builder` stage: that stage is never in the registry, so its extraction is
+always from a fresh local build while the challenge image is the registry's.
+
+The existence check goes through the local daemon (the same certs.d material
+and credentials it pushes and pulls with), so a registry dockerd can push to
+is one cork can ask; a registry that cannot be asked fails the build rather
+than pushing on a guess. Only tag deletes need cmgrd's own client
+certificate, as before.
+
+The repair for a tag that is wrong (a build input the checksum does not
+cover) is to remove it and build again — and "again" needs a trigger, since
+the identity is unchanged and nothing is stale: `--prune-old` on the next
+rebuild of the challenge, or `remove-schema` and `add-schema`, whose fresh
+rows build and push what the registry then lacks.
 
 ## Why pinning exists
 
@@ -125,8 +153,15 @@ challenge still costs a tag resolution on every build of it. Pin all of them.
 **Do**
 
 - Run `pin-refresh` immediately before a batch update, not after.
+- **Re-run `update` after one that failed.** A build whose rebuild failed keeps
+  serving the generation it had, while the challenge row already carries the
+  new source; each build records the source generation it was produced from
+  (`builds.sourcechecksum`), so the difference is reported as `Stale` by every
+  `update` and `update --dry-run` until a rebuild succeeds, and `update`
+  rebuilds exactly those builds. Nothing has to be edited to make it happen.
 - **Put the whole challenge fleet into maintenance for the rebuild.** cork
-  serializes updates against each other, but nothing stops the platform from
+  serializes updates and schema operations against each other (one at a time,
+  the rest wait), but nothing stops the platform from
   requesting launches of a build while that build is being replaced — and a
   launch in flight can collide with the update's own teardown of the instances
   it is displacing (`removal of container ... is already in progress`), which
@@ -252,8 +287,9 @@ number in this document currently rests on.
 ## Limitations
 
 1. **No fleet-wide rebuild.** `update` rebuilds only what the challenge
-   directory says changed. There is no force-rebuild-everything path, so a base
-   bump propagates challenge by challenge as each one is next touched.
+   directory says changed, plus whatever an earlier rebuild failed to replace
+   (see Do). There is no force-rebuild-everything path, so a base bump
+   propagates challenge by challenge as each one is next touched.
 2. **The fingerprint is coarse.** The whole pin map is hashed, so moving any one
    base changes the content identity of every build, not just the ones on that
    base. Per-challenge precision was deferred. It costs nothing while nothing

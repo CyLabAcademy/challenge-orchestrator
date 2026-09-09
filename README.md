@@ -138,7 +138,8 @@ server; nothing touches the database, docker, or the registry directly.
 Deployment:
   update [--dry-run] [--verbose] [--prune-old] [<dir>]
       re-scan the challenge directory on the server (rebuilding changed
-      challenges) and print the resulting changes; <dir> must be inside the
+      challenges, and any build a failed rebuild left at an earlier
+      generation) and print the resulting changes; <dir> must be inside the
       server's CMGR_DIR and defaults to all of it; --prune-old additionally
       removes the image generation each rebuild displaces from rollback
       retention, on the build daemon and in the registry
@@ -437,8 +438,8 @@ automatically as before, pulling the new image before the old containers go
 (under a five-minute ceiling, or `CMGR_WORKER_PULL_TIMEOUT` when that is
 longer);
 one that cannot be restarted (its worker down, the pull or the start failing)
-is removed like any stop on a down worker, and the next `update-schema`
-relaunches it.
+is removed like any stop on a down worker, and the same update relaunches it
+through placement once the build's restarts are done.
 
 **Note:** Challenge metadata includes a derived `delivery_type` field
 (`"service"`, `"artifact_only"`, or `"flag_only"`) describing what competitors

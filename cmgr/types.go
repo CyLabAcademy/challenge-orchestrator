@@ -3,6 +3,7 @@ package cmgr
 import (
 	"context"
 	"math/rand"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,8 +55,10 @@ type Manager struct {
 	challengeDockerfiles map[string][]byte
 	rand                 *rand.Rand
 	randMu               sync.Mutex
-	// updateMu serializes rebuilds (UpdateWithOptions): two of them would
-	// tear down and relaunch the same instances against each other.
+	// updateMu serializes rebuilds (UpdateWithOptions) and schema operations
+	// (CreateSchema, UpdateSchema, DeleteSchema) against each other: any two
+	// of them would tear down and relaunch the same instances against each
+	// other. Taken at the API boundary only; internal helpers assume it held.
 	updateMu sync.Mutex
 	// imageMu serializes the "is this content still referenced? if not, untag"
 	// critical sections (executeBuild cleanup, pruneReplacedImages,
@@ -74,14 +77,25 @@ type Manager struct {
 	challengeInterface string
 	challengeRegistry  string
 	authString         string
-	hostOSType         string // docker daemon OSType, cached once at initDocker (immutable for the daemon)
-	portLow            int
-	portHigh           int
-	lastPruneUnix      atomic.Int64 // atomic UnixNano timestamp used as CAS gate for prune interval
-	pruneInterval      time.Duration
-	pruneAge           time.Duration
-	localQueue         *daemonQueue // slots of the local daemon (instances with no worker)
-	policy             managerPolicy
+	// The registry API client (registry.go) for tag deletes, built on first
+	// successful use and shared; and the credentials handed to dockerd for
+	// pushes and pulls, sent along with it. Existence checks go through the
+	// daemon and need neither.
+	registryClient   *http.Client
+	registryClientMu sync.Mutex
+	registryUser     string
+	registryToken    string
+	// templateSums memoizes templateChecksum per challenge type: the embedded
+	// templates never change while the process runs.
+	templateSums  sync.Map
+	hostOSType    string // docker daemon OSType, cached once at initDocker (immutable for the daemon)
+	portLow       int
+	portHigh      int
+	lastPruneUnix atomic.Int64 // atomic UnixNano timestamp used as CAS gate for prune interval
+	pruneInterval time.Duration
+	pruneAge      time.Duration
+	localQueue    *daemonQueue // slots of the local daemon (instances with no worker)
+	policy        managerPolicy
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
 	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run
@@ -218,10 +232,19 @@ func (cm *ChallengeMetadata) NeedsInstance() bool {
 	return cm.DeliveryType == "" || cm.DeliveryType == DeliveryService
 }
 
+// ChallengeUpdates is DetectChanges' verdict on each challenge, one bucket per
+// challenge: Added (on disk, not in the database), Updated (source changed:
+// every build rebuilt), Refreshed (metadata only: re-persisted), Stale
+// (nothing changed on disk, but a build still serves an earlier generation
+// because its last rebuild failed), Unmodified, Removed. Updated outranks
+// Refreshed outranks Stale. Whatever a failed rebuild left behind is rebuilt
+// on the Refreshed and Stale paths alike, so a Stale verdict is only ever
+// given when there is nothing else to report.
 type ChallengeUpdates struct {
 	Added      []*ChallengeMetadata `json:"added"`
 	Refreshed  []*ChallengeMetadata `json:"refreshed"`
 	Updated    []*ChallengeMetadata `json:"updated"`
+	Stale      []*ChallengeMetadata `json:"stale"`
 	Removed    []*ChallengeMetadata `json:"removed"`
 	Unmodified []*ChallengeMetadata `json:"unmodified"`
 	Errors     []error              `json:"errors"`
@@ -247,12 +270,22 @@ type BuildMetadata struct {
 	// `rollback` operation would swap it with Checksum, re-extract /challenge
 	// from that image (see executeBuild's extraction step), and restart
 	// instances. Same-row rollback is format- and seed-stable by construction.
-	PrevChecksum uint32              `json:"prev_checksum,omitempty" db:"prevchecksum"`
-	Images       []Image             `json:"images"`
-	HasArtifacts bool                `json:"has_artifacts"`
-	LastSolved   int64               `json:"last_solved"`
-	Challenge    ChallengeId         `json:"challenge_id"`
-	Instances    []*InstanceMetadata `json:"instances,omitempty"`
+	PrevChecksum uint32 `json:"prev_checksum,omitempty" db:"prevchecksum"`
+	// SourceChecksum is the challenge source generation (ChallengeMetadata.
+	// SourceChecksum) this build's images were produced from; 0 until the
+	// build has been built. A build is current exactly when it equals the
+	// challenge's recorded source checksum, so a rebuild that failed — the
+	// challenge row already carries the new generation, the build still
+	// serves the old one — is visible as the difference rather than lost.
+	// It is deliberately the source generation and not Checksum: base-image
+	// pins are folded into Checksum and a pin refresh must not make every
+	// build look stale.
+	SourceChecksum uint32              `json:"source_checksum,omitempty" db:"sourcechecksum"`
+	Images         []Image             `json:"images"`
+	HasArtifacts   bool                `json:"has_artifacts"`
+	LastSolved     int64               `json:"last_solved"`
+	Challenge      ChallengeId         `json:"challenge_id"`
+	Instances      []*InstanceMetadata `json:"instances,omitempty"`
 
 	Schema        string `json:"schema"`
 	InstanceCount int    `json:"instance_count"`
