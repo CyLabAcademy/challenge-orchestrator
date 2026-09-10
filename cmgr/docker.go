@@ -186,7 +186,7 @@ func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 	// Note: DetectChanges re-parses and re-hashes the challenge directory on
 	// every converge, even when all builds are already complete (below). That
 	// cost is inherent to detecting drift here; it is paid per challenge on each
-	// CreateSchema/UpdateSchema (e.g. cmgrd instance-count resizes). If it
+	// CreateSchema/UpdateSchema (e.g. corkd instance-count resizes). If it
 	// becomes a bottleneck for large schemas, compare only this challenge's
 	// stored SourceChecksum instead of running a full cross-schema DetectChanges.
 	updates := m.DetectChanges(filepath.Dir(cMeta.Path))
@@ -437,7 +437,7 @@ func (m *Manager) migrateBuildChecksums(db *sqlx.DB) error {
 		// once the images provably carry the new tag (or are shown to need no
 		// retag). A docker or registry error skips just this row — it stays
 		// at 0 and is retried on the next start — rather than aborting the
-		// migration: a registry hiccup here must not stop cmgrd from booting.
+		// migration: a registry hiccup here must not stop corkd from booting.
 		if err := m.retagLegacyImages(db, row.Id, row.Challenge, row.Seed, checksum); err != nil {
 			m.log.errorf("could not migrate images for build %d (will retry next start): %s", row.Id, err)
 			continue
@@ -536,7 +536,7 @@ func (m *Manager) retagLegacyImages(db *sqlx.DB, id BuildId, challenge string, s
 
 // instanceImageName returns the docker tag for a build's per-host image. When
 // CORK_REGISTRY is set the name is registry-qualified so that images can be
-// pushed after building and pulled before launching; cmgr and cmgrd must be
+// pushed after building and pulled before launching; cmgr and corkd must be
 // configured with the same registry value for the derived names to agree.
 func (m *Manager) instanceImageName(challenge ChallengeId, bMeta *BuildMetadata, image Image) string {
 	name := fmt.Sprintf("%s:%s", challenge, bMeta.dockerId(image))
@@ -973,7 +973,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		} else if hdr.Name == "challenge/artifacts.tar.gz" {
 			// Stage the new archive beside the final build-ID path and only
 			// promote it after validateBuild passes: a failed rebuild must leave
-			// the previous archive in place, because cmgrd keeps serving it (the
+			// the previous archive in place, because corkd keeps serving it (the
 			// build row is rolled back, not removed) and deleting it would turn
 			// every player download into a 500. The dot-prefixed name can never
 			// collide with a served "<id>.tar.gz" path.
@@ -1147,7 +1147,7 @@ func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
 
 // teardown removes an instance's containers and network from its daemon
 // under a teardown slot (daemonQueue), waiting for one as long as it takes: a
-// stop must go through, and the queue is cmgrd's own. It is refused with
+// stop must go through, and the queue is corkd's own. It is refused with
 // ErrWorkerDown once the instance's worker is down, which the callers treat
 // as the DB-only case.
 //

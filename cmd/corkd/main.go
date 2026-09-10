@@ -29,8 +29,8 @@ func main() {
 	var port int
 	var help bool
 	var version bool
-	flag.IntVar(&port, "port", 4200, "listening port for cmgrd")
-	flag.StringVar(&iface, "address", "", "listening address for cmgrd")
+	flag.IntVar(&port, "port", 4200, "listening port for corkd")
+	flag.StringVar(&iface, "address", "", "listening address for corkd")
 	flag.BoolVar(&help, "help", false, "display usage information")
 	flag.BoolVar(&version, "version", false, "display version information")
 	flag.Parse()
@@ -54,7 +54,7 @@ func main() {
 		log.Fatal("failed to initialize cmgr library")
 	}
 
-	// cmgrd is the sole owner of the database and the docker/registry state:
+	// corkd is the sole owner of the database and the docker/registry state:
 	// every action (deploys, builds, instance lifecycle, worker management)
 	// goes through its HTTP API. New instances are placed on the configured
 	// workers (round robin, skipping overloaded/down ones).
@@ -138,7 +138,7 @@ Relevant environment variables:
       gain past 2 either (it makes each launch faster, not more parallel).
       The range is open for re-measuring, not for tuning. As many teardown
       slots bound the stops in flight on a daemon: a deluge of stops queues
-      in cmgrd instead of inside dockerd, which it used to make slow, then
+      in corkd instead of inside dockerd, which it used to make slow, then
       unresponsive.
 
   CORK_WORKER_POLL_INTERVAL, CORK_WORKER_POLL_TIMEOUT, CORK_WORKER_MAX_MISSES -
@@ -171,14 +171,14 @@ Relevant environment variables:
 
   CORK_BASE_PINS - path to a JSON map of base image reference to digest,
       defaulting to <CORK_DIR>/.base-pins.json; absent or empty disables
-      pinning. When set, cmgrd rewrites a FROM name:tag instruction to the
+      pinning. When set, corkd rewrites a FROM name:tag instruction to the
       equivalent digest reference as it builds each build context, so the
       builder never re-resolves a mutable tag against the registry and a base
       only moves when the pins are refreshed (POST /pins). Challenge
       Dockerfiles are never modified on disk.
 
 HTTP API:
-  cmgrd owns all state; every action goes through its API (the cmgrd-cli
+  corkd owns all state; every action goes through its API (the cork
   binary is a thin wrapper around it). In addition to the challenge, build,
   instance, worker, and schema endpoints, POST /update re-scans the
   challenge directory (body: {"path": "<dir>", "dry_run": false,
@@ -190,8 +190,8 @@ HTTP API:
 
 Workers:
   When docker workers are configured (GET/POST/PATCH/DELETE on /workers or
-  cmgrd-cli worker-*), new instances are placed on them round robin,
-  skipping overloaded and down workers; with none configured, cmgrd behaves
+  cork worker-*), new instances are placed on them round robin,
+  skipping overloaded and down workers; with none configured, corkd behaves
   as a single-host daemon using DOCKER_HOST. Worker connections use the TLS
   material from DOCKER_CERT_PATH with the server name pinned to
   'academy-docker-worker' (the shared worker certificate), dockerd on port
@@ -200,7 +200,7 @@ Workers:
   A worker goes down (sticky) after CORK_WORKER_MAX_MISSES failed telemetry
   polls (30s of silence by default), a single hung/refused docker control
   call, or a PATCH of {"health": "down"}. Recovery is the operator's call:
-  re-add it (POST /workers or cmgrd-cli worker-add) once the box is rebooted
+  re-add it (POST /workers or cork worker-add) once the box is rebooted
   or repaired, and its instances come back with it (their containers restart
   on their own); or, when the box is terminated and recreated, DELETE it from
   /workers, which purges the worker and all of its instance records, and add
@@ -219,7 +219,7 @@ Workers:
   is retried for the same span and the worker then takes placements anyway,
   with an error naming it in the log. What is left holds its host ports, so a
   launch there may fail on a bind and be retried elsewhere until the next
-  worker-add or cmgrd start reconciles the box again, or docker-reaper
+  worker-add or corkd start reconciles the box again, or docker-reaper
   removes the containers. The alternative, holding a whole box out of the
   fleet over one container its daemon will not remove, costs more.
 
@@ -231,7 +231,7 @@ Workers:
   hangs mid-way clears the
   records once the worker is marked down and returns success. Stops wait
   for a teardown slot on their worker as long as it takes, since a stop must
-  go through, so a deluge of them queues in cmgrd, bounded, rather than
+  go through, so a deluge of them queues in corkd, bounded, rather than
   inside dockerd.
 
   The restart of a persistent instance during an update is exempt, since
@@ -245,7 +245,7 @@ Workers:
   schema converge (add-schema, update-schema) launches persistent instances
   under the same limits.
 
-  Workers have two addresses: the private IP cmgrd dials, and an optional
+  Workers have two addresses: the private IP corkd dials, and an optional
   player-facing public address ("public" in the POST /workers body).
   Instance metadata reports the public one as "worker_public" (falling back
   to the private IP when unset).

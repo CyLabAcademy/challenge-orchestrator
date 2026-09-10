@@ -322,7 +322,7 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string, l
 		Containers: []string{},
 	}
 
-	// Placement (cmgrd only): pick a worker before the instance row is
+	// Placement (corkd only): pick a worker before the instance row is
 	// created so the worker is recorded with it. With no workers configured
 	// selectWorker returns "" and the instance runs on the local daemon.
 	if m.placementEnabled {
@@ -879,11 +879,11 @@ func (m *Manager) Prune() error {
 	// Their workers are read first, because deleting the rows is what makes
 	// their leftovers findable. A launch killed mid-flight leaves containers
 	// running (RestartPolicy "always"), and reconcileWorker spares them for
-	// exactly as long as a row still names them: the pass at cmgrd start
+	// exactly as long as a row still names them: the pass at corkd start
 	// walks straight past them. Once these rows are gone they are orphans,
 	// which is the state that pass exists to clear — so run it again, for
 	// just those workers, rather than leaving them to hold their published
-	// ports until the next worker-add or cmgrd start.
+	// ports until the next worker-add or corkd start.
 	var gcWorkers []string
 	gcWorkerQuery := `SELECT DISTINCT worker FROM instances WHERE is_finalized = 0 AND created_at < datetime('now', '-5 minutes') AND worker != '';`
 	if err := m.db.Select(&gcWorkers, gcWorkerQuery); err != nil {

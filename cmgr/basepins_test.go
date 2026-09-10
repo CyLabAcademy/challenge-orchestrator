@@ -452,7 +452,7 @@ func TestWriteBasePinsReplacesAndRoundTrips(t *testing.T) {
 	}
 
 	// The pin file is committed to the challenge repository and read by
-	// whatever user cmgrd runs as. os.CreateTemp makes its file 0600, so the
+	// whatever user corkd runs as. os.CreateTemp makes its file 0600, so the
 	// explicit Chmod is load-bearing -- without it the rename installs a pin
 	// file no one else can read, which the previous plain-WriteFile
 	// implementation never did.

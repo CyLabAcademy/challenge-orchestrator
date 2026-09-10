@@ -11,7 +11,7 @@ import (
 // the current pins and how many challenge Dockerfiles use each. POST
 // re-resolves every base reference the challenge directory names to the digest
 // the registry serves right now and persists the result; that is the only
-// moment cmgrd consults a mutable tag, since builds use the digests.
+// moment corkd consults a mutable tag, since builds use the digests.
 //
 // A refresh rebuilds nothing, and no later update rebuilds a challenge on its
 // account either: change detection reads the challenge directory only. A

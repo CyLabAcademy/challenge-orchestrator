@@ -624,7 +624,7 @@ func (m *Manager) RefreshBasePins() ([]BasePin, error) {
 	// call, which bounds a single lookup but says nothing about the refresh:
 	// against a registry that accepts connections and then stalls, N bases
 	// serialize into N * controlTimeout inside a single POST /pins, and
-	// neither cmgrd's server nor cmgrd-cli sets a timeout of its own to cut it
+	// neither corkd's server nor cork sets a timeout of its own to cut it
 	// short. Exhausting the budget is not a failure of the pins already
 	// resolved -- they are written, and the refs left over keep what they had.
 	budget := m.basePinsRefreshBudget(len(used))

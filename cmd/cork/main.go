@@ -112,7 +112,7 @@ func printUsage() {
 	fmt.Printf(`
 Usage: %s [--server <url>] <command> [<args>]
 
-A thin HTTP client for cmgrd: every command is an API call against the
+A thin HTTP client for corkd: every command is an API call against the
 server; nothing touches the database, docker, or the registry directly.
 
 Deployment:
@@ -151,7 +151,7 @@ Workers:
       repaired (its instances come back with it: their containers restart on
       their own); the optional public address is what players are given for
       its instances; containers and networks cmgr created on it for instances
-      it no longer records are removed first (as for every worker at cmgrd
+      it no longer records are removed first (as for every worker at corkd
       start). A daemon that stays unreachable while that runs is marked down
       and takes nothing until another worker-add; one that answers but leaves
       the cleanup unfinished takes placements anyway, with an error in the

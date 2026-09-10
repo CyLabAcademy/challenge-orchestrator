@@ -939,7 +939,7 @@ func (m *Manager) rebuildBuilds(metadata *ChallengeMetadata, buildIds []BuildId,
 			// running: the row is there, its containers are not yet.
 			// Stopping it would delete the row under that launch —
 			// ON DELETE CASCADE takes its container rows with it — so
-			// the launch would fail on a foreign key, which cmgrd
+			// the launch would fail on a foreign key, which corkd
 			// reports as a plain 500 rather than the 503 the platform
 			// retries. Leave it alone; it finishes on the generation
 			// it read (see Start).

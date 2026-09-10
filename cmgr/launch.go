@@ -24,7 +24,7 @@ import (
 //     worker; that is why CORK_CONCURRENT_LAUNCHES measured out at 2 on
 //     iptables and shows no gain past 2 on nftables either (nftables makes
 //     each launch faster, not more parallel). A slot that covers the network
-//     stage keeps the daemon's queue in cmgrd, where it is bounded, instead
+//     stage keeps the daemon's queue in corkd, where it is bounded, instead
 //     of inside dockerd, where a deep queue looks like a hung call.
 //
 // Waiting for a slot is bounded for a request-driven launch and refused
@@ -37,7 +37,7 @@ import (
 
 var (
 	// ErrWorkerBusy: no slot on the instance's daemon within the wait.
-	// Retryable (cmgrd answers 503 with Retry-After).
+	// Retryable (corkd answers 503 with Retry-After).
 	ErrWorkerBusy = errors.New("worker is busy")
 	// ErrWorkerDown: the instance's worker went down between placement and
 	// the launch stage. Retryable: placement now skips it.
@@ -153,7 +153,7 @@ func (m *Manager) ensureImages(cli *client.Client, build *BuildMetadata, instanc
 }
 
 // imagePresent reports whether the daemon already holds the tag, in which
-// case the pull is skipped: tags are content-addressed and cmgrd is their
+// case the pull is skipped: tags are content-addressed and corkd is their
 // sole writer, so a present tag names the right content. The inspect runs
 // under the control timeout, and anything but a clean "not found" is a
 // failure: a hung or unreachable daemon is reported like any other control

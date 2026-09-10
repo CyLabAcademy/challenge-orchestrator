@@ -132,7 +132,7 @@ func (m *Manager) purgeBuiltImages(bMeta *BuildMetadata) {
 	}
 
 	// At INFO, because the alternative is a builder that fills up silently.
-	// cmgrd runs at INFO, so the per-image lines above are invisible there;
+	// corkd runs at INFO, so the per-image lines above are invisible there;
 	// without this the operator sees only the startup line promising that
 	// purging happens. Conflicts are the case that actually bites: with
 	// instances placed on the builder's own daemon every image with a live

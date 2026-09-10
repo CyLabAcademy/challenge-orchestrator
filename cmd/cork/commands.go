@@ -13,7 +13,7 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-// Local mirrors of the cmgrd API types (the CLI deliberately does not import
+// Local mirrors of the corkd API types (the CLI deliberately does not import
 // the cmgr library — it talks JSON only).
 
 type Schema struct {

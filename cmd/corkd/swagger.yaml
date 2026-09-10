@@ -2,7 +2,7 @@ swagger: "2.0"
 info:
   description: "This is a minimal REST API for `cmgr` that allows front-ends for a CTF to remotely manage challenges and their templating for events.  It is not intended to replace `cmgr` entirely as it does not currently expose the challenge update process."
   version: "0.2.0"
-  title: "cmgrd"
+  title: "corkd"
   contact:
     email: "code@acictf.com"
   license:

@@ -65,7 +65,7 @@ type Manager struct {
 	// critical sections (executeBuild cleanup, pruneReplacedImages,
 	// destroyImages) so a concurrent remover cannot delete a tag between
 	// another's reference check and its ImageRemove. Content-addressed tags are
-	// shared across build rows, so these checks race under cmgrd's concurrent
+	// shared across build rows, so these checks race under corkd's concurrent
 	// request handling.
 	imageMu sync.Mutex
 	// basePins rewrites `FROM name:tag` to a digest as build contexts are
@@ -99,7 +99,7 @@ type Manager struct {
 	policy        managerPolicy
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
-	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run
+	// corkd; the cmgr CLI leaves it false so CLI-started instances always run
 	// on the local daemon.
 	workersMu         sync.RWMutex
 	workers           map[string]*workerConn

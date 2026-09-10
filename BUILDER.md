@@ -1,7 +1,7 @@
 # The builder
 
 Notes for whoever operates or changes cork's image build path. Everything here
-concerns the **orchestrator** host: the one machine that runs `cmgrd`, builds
+concerns the **orchestrator** host: the one machine that runs `corkd`, builds
 images and pushes them to the registry. Workers only pull.
 
 ## What the build path does now
@@ -47,7 +47,7 @@ always from a fresh local build while the challenge image is the registry's.
 The existence check goes through the local daemon (the same certs.d material
 and credentials it pushes and pulls with), so a registry dockerd can push to
 is one cork can ask; a registry that cannot be asked fails the build rather
-than pushing on a guess. Only tag deletes need cmgrd's own client
+than pushing on a guess. Only tag deletes need corkd's own client
 certificate, as before.
 
 The repair for a tag that is wrong (a build input the checksum does not
@@ -81,15 +81,15 @@ That knob is `pin-refresh`.
 ## Moving a base
 
 ```
-cmgrd-cli pin-list        # what is pinned, and how many challenges use each
-cmgrd-cli pin-refresh     # re-resolve every base to what the registry serves now
+cork pin-list        # what is pinned, and how many challenges use each
+cork pin-refresh     # re-resolve every base to what the registry serves now
 ```
 
 `pin-refresh` is the **only** moment cork consults a mutable tag. It reads
 manifests (`DistributionInspect`), it does not pull layers: over the real corpus
 that is 32 lookups in about 47 s and zero bytes of image data. The resolves are
 serial, and the pass has an overall budget derived from
-`CMGR_WORKER_CONTROL_TIMEOUT`, so a registry that accepts connections and then
+`CORK_WORKER_CONTROL_TIMEOUT`, so a registry that accepts connections and then
 stalls cannot hold a `POST /pins` open indefinitely. A reference that fails to
 resolve **keeps the digest it already had** — a refresh never un-pins a base
 because the network hiccuped — and the run reports the failure so it can be
@@ -168,8 +168,8 @@ challenge still costs a tag resolution on every build of it. Pin all of them.
   fails the update. There is no gate for this inside cork; it is the platform's
   to close, by not asking for launches during the pass.
 - **Commit the pin file to the challenge repository**, at the corpus root, and
-  point `CMGR_BASE_PINS` at it. cmgrd's own default is
-  `<CMGR_DIR>/.base-pins.json` — a dotfile, which nobody commits and a
+  point `CORK_BASE_PINS` at it. corkd's own default is
+  `<CORK_DIR>/.base-pins.json` — a dotfile, which nobody commits and a
   `git clean -xdf` erases. A committed `base-pins.json` is versioned with the
   corpus it pins, restored by a fresh clone, and reviewable as a diff: the pin
   bump becomes a commit rather than an untracked file on one machine. It sits
@@ -196,7 +196,7 @@ challenge still costs a tag resolution on every build of it. Pin all of them.
   and built on the new base.
 - Don't rebuild under live traffic. See the maintenance point above; this is the
   one operational hazard in the update path that cork cannot close for you.
-- Don't hand-edit the pin file to anything but a `sha256:` value. `cmgrd`
+- Don't hand-edit the pin file to anything but a `sha256:` value. `corkd`
   refuses to start on a malformed pin file, deliberately: silently falling back
   to mutable tags is the exact failure pinning exists to prevent.
 - Don't delete the pin file expecting a no-op. An empty map fingerprints as `0`,
@@ -248,7 +248,7 @@ accumulation, not an error, and `systemctl restart containerd` clears it.
 
 ## Purging after the push
 
-`CMGR_PURGE_AFTER_PUSH` — on by default in registry mode, off with
+`CORK_PURGE_AFTER_PUSH` — on by default in registry mode, off with
 `false`/`0`/`off`, and refused outright without a registry.
 
 Once a build's images are in the registry, nothing reads the builder's copies.
@@ -299,7 +299,7 @@ number in this document currently rests on.
    without it comes back unpinned, and unpinned is a different fingerprint.
    Committing it to the challenge repository (see Do) is what makes this a
    non-issue; a machine-local file is not.
-4. **Inline cache is registry-only.** Without `CMGR_REGISTRY` there is nowhere
+4. **Inline cache is registry-only.** Without `CORK_REGISTRY` there is nowhere
    to publish cache metadata, and `CacheFrom` entries would be read as registry
    references — a bare `challenge:tag` normalizes to `docker.io/library` and
    would send a Hub lookup per image per build. Both are switched off in that
