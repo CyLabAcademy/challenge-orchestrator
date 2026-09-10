@@ -17,11 +17,11 @@ import (
 	"time"
 )
 
-// fakeRegistry is an mTLS server standing in for zot: a private CA, a
+// startFakeRegistry is an mTLS server standing in for zot: a private CA, a
 // server certificate for 127.0.0.1, and a client certificate laid out under
-// a certs.d-shaped directory the registry client loads. It returns the
-// Manager pointed at it and the requests the handler saw.
-func fakeRegistry(t *testing.T, handler http.HandlerFunc) (*Manager, *[]*http.Request) {
+// a certs.d-shaped directory the registry client loads. It returns the host
+// to name as the registry and the requests the handler saw.
+func startFakeRegistry(t *testing.T, handler http.HandlerFunc) (string, *[]*http.Request) {
 	t.Helper()
 	newKey := func() *ecdsa.PrivateKey {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -86,9 +86,15 @@ func fakeRegistry(t *testing.T, handler http.HandlerFunc) (*Manager, *[]*http.Re
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
-	host := strings.TrimPrefix(srv.URL, "https://")
-	m := &Manager{log: newLogger(DISABLED), ctx: context.Background(), challengeRegistry: host}
-	return m, seen
+	return strings.TrimPrefix(srv.URL, "https://"), seen
+}
+
+// fakeRegistry is startFakeRegistry with a Manager pointed at it: enough for
+// the registry client on its own.
+func fakeRegistry(t *testing.T, handler http.HandlerFunc) (*Manager, *[]*http.Request) {
+	t.Helper()
+	host, seen := startFakeRegistry(t, handler)
+	return &Manager{log: newLogger(DISABLED), ctx: context.Background(), challengeRegistry: host}, seen
 }
 
 // registryTagPresent asks the registry over the daemon's own mTLS client:
