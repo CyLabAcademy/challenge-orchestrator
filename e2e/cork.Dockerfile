@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# cork (cmgrd + cmgrd-cli) built from this checkout, for the e2e compose
-# stack. Build context is the repository root:
+# cork (cmgrd, cmgrd-cli and cork-build) built from this checkout, for the
+# e2e compose stack. Build context is the repository root:
 #   docker build -f e2e/cork.Dockerfile .
 FROM golang:1.26-alpine AS build
 # CGO for go-sqlite3, as in the release workflow (there against glibc).
@@ -22,7 +22,7 @@ FROM alpine:3.22
 # and sqlite the database-busy step (it holds SQLite's write lock from outside
 # cmgrd). Neither is used by cmgrd itself.
 RUN apk add --no-cache ca-certificates bash curl jq netcat-openbsd openssl sqlite
-COPY --from=build /out/cmgrd /out/cmgrd-cli /usr/local/bin/
+COPY --from=build /out/cmgrd /out/cmgrd-cli /out/cork-build /usr/local/bin/
 COPY e2e/cork-entrypoint.sh /usr/local/bin/cork-entrypoint.sh
 EXPOSE 4200
 ENTRYPOINT ["/usr/local/bin/cork-entrypoint.sh"]
