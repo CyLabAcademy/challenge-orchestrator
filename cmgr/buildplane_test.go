@@ -373,7 +373,9 @@ func testChallenge(id string, sourceChecksum uint32) *ChallengeMetadata {
 
 // A schema converge on an external build plane neither scans a tree nor
 // builds: a build that has been handed over passes, one that has not is
-// named, refused, and its row dropped like a failed build's.
+// named and refused, its row left as it was. The refusal an operator sees
+// is requireHandedOver's, before the converge writes anything; this is
+// the net under it.
 func TestGenerateBuildsExternalRequiresIngestedBuilds(t *testing.T) {
 	m := setupExternalTestManager(t)
 	challenge := testChallenge("test/external-converge", 0)
@@ -404,8 +406,8 @@ func TestGenerateBuildsExternalRequiresIngestedBuilds(t *testing.T) {
 	if strings.Contains(err.Error(), "seed 1") {
 		t.Errorf("error names the ingested build: %s", err)
 	}
-	if _, err := m.lookupBuildMetadata(pending); err == nil {
-		t.Error("the build nobody ingested kept its row")
+	if _, err := m.lookupBuildMetadata(pending); err != nil {
+		t.Errorf("the refusal touched the row of the build nobody handed over: %s", err)
 	}
 	if _, err := m.lookupBuildMetadata(ingested); err != nil {
 		t.Errorf("the ingested build lost its row: %s", err)

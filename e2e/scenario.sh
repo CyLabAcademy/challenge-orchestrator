@@ -941,6 +941,16 @@ if (( FULL )); then
     grep -q "build plane is external" "$fresh/refused.body" ||
       fail "$method $path answered 409 without saying why: $(cat "$fresh/refused.body")"
   done
+  # A schema converge is refused the same way: on an empty catalogue every
+  # challenge the schema names is one nobody has handed over, and the
+  # refusal says which. That it comes before anything is locked or released
+  # is the unit tests' to show; here nothing could be written either way,
+  # with no challenge row for a build to hang off. The CLI carries no
+  # timeout of its own, hence the ceiling.
+  out=$(timeout 30 cmgrd-cli --server "$EXT_SERVER" add-schema "$E2E_SCHEMA" 2>&1) &&
+    fail "add-schema succeeded on an external build plane with nothing handed over: $out"
+  [[ "$out" == *"409"* && "$out" == *"has not been handed over"* ]] ||
+    fail "add-schema on an external build plane with nothing handed over did not answer 409 naming the missing hand-over: $out"
   state=$(curl -sS --max-time 5 "$EXT_SERVER/state") ||
     fail "GET /state failed on the external-build-plane daemon"
   [[ "$state" == "[]" ]] ||
@@ -970,7 +980,7 @@ if (( FULL )); then
     refuses_to_start "on an external build plane with no registry client material (every untag would fail silently)" \
       4295 "$fresh/nocerts.log" "the registry client could not be built"
   rm -rf "$fresh"
-  ok "a cmgrd started on a fresh path created CMGR_ARTIFACT_DIR and its database directory itself and served /version; one pointed at a missing CMGR_DIR exited $rc in ${refuse_took}s and created neither; on an external build plane one came up with that same missing CMGR_DIR ignored, reported build_plane=external and answered 409 to update, dry run, build and pins, and neither one without a registry nor one without registry client material would start"
+  ok "a cmgrd started on a fresh path created CMGR_ARTIFACT_DIR and its database directory itself and served /version; one pointed at a missing CMGR_DIR exited $rc in ${refuse_took}s and created neither; on an external build plane one came up with that same missing CMGR_DIR ignored, reported build_plane=external, answered 409 to update, dry run, build, pins and a schema naming challenges nobody handed over, and neither one without a registry nor one without registry client material would start"
 else
   deselect "fresh-box startup directories"
 fi

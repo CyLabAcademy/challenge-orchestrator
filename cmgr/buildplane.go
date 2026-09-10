@@ -3,7 +3,10 @@ package cmgr
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -73,6 +76,76 @@ func (m *Manager) noteIgnoredSetting(name string) {
 	if _, isSet := os.LookupEnv(name); isSet {
 		m.log.warnf("%s is set but ignored: the build plane is external", name)
 	}
+}
+
+// requireHandedOver is the external build plane's precondition for a
+// schema converge: the challenge row, and a finished build for every
+// (format, seed) the schema names, as a hand-over writes them. An entry
+// that names no seeds wants nothing and is not checked, as a local
+// converge never touches such an entry either. Every challenge that falls
+// short is named, so one refusal lists all of them, and each wraps
+// ErrExternalBuildPlane, which cmgrd answers with 409. Two queries answer
+// for the whole schema, however many builds it names.
+func (m *Manager) requireHandedOver(schema *Schema) []error {
+	ids := []ChallengeId{}
+	if err := m.db.Select(&ids, "SELECT id FROM challenges;"); err != nil {
+		return []error{err}
+	}
+	known := make(map[ChallengeId]bool, len(ids))
+	for _, id := range ids {
+		known[id] = true
+	}
+
+	type wanted struct {
+		Challenge ChallengeId `db:"challenge"`
+		Seed      int         `db:"seed"`
+	}
+	rows := []wanted{}
+	err := m.db.Select(&rows, "SELECT challenge, seed FROM builds WHERE schema = ? AND format = ? AND flag != '';",
+		schema.Name, schema.FlagFormat)
+	if err != nil {
+		return []error{err}
+	}
+	built := make(map[wanted]bool, len(rows))
+	for _, row := range rows {
+		built[row] = true
+	}
+
+	errs := []error{}
+	for _, challenge := range slices.Sorted(maps.Keys(schema.Challenges)) {
+		spec := schema.Challenges[challenge]
+		if len(spec.Seeds) == 0 {
+			continue
+		}
+		if !known[challenge] {
+			errs = append(errs, fmt.Errorf("challenge '%s' has not been handed over: %w", challenge, ErrExternalBuildPlane))
+			continue
+		}
+		missing := []int{}
+		for _, seed := range spec.Seeds {
+			if !built[wanted{challenge, seed}] {
+				missing = append(missing, seed)
+			}
+		}
+		if len(missing) > 0 {
+			errs = append(errs, missingHandOverError(challenge, schema.Name, schema.FlagFormat, missing))
+		}
+	}
+	return errs
+}
+
+// missingHandOverError names the builds of one challenge that a schema
+// wants and no hand-over has delivered. The precondition above and the
+// safety net under it (requireIngestedBuilds) report the shortfall in the
+// same words; each wraps ErrExternalBuildPlane, which cmgrd answers with
+// 409.
+func missingHandOverError(challenge ChallengeId, schema, format string, seeds []int) error {
+	listed := make([]string, 0, len(seeds))
+	for _, seed := range seeds {
+		listed = append(listed, strconv.Itoa(seed))
+	}
+	return fmt.Errorf("no build of '%s' for schema '%s' (format '%s', seed %s) has been handed over: %w",
+		challenge, schema, format, strings.Join(listed, ", "), ErrExternalBuildPlane)
 }
 
 // checkExternalBuildPlane refuses to start an external build plane on a
