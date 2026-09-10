@@ -23,9 +23,13 @@ const (
 	LOGGING_ENV           string = "CMGR_LOGGING"
 	IFACE_ENV             string = "CMGR_INTERFACE"
 	PORTS_ENV             string = "CMGR_PORTS"
-	DISK_QUOTA_ENV        string = "CMGR_ENABLE_DISK_QUOTAS"
-	PRUNE_AGE_ENV         string = "CMGR_PRUNE_AGE"
-	DB_WAL_ENV            string = "CMGR_DB_WAL"
+	// CONCURRENT_LAUNCHES_ENV was the one setting named only as a literal
+	// where it is read; it is a constant so the list of what a build plane
+	// ignores can name it (orchestratorOnlySettings).
+	CONCURRENT_LAUNCHES_ENV string = "CMGR_CONCURRENT_LAUNCHES"
+	DISK_QUOTA_ENV          string = "CMGR_ENABLE_DISK_QUOTAS"
+	PRUNE_AGE_ENV           string = "CMGR_PRUNE_AGE"
+	DB_WAL_ENV              string = "CMGR_DB_WAL"
 
 	// Worker tunables (see workerTiming in workers.go).
 	WORKER_POLL_INTERVAL_ENV   string = "CMGR_WORKER_POLL_INTERVAL"
@@ -100,6 +104,17 @@ type Manager struct {
 	// daemon, which then has no local daemon at all (see buildplane.go).
 	// False, the zero value, is the local build plane there always was.
 	externalBuildPlane bool
+	// buildPlane: this process builds and pushes and serves nothing,
+	// which is what cork-build is (see AsBuildPlane). What a process is,
+	// rather than what its environment holds: nothing reads it from a
+	// variable. Two things follow from it, and both read it directly so
+	// that no second field can come to disagree: a registry is required
+	// (initDocker), since everything it builds is pushed to one; and it
+	// never takes a tag back out of the challenge registry
+	// (retireRegistryTag), since its database is bookkeeping and knows
+	// only what it built, while an orchestrator may still be serving
+	// what these schemas have stopped naming.
+	buildPlane bool
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
 	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run

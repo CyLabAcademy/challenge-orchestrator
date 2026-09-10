@@ -40,6 +40,32 @@ var seccompPolicy string
 func (m *Manager) initDocker() error {
 	m.ctx = context.Background()
 
+	// Before the daemon, because whether a registry is required is decided
+	// by what this process is rather than by anything docker says: an
+	// external plane pulls every image from it, a build plane pushes every
+	// image to it, and an operator who set neither should be told which one
+	// he is missing instead of whatever the daemon complains about first.
+	// (The value itself is read again below, where the credentials for it
+	// are; this only decides the refusal.)
+	if os.Getenv(REGISTRY_ENV) == "" {
+		var err error
+		switch {
+		case m.externalBuildPlane:
+			err = fmt.Errorf("%s is required on an external build plane: the workers pull every image from it", REGISTRY_ENV)
+		case m.buildPlane:
+			// Without one every push short-circuits on challengeRegistry
+			// == "", so an entire event builds locally and reports
+			// success, and every hand-over is then refused for images the
+			// orchestrator cannot find -- the answer arriving an hour
+			// after the mistake.
+			err = fmt.Errorf("%s is required on a build plane: every image it builds is pushed there for an orchestrator's workers to pull", REGISTRY_ENV)
+		}
+		if err != nil {
+			m.log.error(err)
+			return err
+		}
+	}
+
 	if m.externalBuildPlane {
 		// No local daemon: nothing is built here, and every instance runs
 		// on a worker (newInstance refuses a launch with none). m.cli stays
@@ -47,7 +73,7 @@ func (m *Manager) initDocker() error {
 		// image removals, skipped. DOCKER_HOST is the one setting an
 		// operator might still expect to matter, so it is named;
 		// DOCKER_CERT_PATH is the workers' and still applies.
-		m.noteIgnoredSetting("DOCKER_HOST")
+		m.noteIgnoredSetting("DOCKER_HOST", externalPlaneIgnores)
 		// The workers are all this daemon can run instances on, so their
 		// TLS material is checked here the way the registry's is below:
 		// material that cannot be loaded refuses the start (every
@@ -75,7 +101,7 @@ func (m *Manager) initDocker() error {
 	// network creation and container starts internally on either firewall
 	// backend, so two slots measured best on iptables and nftables showed
 	// no gain past two either; the range is open for re-measuring.
-	m.launchConcurrency = m.envSlots("CMGR_CONCURRENT_LAUNCHES", 2)
+	m.launchConcurrency = m.envSlots(CONCURRENT_LAUNCHES_ENV, 2)
 	m.localQueue = newDaemonQueue(m.launchConcurrency)
 	m.log.infof("launch and teardown slots per daemon: %d", m.launchConcurrency)
 
@@ -100,14 +126,9 @@ func (m *Manager) initDocker() error {
 	}
 
 	if m.externalBuildPlane {
-		if m.challengeRegistry == "" {
-			// Without a registry the images an instance runs are the
-			// builder's own copies, and an external build plane leaves
-			// this daemon none.
-			err = fmt.Errorf("%s is required on an external build plane: the workers pull every image from it", REGISTRY_ENV)
-			m.log.error(err)
-			return err
-		}
+		// A registry is already required of this mode, above, before the
+		// daemon that is not there is dialed.
+		//
 		// The registry client is the only image cleanup left here (destroy
 		// and prune untag in the registry alone), and its material lives
 		// under a docker-owned path by default, which a box with no docker
@@ -498,6 +519,17 @@ func (m *Manager) templateChecksum(challengeType string) uint32 {
 // here and in the pure function, nowhere else.
 func (m *Manager) buildContentChecksum(sourceChecksum uint32, format string, challengeType string) uint32 {
 	return contentChecksum(sourceChecksum, format, m.basePinsChecksum(), m.templateChecksum(challengeType))
+}
+
+// ContentChecksum is the identity a build has under the inputs given: its
+// source generation, its flag format, a base image pin fingerprint and the
+// challenge type whose template it is built from. It is what a hand-over
+// states and what the daemon taking one recomputes (see checkHandOver), so
+// a build plane can ask the same question of its own builds before it
+// hands them over -- a build made under other pins carries an identity
+// these inputs do not give, and would be refused.
+func (m *Manager) ContentChecksum(sourceChecksum uint32, format string, pinFingerprint uint32, challengeType string) uint32 {
+	return contentChecksum(sourceChecksum, format, pinFingerprint, m.templateChecksum(challengeType))
 }
 
 // dockerId is the docker tag for one of the build's images. It is derived
@@ -1190,9 +1222,12 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		// one found present belonged to someone else) is taken back out, or
 		// a generation no row names would sit in the registry for good --
 		// prune and destroy reconstruct tags from rows, so they would never
-		// find it. Best-effort, like every registry delete, and outside
-		// imageMu: each call may wait out the registry timeout, and the
-		// purge and prune paths queue on that lock.
+		// find it. registryDeleteTag directly rather than retireRegistryTag:
+		// this is not a retirement but a push being taken back, of content
+		// nothing outside this build has been told about yet, so a build
+		// plane does it too (see AsBuildPlane). Best-effort, like every
+		// registry delete, and outside imageMu: each call may wait out the
+		// registry timeout, and the purge and prune paths queue on that lock.
 		if unreferenced {
 			for _, imageName := range pushed {
 				if derr := m.registryDeleteTag(imageName); derr != nil {
@@ -1684,10 +1719,8 @@ func (m *Manager) pruneReplacedImages(replaced []replacedImages) {
 			// Registry mode: also untag the generation in the registry, or it
 			// accumulates one immutable tag per rebuild forever. Best-effort —
 			// a leaked registry tag is recoverable, a failed update is not.
-			if m.challengeRegistry != "" {
-				if err := m.registryDeleteTag(tag); err != nil {
-					m.log.warnf("could not prune replaced registry tag %s: %s", tag, err)
-				}
+			if err := m.retireRegistryTag(tag); err != nil {
+				m.log.warnf("could not prune replaced registry tag %s: %s", tag, err)
 			}
 		}
 	}
@@ -1756,8 +1789,8 @@ func (m *Manager) destroyImages(build BuildId) error {
 				}
 			}
 			// Best-effort registry untag, mirroring pruneReplacedImages.
-			if m.challengeRegistry != "" && image.Host != "builder" {
-				if err := m.registryDeleteTag(imageName); err != nil {
+			if image.Host != "builder" {
+				if err := m.retireRegistryTag(imageName); err != nil {
 					m.log.warnf("could not remove registry tag %s: %s", imageName, err)
 				}
 			}
@@ -1780,8 +1813,8 @@ func (m *Manager) destroyImages(build BuildId) error {
 				if err := m.removeLocalImage(imageName, iro); err != nil && !errdefs.IsNotFound(err) {
 					m.log.warnf("could not remove rollback-generation image %s: %s", imageName, err)
 				}
-				if m.challengeRegistry != "" && image.Host != "builder" {
-					if err := m.registryDeleteTag(imageName); err != nil {
+				if image.Host != "builder" {
+					if err := m.retireRegistryTag(imageName); err != nil {
 						m.log.warnf("could not remove rollback-generation registry tag %s: %s", imageName, err)
 					}
 				}

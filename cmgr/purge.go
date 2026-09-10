@@ -61,7 +61,7 @@ func (m *Manager) initPurgeAfterPush() {
 		// Nothing is built here, so there is nothing to purge; a setting
 		// left over from a local build plane is named, not obeyed.
 		m.purgeAfterPush = false
-		m.noteIgnoredSetting(PURGE_AFTER_PUSH_ENV)
+		m.noteIgnoredSetting(PURGE_AFTER_PUSH_ENV, externalPlaneIgnores)
 		return
 	}
 	m.purgeAfterPush = true

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"log"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,13 +169,13 @@ func TestNoteIgnoredSettingKeysOnPresence(t *testing.T) {
 	m := &Manager{log: captureLog(&logged), externalBuildPlane: true}
 
 	unsetenv(t, DIR_ENV)
-	m.noteIgnoredSetting(DIR_ENV)
+	m.noteIgnoredSetting(DIR_ENV, externalPlaneIgnores)
 	if logged.Len() != 0 {
 		t.Fatalf("an unset variable was reported: %s", logged.String())
 	}
 
 	t.Setenv(DIR_ENV, "")
-	m.noteIgnoredSetting(DIR_ENV)
+	m.noteIgnoredSetting(DIR_ENV, externalPlaneIgnores)
 	if !strings.Contains(logged.String(), DIR_ENV+" is set but ignored") {
 		t.Fatalf("an empty value was not reported: %s", logged.String())
 	}
@@ -445,11 +446,17 @@ func TestGenerateBuildsExternalRequiresIngestedBuilds(t *testing.T) {
 // registry untag is attempted, best effort as ever.
 func TestDestroyImagesExternalIsRegistryOnly(t *testing.T) {
 	m := setupExternalTestManager(t)
-	m.challengeRegistry = "zot.internal"
 	m.artifactsDir = t.TempDir()
-	// No certificates here: the registry untag fails, and is logged, not
-	// returned -- the same contract as on a local build plane.
-	t.Setenv(REGISTRY_CERT_DIR_ENV, t.TempDir())
+	// A registry that answers, so "the untag is attempted" is something this
+	// test can see rather than something it says. Asserting it matters more
+	// than it looks: retireRegistryTag returns early for a build plane, and
+	// a manager built as a bare struct rather than by NewManager is whatever
+	// the zero value makes it -- so a test that only watched destroyImages
+	// return nil would pass just as well with no untag attempted at all.
+	host, seen := startFakeRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	})
+	m.challengeRegistry = host
 
 	challenge := testChallenge("test/external-destroy", 0)
 	if errs := m.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
@@ -481,17 +488,33 @@ func TestDestroyImagesExternalIsRegistryOnly(t *testing.T) {
 	if _, err := os.Stat(archive); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the destroyed build's archive is still there: %v", err)
 	}
+	// An orchestrator retires what it destroys, and this daemon is one: the
+	// registry is the only place its images live.
+	deletes := 0
+	for _, r := range *seen {
+		if r.Method == http.MethodDelete {
+			deletes++
+		}
+	}
+	if deletes == 0 {
+		t.Errorf("destroying a build on an external plane reached the registry %d time(s) and deleted nothing: its images live nowhere else", len(*seen))
+	}
 }
 
 // pruneReplacedImages is the same shape: no local daemon, registry only.
 func TestPruneReplacedImagesExternalIsRegistryOnly(t *testing.T) {
 	m := setupExternalTestManager(t)
-	m.challengeRegistry = "zot.internal"
-	t.Setenv(REGISTRY_CERT_DIR_ENV, t.TempDir())
+	host, seen := startFakeRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	})
+	m.challengeRegistry = host
 	m.pruneReplacedImages([]replacedImages{{
-		tags: []string{"zot.internal/test/prune:s1-1010-challenge"},
+		tags: []string{host + "/test/prune:s1-1010-challenge"},
 		meta: BuildMetadata{Challenge: "test/prune", Seed: 1, Format: "flag{%s}", Checksum: 0x1010},
 	}})
+	if len(*seen) == 0 {
+		t.Error("pruning a replaced generation on an external plane reached the registry not at all: there is nowhere else its images could go")
+	}
 }
 
 // A launch with no worker to place it on is refused before anything is
@@ -689,5 +712,43 @@ func TestInitDatabaseExternalSkipsChecksumBackfill(t *testing.T) {
 	}
 	if checksum == 0 {
 		t.Fatal("the local build plane did not migrate the build")
+	}
+}
+
+// A build plane refuses to start without a registry, as an external
+// orchestrator does, and for the mirror-image reason: there every image is
+// pulled from it, here every image is pushed to it. Without this a builder
+// builds an entire event, reports success, and every hand-over is refused
+// for images the orchestrator cannot find.
+//
+// Asked of a manager with no daemon to reach, because the refusal is about
+// what the process is and must not wait on docker to say so -- a build plane
+// is a local one, so a check ordered after connectDocker could only be
+// tested where a daemon happens to be running.
+func TestBuildPlaneRequiresRegistry(t *testing.T) {
+	unsetenv(t, REGISTRY_ENV)
+	t.Setenv("DOCKER_HOST", "unix://"+filepath.Join(t.TempDir(), "no-daemon.sock"))
+
+	builder := &Manager{log: newLogger(DISABLED)}
+	AsBuildPlane()(builder)
+	if !builder.buildPlane {
+		t.Fatal("AsBuildPlane did not mark the manager a build plane")
+	}
+	err := builder.initDocker()
+	if err == nil {
+		t.Fatal("a build plane started without a registry")
+	}
+	if !strings.Contains(err.Error(), REGISTRY_ENV) {
+		t.Fatalf("error does not name %s: %s", REGISTRY_ENV, err)
+	}
+
+	// An orchestrator on a local plane is not held to it: its images never
+	// leave its own daemon, which is the single-host deployment. It fails
+	// for the absent daemon instead, which is this test's evidence that the
+	// registry refusal is the build plane's alone.
+	orchestrator := &Manager{log: newLogger(DISABLED)}
+	err = orchestrator.initDocker()
+	if err == nil || strings.Contains(err.Error(), REGISTRY_ENV) {
+		t.Fatalf("a local orchestrator was refused for having no registry: %v", err)
 	}
 }

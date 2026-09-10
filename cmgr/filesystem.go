@@ -23,7 +23,7 @@ func (m *Manager) setDirectories() error {
 		// No challenge tree: the build plane has it, and nothing here reads
 		// one (DetectChanges and the pins refuse, the converge does not
 		// scan). m.chalDir stays empty.
-		m.noteIgnoredSetting(DIR_ENV)
+		m.noteIgnoredSetting(DIR_ENV, externalPlaneIgnores)
 	} else if err = m.setChallengeDirectory(); err != nil {
 		return err
 	}

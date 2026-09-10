@@ -235,7 +235,7 @@ func (m *Manager) initBasePins() error {
 		// over, and a converge on this plane never gets that far
 		// (requireHandedOver refuses first), while a row that exists keeps
 		// the checksum it was handed over with.
-		m.noteIgnoredSetting(BASE_PINS_ENV)
+		m.noteIgnoredSetting(BASE_PINS_ENV, externalPlaneIgnores)
 		return nil
 	}
 	path, isSet := os.LookupEnv(BASE_PINS_ENV)
@@ -438,6 +438,15 @@ func (m *Manager) basePinsChecksum() uint32 {
 		return 0
 	}
 	return m.basePins.checksum()
+}
+
+// BasePinFingerprint is the identity contribution of the pins in force
+// here: 0 with pinning off. It is an input to every build's content
+// checksum (contentChecksum), and the one input a daemon taking a hand-over
+// cannot derive for itself, the pins living where the builds are made, so
+// the build plane states it and the daemon recomputes with it (HandOver).
+func (m *Manager) BasePinFingerprint() uint32 {
+	return m.basePinsChecksum()
 }
 
 // pinBases applies the current pins to a Dockerfile on its way into a build

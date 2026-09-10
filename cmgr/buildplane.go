@@ -38,6 +38,28 @@ var ErrExternalBuildPlane = errors.New("the build plane is external: this daemon
 // a player's retry costs less than a retry loop holding its launch workers.
 var ErrNoWorkers = errors.New("no workers are registered")
 
+// ManagerOption tells NewManager what the process it is being built for is,
+// as against what the environment it is being built in says. What a binary
+// is, no variable should be able to contradict.
+type ManagerOption func(*Manager)
+
+// AsBuildPlane marks a manager as a build plane that serves nothing, which
+// is what cork-build is: it builds and pushes, and it never takes a tag back
+// out of the challenge registry.
+//
+// The registry is shared and write-once, and deciding a tag is spent means
+// knowing every row that still names its content. A build plane cannot know.
+// Its database is bookkeeping -- thrown away and re-derived at will, and
+// carrying only what this build plane itself built -- while the builds it no
+// longer names are still being served by an orchestrator that was handed
+// them. Left to decide for itself it would untag, on a dropped seed or a
+// changed flag format, images a running event still pulls. Retiring them is
+// the orchestrator's to do, whose own schema converge releases those same
+// builds against the database that does know what references them.
+func AsBuildPlane() ManagerOption {
+	return func(m *Manager) { m.buildPlane = true }
+}
+
 // initBuildPlane reads BUILD_PLANE_ENV, an empty value counting as unset. It
 // runs before anything that reads the challenge tree, the pin file or
 // DOCKER_HOST, since on an external build plane none of them apply.
@@ -53,7 +75,36 @@ func (m *Manager) initBuildPlane() error {
 		m.log.error(err)
 		return err
 	}
+
+	// The mirror of the notes an external daemon makes about build-plane
+	// settings: a build plane serves nothing, so everything about serving is
+	// inert here. Worth saying because a unit file grown from an
+	// orchestrator's is the normal way this happens, and the settings below
+	// fail silently rather than loudly -- CMGR_CONCURRENT_LAUNCHES even
+	// reports slots at startup, on a host that will never take a launch.
+	if m.buildPlane {
+		for _, name := range orchestratorOnlySettings {
+			m.noteIgnoredSetting(name, "this is a build plane: nothing runs here")
+		}
+	}
 	return nil
+}
+
+// orchestratorOnlySettings are read by the manager but mean nothing on a
+// build plane, all of them being about instances, the workers that run them,
+// or reclaiming them.
+var orchestratorOnlySettings = []string{
+	CONCURRENT_LAUNCHES_ENV,
+	PORTS_ENV,
+	IFACE_ENV,
+	DISK_QUOTA_ENV,
+	PRUNE_AGE_ENV,
+	WORKER_POLL_INTERVAL_ENV,
+	WORKER_POLL_TIMEOUT_ENV,
+	WORKER_MAX_MISSES_ENV,
+	WORKER_CONTROL_TIMEOUT_ENV,
+	WORKER_PULL_TIMEOUT_ENV,
+	WORKER_LAUNCH_WAIT_ENV,
 }
 
 // BuildPlane reports the configured build plane, BuildPlaneLocal or
@@ -65,18 +116,26 @@ func (m *Manager) BuildPlane() string {
 	return BuildPlaneLocal
 }
 
-// noteIgnoredSetting says at startup that a setting only a local build plane
-// reads is present. A unit file that still carries CMGR_DIR or DOCKER_HOST
-// most likely expects an update to work here, and the answer to that is a
-// 409 later rather than a silent no-op; naming the setting now is the
-// earlier of the two. Presence is what counts: an empty CMGR_DIR is the
-// working directory on a local build plane, and an empty CMGR_BASE_PINS
-// fails one, so neither is a value to pass over.
-func (m *Manager) noteIgnoredSetting(name string) {
+// noteIgnoredSetting says at startup that a setting this process does not
+// read is present, and why it does not. A unit file that still carries
+// CMGR_DIR or DOCKER_HOST most likely expects an update to work here, and
+// the answer to that is a 409 later rather than a silent no-op; naming the
+// setting now is the earlier of the two. It runs in both directions: an
+// external daemon names the build-plane settings, and a build plane names
+// the orchestrator's.
+//
+// Presence is what counts, not value: an empty CMGR_DIR is the working
+// directory on a local build plane, and an empty CMGR_BASE_PINS fails one,
+// so neither is a value to pass over.
+func (m *Manager) noteIgnoredSetting(name, because string) {
 	if _, isSet := os.LookupEnv(name); isSet {
-		m.log.warnf("%s is set but ignored: the build plane is external", name)
+		m.log.warnf("%s is set but ignored: %s", name, because)
 	}
 }
+
+// externalPlaneIgnores is why a setting only a local build plane reads is
+// passed over by a daemon that builds nothing.
+const externalPlaneIgnores = "the build plane is external"
 
 // requireHandedOver is the external build plane's precondition for a
 // schema converge: the challenge row, and a finished build for every
