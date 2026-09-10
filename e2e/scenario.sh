@@ -231,6 +231,7 @@ ORPHAN_NET=""         # its cmgr-<id> network
 ORPHAN_CID=""         # the container holding that network open
 FRESH_CMGRD=""        # pid of the throwaway cmgrd of the fresh-box step
 HO_CMGRD=""           # pid of the throwaway cmgrd of the hand-over step
+CB_CMGRD=""           # pid of the throwaway cmgrd of the cork-build step
 EDITED_META=""        # a challenge metadata file a step edited under CMGR_DIR
 ORPHAN_TAG=""         # a content tag an update deliberately orphaned, which cork never reclaims
 STOPPED_REGISTRY=""   # outer container id of the registry this run stopped
@@ -291,6 +292,7 @@ cleanup() {
   fi
   if [[ -n "$FRESH_CMGRD" ]]; then kill "$FRESH_CMGRD" >/dev/null 2>&1 || true; fi
   if [[ -n "$HO_CMGRD" ]]; then kill "$HO_CMGRD" >/dev/null 2>&1 || true; fi
+  if [[ -n "$CB_CMGRD" ]]; then kill "$CB_CMGRD" >/dev/null 2>&1 || true; fi
   # The stand-in holds the registry's own network alias, so it lets go first;
   # the probe build is destroyed last, so its registry untag has a registry to
   # talk to. t=1 because the stand-in's entrypoint is a pipeline and bash
@@ -1391,6 +1393,146 @@ EOF
   ok "a cmgrd on an external build plane recorded $CH_MAKE (archive included) and $CH_FLAGONLY as this fleet built them, answered unmodified to the same hand-over again, 400 to a forged content checksum and 409 to a tag zot does not serve with nothing written, converged the schema over what it was handed, refused a launch with no worker, and removed a challenge without builds but not one with"
 else
   deselect "hand-over to an external build plane"
+fi
+
+# ------------------------- 5a-bis. the build plane as a binary
+
+if (( FULL )); then
+  step "cork-build: the build plane builds this fleet's schema itself and hands it to a daemon that builds nothing"
+  # The other half of issue #18. cork-build is cmgr's build path with no
+  # orchestrator attached: it reads the schema files, scans the same
+  # /challenges this fleet builds from, builds and pushes to the same zot,
+  # and hands the result to a cmgrd on an external build plane. It drives
+  # the same builder daemon cork does, with purge-after-push on, so it
+  # leaves that daemon as it found it (the purge step below would notice
+  # otherwise).
+  #
+  # Its builds cost almost nothing here: the registry is write-once and
+  # holds these tags already, so every image is adopted rather than built
+  # again -- which is itself the assertion that cork-build derives the same
+  # content identity from the same tree as the daemon that built them.
+  #
+  # Placed before the pins step deliberately: until then nothing is pinned
+  # anywhere, so the fingerprint cork-build states is 0, as the fleet's own
+  # builds were made under.
+  CB=$(mktemp -d)
+  # A schema of its own, naming the two challenges nothing has to be
+  # launched for: the on-demand one, and the flag-only one at a count no
+  # instance is ever started for (a challenge delivered without instances
+  # has a target of zero whatever the schema says). The count still has to
+  # arrive on the daemon, which is what proves it travelled: cork-build
+  # converges every build on demand here and never at 3.
+  MK_SEED=$(api GET "/builds/$MK_BUILD" | jq -r .seed)
+  FLAG_BUILD_ID=$(build_id "$CH_FLAGONLY")
+  FLAG_SEED=$(api GET "/builds/$FLAG_BUILD_ID" | jq -r .seed)
+  cat >"$CB/schema.yaml" <<EOF
+name: e2e-built
+flag_format: e2e{%s}
+challenges:
+  $CH_MAKE:
+    seeds: [$MK_SEED]
+    instance_count: -1
+  $CH_FLAGONLY:
+    seeds: [$FLAG_SEED]
+    instance_count: 3
+EOF
+  # The daemon that takes what it builds: no docker, no tree, no worker.
+  CMGR_BUILD_PLANE=external \
+  CMGR_REGISTRY="$E2E_REGISTRY" \
+  CMGR_ARTIFACT_DIR="$CB/artifacts" \
+  CMGR_DB="$CB/db/cmgr.db" \
+    cmgrd --port 4293 >"$CB/cmgrd.log" 2>&1 &
+  CB_CMGRD=$! # the EXIT trap kills it if anything below fails
+  CB_SERVER=http://127.0.0.1:4293
+  retry 30 "the cork-build cmgrd to answer on :4293" fresh_answers "$CB_CMGRD" 4293 "$CB/cmgrd.log" "the throwaway cmgrd taking cork-build's hand-over"
+
+  t=$(date +%s)
+  # Its own environment, not this container's: a scratch database and
+  # artifact directory, the builder daemon over plain TCP as the fleet's
+  # cmgrd reaches it, and a port range it never uses (it launches nothing).
+  CMGR_DIR="$CHALLENGES" \
+  CMGR_DB="$CB/build.db" \
+  CMGR_ARTIFACT_DIR="$CB/built" \
+  CMGR_REGISTRY="$E2E_REGISTRY" \
+  CMGR_REGISTRY_CERT_DIR="$REGISTRY_CERT_DIR" \
+  CMGR_PURGE_AFTER_PUSH=true \
+  CMGR_PORTS=21000-21009 \
+  DOCKER_HOST="tcp://${E2E_BUILDER#http://}" \
+    timeout 600 cork-build --server "$CB_SERVER" build "$CB/schema.yaml" >"$CB/build.log" 2>&1 ||
+    fail "cork-build failed: $(tail -c 1500 "$CB/build.log")"
+  note "cork-build built and handed over $CH_MAKE and $CH_FLAGONLY in $(( $(date +%s) - t ))s"
+  grep -q "adopted\|already in the registry" "$CB/build.log" ||
+    note "cork-build rebuilt rather than adopting: $(grep -c 'Successfully built' "$CB/build.log" || true) image(s) built"
+  for id in "$CH_MAKE" "$CH_FLAGONLY"; do
+    grep -q "^  $id: added" "$CB/build.log" ||
+      fail "cork-build did not report $id as added by the orchestrator: $(tail -c 800 "$CB/build.log")"
+  done
+
+  # What the daemon recorded is what this fleet built: same flag, same
+  # content identity, same images. cork-build read the same tree and
+  # derived the same identity, which is the whole contract between a build
+  # plane and an orchestrator.
+  cb_state=$(curl -sS --max-time 10 "$CB_SERVER/state") ||
+    fail "GET /state failed on the cork-build daemon"
+  for id in "$CH_MAKE" "$CH_FLAGONLY"; do
+    handed=$(jq -c --arg id "$id" '.[] | select(.id == $id) | .builds[0]' <<<"$cb_state")
+    [[ -n "$handed" ]] ||
+      fail "$id is not on the cork-build daemon: $cb_state"
+    fleet=$(api GET "/builds/$(build_id "$id")")
+    for field in flag checksum source_checksum has_artifacts seed format; do
+      [[ "$(jq -c ".$field" <<<"$handed")" == "$(jq -c ".$field" <<<"$fleet")" ]] ||
+        fail "cork-build's $id differs from this fleet's in $field: $(jq -c ".$field" <<<"$handed") vs $(jq -c ".$field" <<<"$fleet")"
+    done
+    [[ "$(jq -c '[.images[] | {host, exposed_ports}]' <<<"$handed")" == "$(jq -c '[.images[] | {host, exposed_ports}]' <<<"$fleet")" ]] ||
+      fail "cork-build's $id has other images than this fleet's: $(jq -c .images <<<"$handed")"
+    [[ "$(jq -r .schema <<<"$handed")" == e2e-built ]] ||
+      fail "$id was recorded under schema $(jq -r .schema <<<"$handed"), not the one cork-build was given"
+  done
+  # The instance count is the schema's, not the on-demand one cork-build
+  # converged with.
+  [[ "$(jq -r --arg id "$CH_FLAGONLY" '.[] | select(.id == $id) | .builds[0].instance_count' <<<"$cb_state")" == 3 ]] ||
+    fail "$CH_FLAGONLY was recorded at instance count $(jq -r --arg id "$CH_FLAGONLY" '.[] | select(.id == $id) | .builds[0].instance_count' <<<"$cb_state"), not the 3 its schema asks for"
+  [[ "$(jq -r --arg id "$CH_MAKE" '.[] | select(.id == $id) | .builds[0].instance_count' <<<"$cb_state")" == -1 ]] ||
+    fail "$CH_MAKE was not recorded as on demand"
+  # Nothing was launched for either: this daemon has no worker, and a
+  # launch it could not place would have been reported as an error.
+  # `instances` is left out of a build that has none, so the empty list has
+  # to be supplied before it can be counted.
+  [[ "$(jq -r '[.[].builds[] | (.instances // [])[]] | length' <<<"$cb_state")" == 0 ]] ||
+    fail "the cork-build hand-over started instances on a daemon with no workers: $cb_state"
+
+  # The archive travelled with it, and is served.
+  cb_build=$(jq -r --arg id "$CH_MAKE" '.[] | select(.id == $id) | .builds[0].id' <<<"$cb_state")
+  code=$(curl -sS -o "$CB/served.tar.gz" -w '%{http_code}' --connect-timeout 5 --max-time 60 "$CB_SERVER/builds/$cb_build/artifacts.tar.gz")
+  [[ "$code" == 200 ]] ||
+    fail "the cork-build daemon does not serve the archive it was handed for $CH_MAKE ($code)"
+  [[ "$(artifact_get "$MK_BUILD" artifacts.tar.gz "$CB/fleet.tar.gz")" == 200 ]] ||
+    fail "could not download this fleet's archive for build $MK_BUILD"
+  [[ "$(art_members "$CB/served.tar.gz")" == "$(art_members "$CB/fleet.tar.gz")" ]] ||
+    fail "the archive cork-build handed over holds $(art_members "$CB/served.tar.gz"), this fleet's holds $(art_members "$CB/fleet.tar.gz")"
+
+  # And the daemon can now converge the event it was handed, which is what
+  # the whole exchange is for.
+  out=$(timeout 60 cmgrd-cli --server "$CB_SERVER" update-schema "$CB/schema.yaml" 2>&1) ||
+    fail "update-schema on the cork-build daemon failed although cork-build handed it every build: $out"
+
+  # A build plane will not hand over to a daemon that builds for itself:
+  # this fleet's own cmgrd is one, and says so before anything is sent.
+  out=$(CMGR_DIR="$CHALLENGES" CMGR_DB="$CB/build.db" CMGR_ARTIFACT_DIR="$CB/built" \
+        CMGR_REGISTRY="$E2E_REGISTRY" CMGR_REGISTRY_CERT_DIR="$REGISTRY_CERT_DIR" \
+        CMGR_PORTS=21000-21009 DOCKER_HOST="tcp://${E2E_BUILDER#http://}" \
+        timeout 300 cork-build --server "$CMGRD_SERVER" build "$CB/schema.yaml" 2>&1) &&
+    fail "cork-build handed its builds to a daemon on a local build plane: $out"
+  [[ "$out" == *"takes no hand-over"* ]] ||
+    fail "cork-build did not say why it would not hand over to this fleet's cmgrd: $(tail -c 500 <<<"$out")"
+
+  kill "$CB_CMGRD" >/dev/null 2>&1 || true
+  wait "$CB_CMGRD" 2>/dev/null || true
+  CB_CMGRD=""
+  rm -rf "$CB"
+  ok "cork-build read the schema, built $CH_MAKE and $CH_FLAGONLY from $CHALLENGES against the same registry, and handed them to a cmgrd that builds nothing: same flags, content identities, images and archive as this fleet's own builds, at the instance counts the schema asks for rather than the on-demand ones it converged with, with nothing launched; that daemon then converged the schema, and this fleet's own cmgrd was refused as a local build plane"
+else
+  deselect "cork-build, the build plane as a binary"
 fi
 
 # ------------------------------- 5b. purge after push
