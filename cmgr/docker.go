@@ -500,6 +500,17 @@ func (m *Manager) buildContentChecksum(sourceChecksum uint32, format string, cha
 	return contentChecksum(sourceChecksum, format, m.basePinsChecksum(), m.templateChecksum(challengeType))
 }
 
+// ContentChecksum is the identity a build has under the inputs given: its
+// source generation, its flag format, a base image pin fingerprint and the
+// challenge type whose template it is built from. It is what a hand-over
+// states and what the daemon taking one recomputes (see checkHandOver), so
+// a build plane can ask the same question of its own builds before it
+// hands them over -- a build made under other pins carries an identity
+// these inputs do not give, and would be refused.
+func (m *Manager) ContentChecksum(sourceChecksum uint32, format string, pinFingerprint uint32, challengeType string) uint32 {
+	return contentChecksum(sourceChecksum, format, pinFingerprint, m.templateChecksum(challengeType))
+}
+
 // dockerId is the docker tag for one of the build's images. It is derived
 // from portable build identity — seed plus content checksum — rather than the
 // local autoincrement build id, so the same challenge content yields the same
@@ -1190,9 +1201,12 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		// one found present belonged to someone else) is taken back out, or
 		// a generation no row names would sit in the registry for good --
 		// prune and destroy reconstruct tags from rows, so they would never
-		// find it. Best-effort, like every registry delete, and outside
-		// imageMu: each call may wait out the registry timeout, and the
-		// purge and prune paths queue on that lock.
+		// find it. registryDeleteTag directly rather than retireRegistryTag:
+		// this is not a retirement but a push being taken back, of content
+		// nothing outside this build has been told about yet, so a build
+		// plane does it too (see AsBuildPlane). Best-effort, like every
+		// registry delete, and outside imageMu: each call may wait out the
+		// registry timeout, and the purge and prune paths queue on that lock.
 		if unreferenced {
 			for _, imageName := range pushed {
 				if derr := m.registryDeleteTag(imageName); derr != nil {
@@ -1684,10 +1698,8 @@ func (m *Manager) pruneReplacedImages(replaced []replacedImages) {
 			// Registry mode: also untag the generation in the registry, or it
 			// accumulates one immutable tag per rebuild forever. Best-effort —
 			// a leaked registry tag is recoverable, a failed update is not.
-			if m.challengeRegistry != "" {
-				if err := m.registryDeleteTag(tag); err != nil {
-					m.log.warnf("could not prune replaced registry tag %s: %s", tag, err)
-				}
+			if err := m.retireRegistryTag(tag); err != nil {
+				m.log.warnf("could not prune replaced registry tag %s: %s", tag, err)
 			}
 		}
 	}
@@ -1756,8 +1768,8 @@ func (m *Manager) destroyImages(build BuildId) error {
 				}
 			}
 			// Best-effort registry untag, mirroring pruneReplacedImages.
-			if m.challengeRegistry != "" && image.Host != "builder" {
-				if err := m.registryDeleteTag(imageName); err != nil {
+			if image.Host != "builder" {
+				if err := m.retireRegistryTag(imageName); err != nil {
 					m.log.warnf("could not remove registry tag %s: %s", imageName, err)
 				}
 			}
@@ -1780,8 +1792,8 @@ func (m *Manager) destroyImages(build BuildId) error {
 				if err := m.removeLocalImage(imageName, iro); err != nil && !errdefs.IsNotFound(err) {
 					m.log.warnf("could not remove rollback-generation image %s: %s", imageName, err)
 				}
-				if m.challengeRegistry != "" && image.Host != "builder" {
-					if err := m.registryDeleteTag(imageName); err != nil {
+				if image.Host != "builder" {
+					if err := m.retireRegistryTag(imageName); err != nil {
 						m.log.warnf("could not remove rollback-generation registry tag %s: %s", imageName, err)
 					}
 				}

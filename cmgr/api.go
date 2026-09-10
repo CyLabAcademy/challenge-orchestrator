@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/CyLabAcademy/challenge-orchestrator/cmgr/dockerfiles"
@@ -25,11 +26,19 @@ func Version() string {
 
 // Creates a new instance of the challenge manager validating the appropriate
 // environment variables in the process.  A return value of `nil` indicates
-// a fatal error occurred during intitialization.
-func NewManager(logLevel LogLevel) *Manager {
+// a fatal error occurred during intitialization.  The options say what the
+// calling process is, which its environment does not get to contradict (see
+// ManagerOption).
+func NewManager(logLevel LogLevel, options ...ManagerOption) *Manager {
 	mgr := new(Manager)
 	mgr.log = newLogger(logLevel)
 	mgr.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+	// An orchestrator unless its caller says otherwise: the daemon and the
+	// CLI both serve what they build, and only a build plane does not.
+	mgr.retiresRegistryTags = true
+	for _, option := range options {
+		option(mgr)
+	}
 
 	mgr.log.infof("version: %s", Version())
 
@@ -870,6 +879,14 @@ func (m *Manager) GetChallengeMetadata(challenge ChallengeId) (*ChallengeMetadat
 
 func (m *Manager) GetBuildMetadata(build BuildId) (*BuildMetadata, error) {
 	return m.lookupBuildMetadata(build)
+}
+
+// BuildArtifactsPath is where this daemon keeps a build's artifact bundle,
+// the file GET /builds/<id>/artifacts.tar.gz serves. A build plane reads it
+// back from here to put it in the hand-over.
+func (m *Manager) BuildArtifactsPath(build BuildId) string {
+	meta := BuildMetadata{Id: build}
+	return filepath.Join(m.artifactsDir, meta.getArtifactsFilename())
 }
 
 func (m *Manager) GetInstanceMetadata(instance InstanceId) (*InstanceMetadata, error) {

@@ -440,6 +440,15 @@ func (m *Manager) basePinsChecksum() uint32 {
 	return m.basePins.checksum()
 }
 
+// BasePinFingerprint is the identity contribution of the pins in force
+// here: 0 with pinning off. It is an input to every build's content
+// checksum (contentChecksum), and the one input a daemon taking a hand-over
+// cannot derive for itself, the pins living where the builds are made, so
+// the build plane states it and the daemon recomputes with it (HandOver).
+func (m *Manager) BasePinFingerprint() uint32 {
+	return m.basePinsChecksum()
+}
+
 // pinBases applies the current pins to a Dockerfile on its way into a build
 // context.
 func (m *Manager) pinBases(challenge ChallengeId, dockerfile []byte) []byte {

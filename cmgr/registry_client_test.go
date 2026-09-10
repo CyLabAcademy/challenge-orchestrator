@@ -162,6 +162,53 @@ func TestRegistryTagPresentUnreachable(t *testing.T) {
 
 // registryDeleteTag, over the same client: 202 and 404 are done, 405 is a
 // registry that will not delete tags, anything else is the status.
+// Retiring a tag -- taking it out because no row names its content any more
+// -- is the orchestrator's alone. A build plane pushes to the same registry
+// and never takes anything back out of it: its database is bookkeeping and
+// knows only what it built, not what an orchestrator is still serving.
+func TestRetireRegistryTag(t *testing.T) {
+	accept := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusAccepted) }
+	spent := "/cat/chal:s1-1111-challenge"
+
+	orchestrator, seen := fakeRegistry(t, accept)
+	orchestrator.retiresRegistryTags = true
+	if err := orchestrator.retireRegistryTag(orchestrator.challengeRegistry + spent); err != nil {
+		t.Errorf("an orchestrator retiring a spent tag: %v", err)
+	}
+	if len(*seen) != 1 || (*seen)[0].Method != http.MethodDelete {
+		t.Fatalf("%d request(s) reached the registry, want the one delete", len(*seen))
+	}
+
+	builder, builderSeen := fakeRegistry(t, accept)
+	builder.retiresRegistryTags = true // as NewManager leaves it
+	AsBuildPlane()(builder)
+	if builder.retiresRegistryTags {
+		t.Fatal("AsBuildPlane left this manager retiring registry tags")
+	}
+	if err := builder.retireRegistryTag(builder.challengeRegistry + spent); err != nil {
+		t.Errorf("a build plane leaving a spent tag alone: %v", err)
+	}
+	if len(*builderSeen) != 0 {
+		t.Errorf("a build plane reached the registry to retire a tag: %v", *builderSeen)
+	}
+
+	// The one delete that is not a retirement: a build taking back what it
+	// had just pushed before it failed. Nothing outside that build has been
+	// told about the content, so a build plane does it too.
+	if err := builder.registryDeleteTag(builder.challengeRegistry + "/cat/chal:s1-2222-challenge"); err != nil {
+		t.Errorf("a build plane taking back its own push: %v", err)
+	}
+	if len(*builderSeen) != 1 {
+		t.Errorf("%d request(s) reached the registry, want the one push taken back", len(*builderSeen))
+	}
+
+	// With no registry configured there is nothing to retire from.
+	none := &Manager{log: newLogger(DISABLED), retiresRegistryTags: true}
+	if err := none.retireRegistryTag("cat/chal:s1-1111-challenge"); err != nil {
+		t.Errorf("no registry: %v", err)
+	}
+}
+
 func TestRegistryDeleteTag(t *testing.T) {
 	m, seen := fakeRegistry(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {

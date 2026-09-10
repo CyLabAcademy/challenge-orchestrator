@@ -205,6 +205,21 @@ func (m *Manager) registryManifestRequest(method, imageName string) (*http.Reque
 	return req, nil
 }
 
+// retireRegistryTag takes a tag out of the challenge registry now that no row
+// this process can see names its content any more. Only an orchestrator may:
+// see AsBuildPlane for why a build plane's database is not the one that gets
+// to decide, and registryDeleteTag for the one delete that is not a
+// retirement (a build taking back what it had just pushed, which nothing else
+// has been told about yet).
+//
+// Best-effort by contract, as registryDeleteTag is.
+func (m *Manager) retireRegistryTag(imageName string) error {
+	if m.challengeRegistry == "" || !m.retiresRegistryTags {
+		return nil
+	}
+	return m.registryDeleteTag(imageName)
+}
+
 // registryDeleteTag removes a tag from the challenge registry so pruned or
 // destroyed generations, and the tags of a build that failed after pushing,
 // do not accumulate there (content-addressed tags are never overwritten, so

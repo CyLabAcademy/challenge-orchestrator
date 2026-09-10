@@ -38,6 +38,28 @@ var ErrExternalBuildPlane = errors.New("the build plane is external: this daemon
 // a player's retry costs less than a retry loop holding its launch workers.
 var ErrNoWorkers = errors.New("no workers are registered")
 
+// ManagerOption tells NewManager what the process it is being built for is,
+// as against what the environment it is being built in says. What a binary
+// is, no variable should be able to contradict.
+type ManagerOption func(*Manager)
+
+// AsBuildPlane marks a manager as a build plane that serves nothing, which
+// is what cork-build is: it builds and pushes, and it never takes a tag back
+// out of the challenge registry.
+//
+// The registry is shared and write-once, and deciding a tag is spent means
+// knowing every row that still names its content. A build plane cannot know.
+// Its database is bookkeeping -- thrown away and re-derived at will, and
+// carrying only what this build plane itself built -- while the builds it no
+// longer names are still being served by an orchestrator that was handed
+// them. Left to decide for itself it would untag, on a dropped seed or a
+// changed flag format, images a running event still pulls. Retiring them is
+// the orchestrator's to do, whose own schema converge releases those same
+// builds against the database that does know what references them.
+func AsBuildPlane() ManagerOption {
+	return func(m *Manager) { m.retiresRegistryTags = false }
+}
+
 // initBuildPlane reads BUILD_PLANE_ENV, an empty value counting as unset. It
 // runs before anything that reads the challenge tree, the pin file or
 // DOCKER_HOST, since on an external build plane none of them apply.

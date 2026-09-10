@@ -106,6 +106,13 @@ type Manager struct {
 	// daemon, which then has no local daemon at all (see buildplane.go).
 	// False, the zero value, is the local build plane there always was.
 	externalBuildPlane bool
+	// retiresRegistryTags lets this process take a tag back out of the
+	// challenge registry once no row it can see names that content any more
+	// (destroyImages, pruneReplacedImages). True for an orchestrator, whose
+	// database is the record of what the fleet is serving; false for a build
+	// plane, whose database is bookkeeping and knows only what it built
+	// (see AsBuildPlane).
+	retiresRegistryTags bool
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
 	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run
