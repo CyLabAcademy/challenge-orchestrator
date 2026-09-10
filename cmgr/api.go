@@ -789,6 +789,9 @@ func (m *Manager) DeleteSchema(name string) error {
 
 func (m *Manager) cleanupSchemaResources(name string) error {
 	instances, err := m.removedSchemaInstances(name)
+	if err != nil {
+		return err
+	}
 	for _, id := range instances {
 		iMeta, err := m.lookupInstanceMetadata(id)
 		if err != nil {
@@ -802,6 +805,9 @@ func (m *Manager) cleanupSchemaResources(name string) error {
 	}
 
 	builds, err := m.removedSchemaBuilds(name)
+	if err != nil {
+		return err
+	}
 	for _, id := range builds {
 		err = m.destroyImages(id)
 		if err != nil {
