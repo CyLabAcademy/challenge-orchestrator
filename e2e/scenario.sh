@@ -230,6 +230,7 @@ ORPHAN_WORKER=""      # worker ip holding the planted orphan
 ORPHAN_NET=""         # its cmgr-<id> network
 ORPHAN_CID=""         # the container holding that network open
 FRESH_CMGRD=""        # pid of the throwaway cmgrd of the fresh-box step
+HO_CMGRD=""           # pid of the throwaway cmgrd of the hand-over step
 EDITED_META=""        # a challenge metadata file a step edited under CMGR_DIR
 ORPHAN_TAG=""         # a content tag an update deliberately orphaned, which cork never reclaims
 STOPPED_REGISTRY=""   # outer container id of the registry this run stopped
@@ -289,6 +290,7 @@ cleanup() {
     worker_status "$ORPHAN_WORKER" "/networks/$ORPHAN_NET" -X DELETE >/dev/null 2>&1 || true
   fi
   if [[ -n "$FRESH_CMGRD" ]]; then kill "$FRESH_CMGRD" >/dev/null 2>&1 || true; fi
+  if [[ -n "$HO_CMGRD" ]]; then kill "$HO_CMGRD" >/dev/null 2>&1 || true; fi
   # The stand-in holds the registry's own network alias, so it lets go first;
   # the probe build is destroyed last, so its registry untag has a registry to
   # talk to. t=1 because the stand-in's entrypoint is a pipeline and bash
@@ -1236,6 +1238,160 @@ for ip in "${WORKER_IPS[@]}"; do
   fi
 done
 ok "all instance images were pushed"
+
+# ---------------------- 5a. hand-over to an external build plane
+
+if (( FULL )); then
+  step "hand-over: a cmgrd on an external build plane records what this fleet built, checked against zot, and refuses what it cannot check"
+  # PUT /challenges/<id> is how a build reaches a daemon that does not build
+  # (cmgr/handover.go): the GET /state element of the challenge, in the part
+  # hand_over with the pin fingerprint the builds were made under, then one
+  # part artifacts.<i> per build that publishes an archive. The daemon
+  # recomputes every build's identity from those inputs and asks zot for
+  # every image tag before it records anything. The throwaway daemon here
+  # is the fresh-box step's external-plane shape again: zot's client
+  # material is this container's certs.d mount, and no worker is registered,
+  # so nothing it records can be launched -- asserted below as the 500 slim
+  # mode answers with no worker.
+  # Placed before the base image pins step on purpose: until then the fleet
+  # builds with no pins, so the hand-overs state pin fingerprint 0.
+  [[ "$(api GET /pins | jq -r '.pins | length')" == 0 ]] ||
+    fail "the fleet already pins base images: the hand-overs below state pin fingerprint 0 and would be refused"
+  HO=$(mktemp -d)
+  CMGR_BUILD_PLANE=external \
+  CMGR_REGISTRY="$E2E_REGISTRY" \
+  CMGR_ARTIFACT_DIR="$HO/artifacts" \
+  CMGR_DB="$HO/db/cmgr.db" \
+    cmgrd --port 4294 >"$HO/cmgrd.log" 2>&1 &
+  HO_CMGRD=$! # the EXIT trap kills it if anything below fails
+  HO_SERVER=http://127.0.0.1:4294
+  retry 30 "the hand-over cmgrd to answer on :4294" fresh_answers "$HO_CMGRD" 4294 "$HO/cmgrd.log" "the throwaway cmgrd taking the hand-over"
+  # hand_over <challenge> <json file> [archive]: PUT the hand-over, print the
+  # status, leave the body in $HO/body. Its own curl: the one multipart
+  # request in this scenario, and one that must fail in seconds here.
+  hand_over() {
+    local parts=(-F "hand_over=<$2;type=application/json")
+    if [[ -n "${3:-}" ]]; then parts+=(-F "artifacts.0=@$3;type=application/gzip"); fi
+    curl -sS -o "$HO/body" -w '%{http_code}' --connect-timeout 5 --max-time 120 \
+      -X PUT "${parts[@]}" "$HO_SERVER/challenges/$1"
+  }
+  ho_api() { curl -sS --fail-with-body --connect-timeout 5 --max-time 30 -X "$1" "$HO_SERVER$2"; }
+  ho_status() {
+    curl -sS -o "$HO/body" -w '%{http_code}' --connect-timeout 5 --max-time 30 \
+      -X "$1" -H 'Content-Type: application/json' ${3:+-d "$3"} "$HO_SERVER$2"
+  }
+  # The payload is the fleet daemon's own state element for the challenge,
+  # its instances dropped (they are the fleet's): what a builder with a
+  # scratch database produces is the same shape.
+  element() { api GET /state | jq --arg id "$1" '.[] | select(.id == $id) | del(.builds[].instances)'; }
+  payload() { jq -n --argjson challenge "$(element "$1")" '{challenge: $challenge, pin_fingerprint: 0}'; }
+
+  payload "$CH_MAKE" >"$HO/make.json"
+  [[ "$(artifact_get "$MK_BUILD" artifacts.tar.gz "$HO/make.tar.gz")" == 200 ]] ||
+    fail "could not download the archive of build $MK_BUILD from the fleet daemon"
+  code=$(hand_over "$CH_MAKE" "$HO/make.json" "$HO/make.tar.gz")
+  [[ "$code" == 200 ]] ||
+    fail "the hand-over of $CH_MAKE answered $code, want 200: $(tr '\n' ' ' <"$HO/body" | tail -c 400)"
+  [[ "$(jq -r '.added[0]' "$HO/body")" == "$CH_MAKE" ]] ||
+    fail "the hand-over of $CH_MAKE was not reported as added: $(cat "$HO/body")"
+  HO_MK_BUILD=$(jq -r '.challenge.builds[0].id' "$HO/body")
+  [[ "$HO_MK_BUILD" =~ ^[0-9]+$ ]] ||
+    fail "the hand-over answered no build id: $(cat "$HO/body")"
+  handed=$(ho_api GET "/builds/$HO_MK_BUILD") ||
+    fail "GET /builds/$HO_MK_BUILD failed on the hand-over daemon"
+  fleet=$(api GET "/builds/$MK_BUILD")
+  for field in flag checksum source_checksum has_artifacts seed format schema instance_count lookup_data; do
+    [[ "$(jq -c ".$field" <<<"$handed")" == "$(jq -c ".$field" <<<"$fleet")" ]] ||
+      fail "the recorded build differs from the fleet's in $field: $(jq -c . <<<"$handed") vs $(jq -c . <<<"$fleet")"
+  done
+  [[ "$(jq -c '[.images[] | {host, exposed_ports}]' <<<"$handed")" == "$(jq -c '[.images[] | {host, exposed_ports}]' <<<"$fleet")" ]] ||
+    fail "the recorded build's images differ from the fleet's: $(jq -c .images <<<"$handed")"
+  code=$(curl -sS -o "$HO/served.tar.gz" -w '%{http_code}' --connect-timeout 5 --max-time 60 "$HO_SERVER/builds/$HO_MK_BUILD/artifacts.tar.gz")
+  [[ "$code" == 200 ]] ||
+    fail "the hand-over daemon does not serve the archive it was handed (GET /builds/$HO_MK_BUILD/artifacts.tar.gz: $code)"
+  [[ "$(art_members "$HO/served.tar.gz")" == "$(art_members "$HO/make.tar.gz")" ]] ||
+    fail "the archive served is not the one handed over: $(art_members "$HO/served.tar.gz") vs $(art_members "$HO/make.tar.gz")"
+  note "$CH_MAKE recorded as build $HO_MK_BUILD, its archive served"
+
+  # The same hand-over again: unmodified, the same row.
+  code=$(hand_over "$CH_MAKE" "$HO/make.json" "$HO/make.tar.gz")
+  [[ "$code" == 200 && "$(jq -r '.unmodified[0]' "$HO/body")" == "$CH_MAKE" && "$(jq -r '.challenge.builds[0].id' "$HO/body")" == "$HO_MK_BUILD" ]] ||
+    fail "the same hand-over again answered $code / $(cat "$HO/body"), want 200, unmodified, build $HO_MK_BUILD"
+
+  # Refused for what it says: a content checksum its inputs do not give.
+  jq '.challenge.builds[0].checksum += 1' "$HO/make.json" >"$HO/forged.json"
+  code=$(hand_over "$CH_MAKE" "$HO/forged.json" "$HO/make.tar.gz")
+  [[ "$code" == 400 ]] ||
+    fail "a hand-over with a forged content checksum answered $code, want 400: $(cat "$HO/body")"
+  grep -q "content checksum" "$HO/body" ||
+    fail "the refusal of the forged checksum does not say why: $(cat "$HO/body")"
+  # Refused for what zot says: a seed nobody built has no tag there.
+  jq '.challenge.builds[0].seed = 99' "$HO/make.json" >"$HO/unbuilt.json"
+  code=$(hand_over "$CH_MAKE" "$HO/unbuilt.json" "$HO/make.tar.gz")
+  [[ "$code" == 409 ]] ||
+    fail "a hand-over naming a tag zot does not serve answered $code, want 409: $(cat "$HO/body")"
+  grep -q "s99-.*not in the registry" "$HO/body" ||
+    fail "the refusal does not name the missing tag: $(cat "$HO/body")"
+  [[ "$(ho_api GET /state | jq --arg id "$CH_MAKE" '.[] | select(.id == $id) | .builds | length')" == 1 ]] ||
+    fail "a refused hand-over left a build behind: $(ho_api GET /state | jq -c .)"
+
+  # A flag-only challenge: no archive part at all.
+  payload "$CH_FLAGONLY" >"$HO/flag.json"
+  code=$(hand_over "$CH_FLAGONLY" "$HO/flag.json")
+  [[ "$code" == 200 && "$(jq -r '.added[0]' "$HO/body")" == "$CH_FLAGONLY" ]] ||
+    fail "the hand-over of $CH_FLAGONLY answered $code: $(cat "$HO/body")"
+  HO_FLAG_BUILD=$(jq -r '.challenge.builds[0].id' "$HO/body")
+  [[ "$(ho_api GET "/builds/$HO_FLAG_BUILD" | jq -r .flag)" == "$(api GET "/builds/$(build_id "$CH_FLAGONLY")" | jq -r .flag)" ]] ||
+    fail "the flag-only build was recorded with another flag"
+
+  # With both handed over, the converge the fresh-box step saw refused goes
+  # through: nothing is built, the rows follow the schema.
+  cat >"$HO/schema.yaml" <<EOF
+name: $SCHEMA_NAME
+flag_format: $(jq -r .format <<<"$fleet")
+challenges:
+  $CH_MAKE:
+    seeds: [$(jq -r .seed <<<"$fleet")]
+    instance_count: -1
+  $CH_FLAGONLY:
+    seeds: [$(ho_api GET "/builds/$HO_FLAG_BUILD" | jq -r .seed)]
+    instance_count: -1
+EOF
+  out=$(timeout 60 cmgrd-cli --server "$HO_SERVER" update-schema "$HO/schema.yaml" 2>&1) ||
+    fail "update-schema on the hand-over daemon failed although every build it names was handed over: $out"
+  has_line "$SCHEMA_NAME" cmgrd-cli --server "$HO_SERVER" list-schemas ||
+    fail "the hand-over daemon does not list $SCHEMA_NAME after update-schema"
+  # A launch: placement is reached and, with no worker registered, refused
+  # as slim mode refuses it, never run locally.
+  code=$(ho_status POST "/builds/$HO_MK_BUILD" '{"user_id":"e2e"}')
+  [[ "$code" == 500 ]] && grep -q "no workers are registered" "$HO/body" ||
+    fail "a launch on the hand-over daemon, with no worker, answered $code: $(cat "$HO/body")"
+
+  # A challenge with builds on record cannot be removed; one handed over
+  # with metadata alone can.
+  code=$(ho_status DELETE "/challenges/$CH_MAKE")
+  [[ "$code" == 409 ]] ||
+    fail "removing $CH_MAKE with a build on record answered $code, want 409: $(cat "$HO/body")"
+  payload "$CH_ONDEMAND" | jq '.challenge.builds = []' >"$HO/od-meta.json"
+  code=$(hand_over "$CH_ONDEMAND" "$HO/od-meta.json")
+  [[ "$code" == 200 && "$(jq -r '.added[0]' "$HO/body")" == "$CH_ONDEMAND" ]] ||
+    fail "a hand-over of metadata alone answered $code: $(cat "$HO/body")"
+  code=$(ho_status DELETE "/challenges/$CH_ONDEMAND")
+  [[ "$code" == 204 ]] ||
+    fail "removing $CH_ONDEMAND, which has no build on record, answered $code: $(cat "$HO/body")"
+  [[ "$(ho_status GET "/challenges/$CH_ONDEMAND")" == 404 ]] ||
+    fail "$CH_ONDEMAND is still on the hand-over daemon after DELETE"
+
+  # The daemon goes without removing its schema: its untags are registry-only
+  # (it has no docker daemon), and the tags it would untag are this fleet's.
+  kill "$HO_CMGRD" >/dev/null 2>&1 || true
+  wait "$HO_CMGRD" 2>/dev/null || true
+  HO_CMGRD=""
+  rm -rf "$HO"
+  ok "a cmgrd on an external build plane recorded $CH_MAKE (archive included) and $CH_FLAGONLY as this fleet built them, answered unmodified to the same hand-over again, 400 to a forged content checksum and 409 to a tag zot does not serve with nothing written, converged the schema over what it was handed, refused a launch with no worker, and removed a challenge without builds but not one with"
+else
+  deselect "hand-over to an external build plane"
+fi
 
 # ------------------------------- 5b. purge after push
 
