@@ -775,6 +775,14 @@ func (m *Manager) workerDownCh(worker string) <-chan struct{} {
 // the stop path's short-circuit before this is reached.
 func (m *Manager) instanceClient(instance *InstanceMetadata) (*client.Client, error) {
 	if instance.Worker == "" {
+		if m.externalBuildPlane {
+			// Never placed by this daemon (newInstance refuses the launch)
+			// and refused at startup (checkExternalBuildPlane); only a
+			// record written by someone else since that check gets here.
+			err := fmt.Errorf("instance %d was placed on the local daemon, which an external build plane has none of", instance.Id)
+			m.log.error(err)
+			return nil, err
+		}
 		return m.cli, nil
 	}
 	m.workersMu.RLock()

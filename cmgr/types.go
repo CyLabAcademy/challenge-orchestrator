@@ -96,6 +96,10 @@ type Manager struct {
 	pruneAge      time.Duration
 	localQueue    *daemonQueue // slots of the local daemon (instances with no worker)
 	policy        managerPolicy
+	// externalBuildPlane: images are built elsewhere and handed to this
+	// daemon, which then has no local daemon at all (see buildplane.go).
+	// False, the zero value, is the local build plane there always was.
+	externalBuildPlane bool
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
 	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run

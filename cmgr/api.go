@@ -38,6 +38,12 @@ func NewManager(logLevel LogLevel) *Manager {
 		return nil
 	}
 
+	// Before the directories, the pins and docker: on an external build
+	// plane each of those skips what only a local one reads.
+	if err := mgr.initBuildPlane(); err != nil {
+		return nil
+	}
+
 	mgr.workerTiming = mgr.workerTimingFromEnv()
 
 	if err := mgr.setDirectories(); err != nil {
@@ -53,6 +59,10 @@ func NewManager(logLevel LogLevel) *Manager {
 	}
 
 	if err := mgr.initDatabase(); err != nil {
+		return nil
+	}
+
+	if err := mgr.checkExternalBuildPlane(); err != nil {
 		return nil
 	}
 
@@ -89,11 +99,18 @@ func NewManager(logLevel LogLevel) *Manager {
 // making any other API calls for affected challenges.  Failure to follow this
 // guidance could result in inconsistencies in deployed challenges.
 func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
+	cu := new(ChallengeUpdates)
+
+	// No tree to scan: drift is detected where the tree is, on the build
+	// plane, and this daemon learns of a change when the build arrives.
+	if m.externalBuildPlane {
+		cu.Errors = []error{ErrExternalBuildPlane}
+		return cu
+	}
+
 	if fp == "" {
 		fp = m.chalDir
 	}
-
-	cu := new(ChallengeUpdates)
 
 	fp, err := m.normalizeDirPath(fp)
 	if err != nil {
@@ -210,6 +227,12 @@ func (m *Manager) Update(fp string) *ChallengeUpdates {
 // UpdateWithOptions is identical to Update but takes explicit options; Update
 // is equivalent to calling this with the zero-value UpdateOptions.
 func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *ChallengeUpdates {
+	// Refused before the lock: a schema operation waiting behind it would
+	// otherwise queue on a request that can do nothing.
+	if m.externalBuildPlane {
+		return &ChallengeUpdates{Errors: []error{ErrExternalBuildPlane}}
+	}
+
 	// One rebuild at a time. Two of them would work over the same instances:
 	// each tearing down what the other just started, reassigning the same
 	// ports twice, and taking the network the other had just created for a
@@ -254,6 +277,9 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 // See cacheRefsFor and BUILDER.md. (This replaced a per-challenge "freeze"
 // image, which is gone.)
 func (m *Manager) Build(challenge ChallengeId, seeds []int, flagFormat string) ([]*BuildMetadata, error) {
+	if m.externalBuildPlane {
+		return nil, ErrExternalBuildPlane
+	}
 	schema := fmt.Sprintf("%s%x", manualSchemaPrefix, m.rand.Int63())
 	instanceCount := -1
 
@@ -324,13 +350,19 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string, l
 
 	// Placement (cmgrd only): pick a worker before the instance row is
 	// created so the worker is recorded with it. With no workers configured
-	// selectWorker returns "" and the instance runs on the local daemon.
+	// selectWorker returns "" and the instance runs on the local daemon --
+	// on a local build plane. An external one has no local daemon, so a
+	// launch with nowhere to go is refused here, before anything is
+	// recorded, as a failure of the fleet rather than a retryable one.
 	if m.placementEnabled {
 		worker, err := m.selectWorker()
 		if err != nil {
 			return 0, err
 		}
 		iMeta.Worker = worker
+	}
+	if iMeta.Worker == "" && m.externalBuildPlane {
+		return 0, ErrNoWorkers
 	}
 
 	// Refuse at once what would only be refused after the wait (admit).
@@ -416,14 +448,35 @@ func (m *Manager) Stop(instance InstanceId) error {
 	return m.stopInstance(iMeta)
 }
 
+// unreachable reports an instance no daemon of this process can reach: one
+// on a down (or purged) worker, or one placed on the local daemon, which an
+// external build plane does not have. Both are stopped by clearing records
+// alone (stopInstance); instanceClient refuses the latter outright.
+func (m *Manager) unreachable(instance *InstanceMetadata) bool {
+	if instance.Worker == "" {
+		return m.externalBuildPlane
+	}
+	return m.workerIsDown(instance.Worker)
+}
+
+// whereUnreachable says why an instance is out of reach, for the log.
+func (m *Manager) whereUnreachable(instance *InstanceMetadata) string {
+	if instance.Worker == "" {
+		return "placed on the local daemon, which an external build plane has none of"
+	}
+	return fmt.Sprintf("worker %s down", instance.Worker)
+}
+
 func (m *Manager) stopInstance(instance *InstanceMetadata) error {
-	// A down (or purged) worker cannot be reached: clear our records and
-	// report success so callers (the platform's stop/restart/TTL flows) are
-	// never wedged behind a dead box. Any containers actually left running
-	// are removed if the box rejoins placement (reconcileWorker, on
-	// worker-add and at startup); until then they are docker-reaper's.
-	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
-		m.log.warnf("worker %s down: clearing instance %d records without docker teardown", instance.Worker, instance.Id)
+	// A daemon that cannot be reached -- a down (or purged) worker, or the
+	// local daemon an external build plane does not have: clear our records
+	// and report success so callers (the platform's stop/restart/TTL flows,
+	// a schema delete, a prune) are never wedged behind it. Any containers
+	// actually left running on a worker are removed if the box rejoins
+	// placement (reconcileWorker, on worker-add and at startup); until then
+	// they are docker-reaper's.
+	if m.unreachable(instance) {
+		m.log.warnf("%s: clearing instance %d records without docker teardown", m.whereUnreachable(instance), instance.Id)
 		return m.removeInstanceMetadata(instance.Id)
 	}
 
@@ -433,7 +486,7 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 		// the worker went down while it waited for its slot: finish the way a
 		// stop on a down worker does, so the caller gets its success now
 		// rather than from a second attempt.
-		if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+		if m.unreachable(instance) {
 			m.log.warnf("worker %s went down during the stop of instance %d: clearing its records without further docker teardown", instance.Worker, instance.Id)
 			return m.removeInstanceMetadata(instance.Id)
 		}

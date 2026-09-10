@@ -226,6 +226,16 @@ func (b *basePins) replace(m map[string]string) {
 // initBasePins resolves the pin file's location and loads it if present. A
 // missing file is not an error: pinning is opt-in.
 func (m *Manager) initBasePins() error {
+	if m.externalBuildPlane {
+		// Pins are applied as build contexts are made, which happens on the
+		// build plane; their fingerprint reaches this daemon inside each
+		// build's content checksum. With m.basePins nil the fingerprint
+		// computed here is 0, which only ever stamps the placeholder of a
+		// row nobody has built yet (openBuild) -- and a converge drops such
+		// a row (requireIngestedBuilds).
+		m.noteIgnoredSetting(BASE_PINS_ENV)
+		return nil
+	}
 	path, isSet := os.LookupEnv(BASE_PINS_ENV)
 	if !isSet {
 		path = filepath.Join(m.chalDir, ".base-pins.json")
@@ -456,6 +466,9 @@ type BasePin struct {
 
 // ListBasePins reports the current pins alongside how many challenges use each.
 func (m *Manager) ListBasePins() ([]BasePin, error) {
+	if m.externalBuildPlane {
+		return nil, ErrExternalBuildPlane
+	}
 	if m.basePins == nil {
 		return []BasePin{}, nil
 	}
@@ -589,6 +602,9 @@ func (m *Manager) basePinsRefreshBudget(n int) time.Duration {
 //
 // Existing pins are re-resolved too, so a refresh is how a base is moved.
 func (m *Manager) RefreshBasePins() ([]BasePin, error) {
+	if m.externalBuildPlane {
+		return nil, ErrExternalBuildPlane
+	}
 	if m.basePins == nil {
 		return nil, fmt.Errorf("base pinning is not configured")
 	}
