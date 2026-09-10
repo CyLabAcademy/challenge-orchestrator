@@ -4,6 +4,14 @@ Notes for whoever operates or changes cork's image build path. Everything here
 concerns the **orchestrator** host: the one machine that runs `cmgrd`, builds
 images and pushes them to the registry. Workers only pull.
 
+That machine can also be told not to build at all. `CMGR_BUILD_PLANE=external`
+starts `cmgrd` with no docker daemon and no challenge tree: everything in this
+document then happens wherever the images are built before they are handed
+over (issue #18), `update`, manual builds and the pins commands answer 409, a
+schema converge only checks that every build it wants has already arrived,
+and a launch with no worker registered fails instead of running locally. The
+default, `local`, is the daemon this document describes.
+
 ## What the build path does now
 
 cork asks the Docker API for **BuildKit** explicitly (`version=2`) on every
