@@ -86,6 +86,52 @@ paths:
             items:
               type: integer
               format: int64
+    put:
+      tags: [challenges]
+      consumes: ["multipart/form-data"]
+      produces: ["application/json"]
+      summary: "Hands the challenge and its builds over from an external build plane"
+      description: "How a build reaches a cmgrd on an external build plane (CMGR_BUILD_PLANE=external): the challenge as the build plane scanned it and each build as the build there left it, the images already pushed to the registry and the artifact archives in the request. Every build's content checksum is recomputed from the payload's inputs (its source checksum, the flag format, the pin fingerprint and this daemon's template for the challenge type), every image tag is looked up in the registry, and every archive is taken and validated, all before anything is recorded. The challenge is then persisted under the verdict an update would give it, each build's row is found or opened by its (schema, format, seed), and the build is committed as a rebuild is: the instances of the generation it replaces are restarted or relaunched. A build whose row already serves the generation delivered is left as it is, instances included, so the same hand-over twice changes nothing. A cmgrd on a local build plane refuses the hand-over."
+      parameters:
+        - in: "formData"
+          name: "hand_over"
+          description: "The JSON HandOver: the challenge in the GET /state element shape with the builds handed over, and the pin fingerprint they were made under. Must be the first part."
+          required: true
+          type: string
+        - in: "formData"
+          name: "artifacts.<i>"
+          description: "The artifact archive (gzip tar, as GET /builds/{build_id}/artifacts.tar.gz serves it) of the build at index i of the hand-over's builds: one part per build that declares has_artifacts, following hand_over in build order."
+          required: false
+          type: file
+        - in: "query"
+          name: "prune_old"
+          description: "With `true`, the image generation each rebuilt build displaces from rollback retention is untagged in the registry (update's --prune-old)."
+          required: false
+          type: boolean
+      responses:
+        "400":
+          description: "The hand-over contradicts itself or its inputs (not multipart, hand_over missing or malformed, a build of another challenge or source generation, a content checksum its inputs do not give, an image for a host the challenge does not name), or an archive it declares is missing, malformed, oversized or empty; nothing was recorded"
+        "409":
+          description: "An image tag the hand-over names is not in the registry (nothing was recorded), or this cmgrd is on a local build plane and builds for itself"
+        "500":
+          description: "The registry or the database could not be asked (nothing was recorded), or a build could not be committed once the writes had begun: the body is the HandOverResponse, its errors naming each such build, dropped or left at its previous generation as after a failed rebuild"
+        "200":
+          description: "The verdict, as POST /update reports one, with the challenge as recorded"
+          schema:
+            $ref: "#/definitions/HandOverResponse"
+    delete:
+      tags: [challenges]
+      summary: "Removes a challenge that has no builds"
+      description: "The counterpart of the hand-over, for a challenge the build plane no longer has. Refused while builds of it are on record: those go with their schema (DELETE /schemas/{name}) or with DELETE /builds/{build_id}. A cmgrd on a local build plane accepts it too, but there its tree decides: the next update finds the challenge again unless it is gone from the tree as well."
+      responses:
+        "404":
+          description: "Invalid path string to include invalid challenge identifier"
+        "409":
+          description: "The challenge still has builds on record"
+        "500":
+          description: "A database error occurred in `cmgr`"
+        "204":
+          description: "Indicates successfully deleted"
   /builds/{build_id}:
     parameters:
       - name: "build_id"
@@ -484,6 +530,50 @@ definitions:
         items:
           type: integer
           format: int32
+  HandOver:
+    type: object
+    description: "What PUT /challenges/{challenge_id} carries. The challenge is the GET /state element shape, its builds being the builds handed over: seed, format, schema and instance_count as the schema names them on the build plane, flag, lookup_data, images with their exposed_ports, has_artifacts, and checksum and source_checksum as stamped there. Build ids, instances, last_solved and prev_checksum are the receiving daemon's own and are ignored."
+    properties:
+      challenge:
+        $ref: "#/definitions/ChallengeMetadata"
+      pin_fingerprint:
+        type: integer
+        format: int32
+        description: "The base image pin fingerprint the builds were made under; 0 without pins"
+  HandOverResponse:
+    type: object
+    description: "POST /update's response shape, with the challenge as recorded (its builds carrying this daemon's ids)"
+    properties:
+      added:
+        type: array
+        items:
+          type: string
+      refreshed:
+        type: array
+        items:
+          type: string
+      updated:
+        type: array
+        items:
+          type: string
+      stale:
+        type: array
+        items:
+          type: string
+      removed:
+        type: array
+        items:
+          type: string
+      unmodified:
+        type: array
+        items:
+          type: string
+      errors:
+        type: array
+        items:
+          type: string
+      challenge:
+        $ref: "#/definitions/ChallengeMetadata"
   SchemaDefinition:
     type: object
     properties:
