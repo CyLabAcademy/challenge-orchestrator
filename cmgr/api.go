@@ -638,6 +638,18 @@ func (m *Manager) UpdateSchema(schema *Schema) []error {
 }
 
 func (m *Manager) convergeSchema(schema *Schema) []error {
+	// On an external build plane nothing is built here, so every build the
+	// schema wants must already have been handed over. Checked before
+	// anything is locked or torn down: a schema whose builds have not
+	// arrived is refused whole, with the running state untouched, rather
+	// than after cleanupSchemaResources has released the builds it
+	// displaces and openBuild has written placeholder rows for the rest.
+	if m.externalBuildPlane {
+		if errs := m.requireHandedOver(schema); len(errs) > 0 {
+			return errs
+		}
+	}
+
 	// Mark existing state as locked/outdated
 	err := m.lockSchema(schema.Name)
 	if err != nil {

@@ -230,9 +230,11 @@ func (m *Manager) initBasePins() error {
 		// Pins are applied as build contexts are made, which happens on the
 		// build plane; their fingerprint reaches this daemon inside each
 		// build's content checksum. With m.basePins nil the fingerprint
-		// computed here is 0, which only ever stamps the placeholder of a
-		// row nobody has built yet (openBuild) -- and a converge drops such
-		// a row (requireIngestedBuilds).
+		// computed here is 0, and nothing persists it: openBuild would
+		// stamp it on the row it inserts for a build nobody has handed
+		// over, and a converge on this plane never gets that far
+		// (requireHandedOver refuses first), while a row that exists keeps
+		// the checksum it was handed over with.
 		m.noteIgnoredSetting(BASE_PINS_ENV)
 		return nil
 	}

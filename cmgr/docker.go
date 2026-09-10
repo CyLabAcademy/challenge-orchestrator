@@ -364,37 +364,32 @@ func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 
 // requireIngestedBuilds is generateBuilds on an external build plane: there
 // is no tree to detect drift in and nothing to build, both being the build
-// plane's. Every wanted build must already have been handed over; one that
-// has not is named and its row dropped, exactly as a build that failed here
-// would be, so a schema never carries a build with no images behind it.
+// plane's. convergeSchema has required every build the schema names to be
+// handed over before it locked anything (requireHandedOver) and holds
+// updateMu while it converges, so what reaches here is on record; a build
+// without a hand-over is the same refusal again, as the safety net under
+// the lock. Of what a local converge would still say, one thing needs no
+// tree: a build produced from an earlier source generation, whose rebuild
+// is the build plane's to hand over.
 func (m *Manager) requireIngestedBuilds(builds []*BuildMetadata) error {
 	challenge := builds[0].Challenge
-	seeds := []string{}
+	missing := []int{}
 	for _, build := range builds {
-		if build.Flag != "" {
-			continue
-		}
-		seeds = append(seeds, strconv.Itoa(build.Seed))
-		if build.Id != 0 {
-			m.removeBuildMetadata(build.Id)
+		if build.Flag == "" {
+			missing = append(missing, build.Seed)
 		}
 	}
-	if len(seeds) == 0 {
-		// Nothing to build. Of what a local converge would still say
-		// here, one thing needs no tree: a build produced from an earlier
-		// source generation, whose rebuild is the build plane's to hand
-		// over.
-		if stale, err := m.challengeHasStaleBuild(challenge); err != nil {
-			m.log.warnf("could not check whether the builds of '%s' are current: %s", challenge, err)
-		} else if stale {
-			m.log.warnf("a build of '%s' was produced from an earlier source generation; hand over a rebuild", challenge)
-		}
-		return nil
+	if len(missing) > 0 {
+		err := missingHandOverError(challenge, builds[0].Schema, builds[0].Format, missing)
+		m.log.error(err)
+		return err
 	}
-	err := fmt.Errorf("no build of '%s' for schema '%s' (format '%s', seed %s) has been ingested: %w",
-		challenge, builds[0].Schema, builds[0].Format, strings.Join(seeds, ", "), ErrExternalBuildPlane)
-	m.log.error(err)
-	return err
+	if stale, err := m.challengeHasStaleBuild(challenge); err != nil {
+		m.log.warnf("could not check whether the builds of '%s' are current: %s", challenge, err)
+	} else if stale {
+		m.log.warnf("a build of '%s' was produced from an earlier source generation; hand over a rebuild", challenge)
+	}
+	return nil
 }
 
 type dockerError struct {
