@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/picoCTF/cmgr/cmgr/dockerfiles"
+	"github.com/CyLabAcademy/challenge-orchestrator/cmgr/dockerfiles"
 )
 
 const manualSchemaPrefix = "manual-"

@@ -10,6 +10,6 @@ if [[ "${1:-}" == "--full" ]]; then
   export E2E_FULL=1
   shift
 fi
-export CORK_VERSION="${CORK_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo e2e)}"
+export CORK_VERSION="${CORK_VERSION:-$(sh ../ci/version.sh)}"
 docker compose up -d --build
 docker compose run --rm e2e

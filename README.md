@@ -55,7 +55,7 @@ Both CA private keys (`docker-ca-key.pem`, `zot-ca-key.pem`) stay offline and ar
 
 ### Orchestrator
 
-1. Install cork on the server by cloning this repository and building using `go build -v -o bin ./...` in the challenge-orchestrator directory
+1. Install cork on the server by cloning this repository and building using `go build -v -ldflags "$(sh ci/version.sh --ldflags)" -o bin ./...` in the challenge-orchestrator directory
 2. Install docker on the server. Required to build images. https://docs.docker.com/engine/install/ubuntu/
 3. Install docker-reaper onto the server. This prevents stale containers and unused images from accumulating. https://github.com/picoCTF/docker-reaper. If you don't mind the orchestrator's local docker daemon, which is only used for building, being filled with build artifacts, then this can step can be skipped.
 4. Configure cork's environment variables
@@ -476,11 +476,11 @@ _cgo_ enabled for at least the initial build where the _sqlite3_ driver is
 built and installed.  To get started, you can run:
 
 ```sh
-git clone https://github.com/picoCTF/cmgr
-cd cmgr
+git clone https://github.com/CyLabAcademy/challenge-orchestrator
+cd challenge-orchestrator
 go get -v -t -d ./...
 mkdir bin
-go build -v -o bin ./...
+go build -v -ldflags "$(sh ci/version.sh --ldflags)" -o bin ./...
 go test -v ./...
 ```
 

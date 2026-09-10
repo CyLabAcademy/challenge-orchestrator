@@ -15,7 +15,8 @@ const (
 const serverEnv = "CMGRD_SERVER"
 const defaultServer = "http://127.0.0.1:4200"
 
-// Set at build time via -ldflags "-X main.version=$(git describe --tags)".
+// Set at build time from ci/version.sh, which is the single definition of the
+// version and stamps this variable and the daemon's together.
 var version string
 
 func clientVersion() string {

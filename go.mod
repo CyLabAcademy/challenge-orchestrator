@@ -1,4 +1,4 @@
-module github.com/picoCTF/cmgr
+module github.com/CyLabAcademy/challenge-orchestrator
 
 go 1.26.0
 
