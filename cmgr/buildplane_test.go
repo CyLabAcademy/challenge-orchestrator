@@ -222,14 +222,31 @@ func writeSelfSignedCerts(t *testing.T, caName, certName, keyName string) string
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
+	cert := pemCert(der)
+	return writeCertDir(t, map[string][]byte{caName: cert, certName: cert, keyName: pemKey(t, key)})
+}
+
+// pemCert and pemKey encode a certificate and its EC key the way certs.d
+// holds them and the registry client (newRegistryHTTPClient) reads them.
+func pemCert(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func pemKey(t *testing.T, key *ecdsa.PrivateKey) []byte {
+	t.Helper()
+	der, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+}
+
+// writeCertDir lays the files out under a temporary directory, as certs.d
+// would, and returns it.
+func writeCertDir(t *testing.T, files map[string][]byte) string {
+	t.Helper()
 	dir := t.TempDir()
-	for name, data := range map[string][]byte{caName: certPEM, certName: certPEM, keyName: keyPEM} {
+	for name, data := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
 			t.Fatal(err)
 		}

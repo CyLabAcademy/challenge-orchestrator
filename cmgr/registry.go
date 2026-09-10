@@ -63,6 +63,58 @@ func manifestUnknown(err error) bool {
 	return false
 }
 
+// registryTagPresent asks the registry itself whether imageName's tag names
+// a manifest, over the daemon's own client (registryHTTPClient) rather than
+// the local docker daemon registryTagExists goes through: it is the
+// question a daemon with no docker daemon asks before it records a build
+// someone else pushed (issue #18). 200 is present and 404 absent; anything
+// else, a registry that cannot be reached included, is an error, since
+// recording a build on a guess is what the check exists to prevent.
+func (m *Manager) registryTagPresent(imageName string) (bool, error) {
+	code, status, err := m.registryManifestStatus(http.MethodHead, imageName)
+	if err != nil {
+		return false, err
+	}
+
+	switch code {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("registry lookup of %s returned %s", imageName, status)
+	}
+}
+
+// registryManifestStatus makes one distribution API call against the
+// manifest imageName's tag names, over the daemon's own client, and
+// answers with the status the registry gave: the exchange a HEAD
+// (registryTagPresent) and a DELETE (registryDeleteTag) share. The Accept
+// header names every manifest type a push can leave behind, so a registry
+// that filters by it does not answer 404 for a manifest it holds.
+func (m *Manager) registryManifestStatus(method, imageName string) (int, string, error) {
+	httpClient, err := m.registryHTTPClient()
+	if err != nil {
+		return 0, "", err
+	}
+	req, err := m.registryManifestRequest(method, imageName)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Accept", strings.Join([]string{
+		"application/vnd.oci.image.manifest.v1+json",
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+	}, ", "))
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	resp.Body.Close()
+	return resp.StatusCode, resp.Status, nil
+}
+
 // registryHTTPClient is an HTTP client trusting and authenticating with the
 // same TLS material dockerd uses for the challenge registry: ca.crt /
 // client.cert / client.key under /etc/docker/certs.d/<host> (overridable via
@@ -167,30 +219,21 @@ func (m *Manager) registryManifestRequest(method, imageName string) (*http.Reque
 // Best-effort by contract: callers treat any error as "tag leaked in the
 // registry" (recoverable) and must not fail the surrounding operation.
 func (m *Manager) registryDeleteTag(imageName string) error {
-	httpClient, err := m.registryHTTPClient()
+	code, status, err := m.registryManifestStatus(http.MethodDelete, imageName)
 	if err != nil {
 		return err
 	}
-	req, err := m.registryManifestRequest(http.MethodDelete, imageName)
-	if err != nil {
-		return err
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
 
-	switch {
-	case resp.StatusCode == http.StatusAccepted:
+	switch code {
+	case http.StatusAccepted:
 		return nil
-	case resp.StatusCode == http.StatusNotFound:
+	case http.StatusNotFound:
 		// Already gone — e.g. a shared tuple pruned via another row, or a
 		// tag that was never pushed (builder images). Not an error.
 		return nil
-	case resp.StatusCode == http.StatusMethodNotAllowed:
+	case http.StatusMethodNotAllowed:
 		return fmt.Errorf("registry %s does not accept tag deletes (405); tag %s leaked", m.challengeRegistry, imageName)
 	default:
-		return fmt.Errorf("registry delete of %s returned %s", imageName, resp.Status)
+		return fmt.Errorf("registry delete of %s returned %s", imageName, status)
 	}
 }
