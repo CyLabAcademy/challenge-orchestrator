@@ -45,7 +45,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	artifact_dir, _ = os.LookupEnv(cmgr.ARTIFACT_DIR_ENV)
+	artifact_dir, _ = cmgr.LookupEnv(cmgr.ARTIFACT_DIR_ENV)
 	if artifact_dir == "" {
 		artifact_dir = "."
 	}
@@ -88,45 +88,50 @@ Usage: %s [<options>]
   --version  display version information and exit
 
 Relevant environment variables:
-  CMGR_DB - path to cmgr's database file (defaults to 'cmgr.db')
+  Each of these also answers to the CMGR_ name it had before the rename
+  (CMGR_DB for CORK_DB, and so on), read only when the CORK_ name is unset.
+  The daemon lists the CMGR_ names it finds at startup; they go away two
+  minor releases after the rename.
 
-  CMGR_DIR - directory containing all challenges (defaults to '.')
+  CORK_DB - path to cmgr's database file (defaults to 'cmgr.db')
 
-  CMGR_ARTIFACT_DIR - directory for storing artifact bundles (defaults to '.')
+  CORK_DIR - directory containing all challenges (defaults to '.')
 
-  CMGR_MAX_ARTIFACT_FILES - maximum number of entries permitted in a
+  CORK_ARTIFACT_DIR - directory for storing artifact bundles (defaults to '.')
+
+  CORK_MAX_ARTIFACT_FILES - maximum number of entries permitted in a
       challenge's artifact archive (defaults to 10000)
 
-  CMGR_MAX_ARTIFACT_BYTES - maximum total uncompressed size of a challenge's
+  CORK_MAX_ARTIFACT_BYTES - maximum total uncompressed size of a challenge's
       artifact archive (defaults to '5g')
 
-  CMGR_MAX_ARTIFACT_FILE_BYTES - maximum uncompressed size of any single file
+  CORK_MAX_ARTIFACT_FILE_BYTES - maximum uncompressed size of any single file
       within a challenge's artifact archive (defaults to '1g')
 
-  CMGR_LOGGING - controls the verbosity of the internal logging infrastructure
+  CORK_LOGGING - controls the verbosity of the internal logging infrastructure
       and should be one of the following: debug, info, warn, error, or disabled
       (defaults to 'info')
 
-  CMGR_PORTS - the range of ports that are dedicated for serving challenges;
+  CORK_PORTS - the range of ports that are dedicated for serving challenges;
       cmgr will assume that it fully owns these ports and nothing else will
       try to use them (i.e., not in ephemeral range or overlapping with a
       service running on the host); format is '1000-1000'
 
-  CMGR_INTERFACE - the host interface/address to which published challenge
+  CORK_INTERFACE - the host interface/address to which published challenge
       ports should be bound (defaults to '0.0.0.0'); if the specified interface
       does not exist on the host running the Docker daemon, Docker will silently
       ignore this value and instead bind to the loopback address
 
-  CMGR_PRUNE_AGE - the maximum age for on-demand challenge instances; old
+  CORK_PRUNE_AGE - the maximum age for on-demand challenge instances; old
       instances are automatically pruned from the database (defaults to '1h');
       set to '0' to disable automatic pruning.
-  CMGR_DB_WAL - controls whether SQLite WAL journaling mode is enabled;
+  CORK_DB_WAL - controls whether SQLite WAL journaling mode is enabled;
       on by default for improved throughput under high concurrency;
       creates <db>-wal and <db>-shm sidecar files; do NOT use on network-mounted
       filesystems (NFS, SMB) as this may cause corruption; set to 'false'
       to disable.
 
-  CMGR_CONCURRENT_LAUNCHES - launch slots per docker daemon (defaults to 2;
+  CORK_CONCURRENT_LAUNCHES - launch slots per docker daemon (defaults to 2;
       1 to 16). A slot covers an instance's network creation and container
       starts, which dockerd serializes internally on either firewall
       backend: 2 measured as the optimum on iptables, and nftables showed no
@@ -136,36 +141,36 @@ Relevant environment variables:
       in cmgrd instead of inside dockerd, which it used to make slow, then
       unresponsive.
 
-  CMGR_WORKER_POLL_INTERVAL, CMGR_WORKER_POLL_TIMEOUT, CMGR_WORKER_MAX_MISSES -
+  CORK_WORKER_POLL_INTERVAL, CORK_WORKER_POLL_TIMEOUT, CORK_WORKER_MAX_MISSES -
       how often each worker's telemetry agent is polled (defaults to '500ms'),
       the per-poll timeout (defaults to '250ms'; clamped to half the interval
       when not under it)
       and how many consecutive failed polls mark the worker down (defaults to
       60, i.e. 30s of silence); down is sticky until the next worker-add.
 
-  CMGR_WORKER_CONTROL_TIMEOUT - ceiling for one container or network call to
+  CORK_WORKER_CONTROL_TIMEOUT - ceiling for one container or network call to
       a worker's docker daemon (defaults to '30s'); a call that hits it marks
       the worker down.
 
-  CMGR_WORKER_PULL_TIMEOUT - ceiling for one image pull before a launch
+  CORK_WORKER_PULL_TIMEOUT - ceiling for one image pull before a launch
       (defaults to '30s'); a pull that hits it fails that launch as
       retryable (503) but does not mark the worker down. It is also the
       ceiling for a restart's pull whenever it is set above the five minutes
       those get by default.
 
-  CMGR_WORKER_LAUNCH_WAIT - how long a launch waits for a launch slot on its
+  CORK_WORKER_LAUNCH_WAIT - how long a launch waits for a launch slot on its
       daemon (defaults to '10s'); past that it fails as retryable (503 with
       Retry-After) instead of queueing behind a saturated daemon. A launch
       that would evidently wait longer, judging by the launches already
       waiting there and the daemon's recent pace, is refused the same way at
       once, before anything is recorded.
 
-  CMGR_REGISTRY - the docker registry holding built challenge images; when
+  CORK_REGISTRY - the docker registry holding built challenge images; when
       set, images are pulled from it before each instance start (must match
       the value used by cmgr when building).
 
-  CMGR_BASE_PINS - path to a JSON map of base image reference to digest,
-      defaulting to <CMGR_DIR>/.base-pins.json; absent or empty disables
+  CORK_BASE_PINS - path to a JSON map of base image reference to digest,
+      defaulting to <CORK_DIR>/.base-pins.json; absent or empty disables
       pinning. When set, cmgrd rewrites a FROM name:tag instruction to the
       equivalent digest reference as it builds each build context, so the
       builder never re-resolves a mutable tag against the registry and a base
@@ -192,7 +197,7 @@ Workers:
   'academy-docker-worker' (the shared worker certificate), dockerd on port
   2376, and the telemetry agent on port 2136.
 
-  A worker goes down (sticky) after CMGR_WORKER_MAX_MISSES failed telemetry
+  A worker goes down (sticky) after CORK_WORKER_MAX_MISSES failed telemetry
   polls (30s of silence by default), a single hung/refused docker control
   call, or a PATCH of {"health": "down"}. Recovery is the operator's call:
   re-add it (POST /workers or cmgrd-cli worker-add) once the box is rebooted
@@ -220,7 +225,7 @@ Workers:
 
   Under load a launch fails fast rather than queueing: it is refused at once
   when the launches already waiting on its worker would keep it waiting
-  longer than CMGR_WORKER_LAUNCH_WAIT, waits at most that long otherwise, and
+  longer than CORK_WORKER_LAUNCH_WAIT, waits at most that long otherwise, and
   is refused as soon as its worker goes down; all three answer 503 with
   Retry-After so the platform's retry is placed afresh. A stop whose worker
   hangs mid-way clears the
@@ -231,7 +236,7 @@ Workers:
 
   The restart of a persistent instance during an update is exempt, since
   nothing retries it: it pulls the new image under a ceiling of five minutes,
-  or CMGR_WORKER_PULL_TIMEOUT when that is longer,
+  or CORK_WORKER_PULL_TIMEOUT when that is longer,
   while the old containers keep serving, then swaps them, waiting for its
   slot as long as it takes. One that cannot be restarted (its worker down,
   the pull or the start failed) is removed instead, like any stop on a down
@@ -416,6 +421,8 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			err = nil
+			// The CMGR_ prefix here is the challenge contract (what a container
+			// sees), not a daemon setting, so the rename leaves it alone.
 			if req.Env != nil {
 				for k, v := range req.Env {
 					envVars["CMGR_"+k] = v
@@ -697,7 +704,7 @@ func (s state) updateHandler(w http.ResponseWriter, r *http.Request) {
 
 	path := req.Path
 	if path == "" {
-		path = os.Getenv(cmgr.DIR_ENV)
+		path = cmgr.Getenv(cmgr.DIR_ENV)
 		if path == "" {
 			path = "."
 		}

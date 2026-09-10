@@ -30,7 +30,7 @@ import (
 // the build context, so challenge Dockerfiles keep their readable tags and
 // several hundred of them need no edit.
 //
-// The map lives in a JSON file (CMGR_BASE_PINS, default <CMGR_DIR>/.base-pins.json):
+// The map lives in a JSON file (CORK_BASE_PINS, default <CORK_DIR>/.base-pins.json):
 //
 //	{"ubuntu:24.04": "sha256:...", "nginx:mainline": "sha256:..."}
 //
@@ -51,7 +51,7 @@ import (
 // whole fleet onto a new base needs a rebuild of the whole fleet, which cork
 // has no single command for today. See BUILDER.md.
 
-const BASE_PINS_ENV = "CMGR_BASE_PINS"
+const BASE_PINS_ENV = "CORK_BASE_PINS"
 
 // fromLineRe splits a FROM instruction into its prefix, any flags such as
 // --platform=, the image reference, and whatever follows (typically `AS name`).
@@ -226,7 +226,7 @@ func (b *basePins) replace(m map[string]string) {
 // initBasePins resolves the pin file's location and loads it if present. A
 // missing file is not an error: pinning is opt-in.
 func (m *Manager) initBasePins() error {
-	path, isSet := os.LookupEnv(BASE_PINS_ENV)
+	path, isSet := LookupEnv(BASE_PINS_ENV)
 	if !isSet {
 		path = filepath.Join(m.chalDir, ".base-pins.json")
 	}
@@ -249,7 +249,7 @@ func (m *Manager) initBasePins() error {
 		// Said out loud. An empty map is indistinguishable at a glance from a
 		// working one, and it means every build resolves a mutable tag -- the
 		// exposure pinning exists to remove -- while also fingerprinting
-		// differently from a pinned deployment. A typo in CMGR_BASE_PINS or a
+		// differently from a pinned deployment. A typo in CORK_BASE_PINS or a
 		// `git clean -xdf` over the default dotfile both land here.
 		m.log.warnf("no base image pins loaded from %s: builds will resolve mutable tags against the registry", m.basePins.path)
 	}
@@ -565,7 +565,7 @@ func externalBaseRefs(dockerfile []byte) map[string]bool {
 //
 // Derived from controlTimeout rather than being its own setting, so the one
 // knob an operator already has for "this registry is slow"
-// (CMGR_WORKER_CONTROL_TIMEOUT) moves both. It allows an average of a fifth of
+// (CORK_WORKER_CONTROL_TIMEOUT) moves both. It allows an average of a fifth of
 // a per-call timeout per reference, with a floor of two full timeouts so a
 // tiny corpus still gets room for one straggler. At the defaults that is about
 // four minutes for a corpus of thirty-odd bases, against a measured normal

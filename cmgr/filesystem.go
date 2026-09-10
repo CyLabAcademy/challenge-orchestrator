@@ -14,12 +14,12 @@ import (
 	"strings"
 )
 
-// Reads the environment variable CMGR_CHALLENGE_DIR and then normalizes it
+// Reads the challenge directory setting (CORK_DIR) and then normalizes it
 // to an absolute path and validates that it is a directory.
 func (m *Manager) setDirectories() error {
 	var err error
 
-	chalDir, isSet := os.LookupEnv(DIR_ENV)
+	chalDir, isSet := LookupEnv(DIR_ENV)
 	if !isSet {
 		chalDir = "."
 	}
@@ -44,7 +44,7 @@ func (m *Manager) setDirectories() error {
 		return errors.New(m.chalDir + " is not a directory")
 	}
 
-	artifactsDir, isSet := os.LookupEnv(ARTIFACT_DIR_ENV)
+	artifactsDir, isSet := LookupEnv(ARTIFACT_DIR_ENV)
 	if !isSet {
 		artifactsDir = "."
 	}

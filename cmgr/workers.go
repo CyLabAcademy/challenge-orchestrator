@@ -30,7 +30,7 @@ const (
 	workerDockerPort    = 2376
 	workerTelemetryPort = 2136
 
-	// minPollInterval floors CMGR_WORKER_POLL_INTERVAL. The per-poll timeout
+	// minPollInterval floors CORK_WORKER_POLL_INTERVAL. The per-poll timeout
 	// is derived from the interval when it does not fit under it, and a
 	// timeout of zero would mean no timeout at all (http.Client), so an
 	// interval too small to leave room for one is refused rather than
@@ -77,7 +77,7 @@ var defaultWorkerTiming = workerTiming{
 	launchWait:     10 * time.Second,
 }
 
-// workerTimingFromEnv returns defaultWorkerTiming with the CMGR_WORKER_*
+// workerTimingFromEnv returns defaultWorkerTiming with the CORK_WORKER_*
 // overrides applied. A value that does not parse (or is not positive) is
 // logged and ignored; the poll interval has a floor (minPollInterval) and a
 // poll timeout that does not fit inside it is clamped to half of it, so no
@@ -89,7 +89,7 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 	m.envDuration(WORKER_CONTROL_TIMEOUT_ENV, &t.controlTimeout)
 	m.envDuration(WORKER_PULL_TIMEOUT_ENV, &t.pullTimeout)
 	m.envDuration(WORKER_LAUNCH_WAIT_ENV, &t.launchWait)
-	if s, ok := os.LookupEnv(WORKER_MAX_MISSES_ENV); ok {
+	if s, ok := LookupEnv(WORKER_MAX_MISSES_ENV); ok {
 		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
 			t.maxMisses = n
 		} else {
@@ -115,7 +115,7 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 // envDuration overrides *d from the named variable when it holds a positive
 // duration; anything else is logged and leaves *d alone.
 func (m *Manager) envDuration(name string, d *time.Duration) {
-	s, ok := os.LookupEnv(name)
+	s, ok := LookupEnv(name)
 	if !ok {
 		return
 	}
@@ -789,7 +789,7 @@ func (m *Manager) instanceClient(instance *InstanceMetadata) (*client.Client, er
 }
 
 // daemonQueue holds one daemon's slots: launches (see launch.go) and
-// teardowns, as many of each as CMGR_CONCURRENT_LAUNCHES. Teardowns have
+// teardowns, as many of each as CORK_CONCURRENT_LAUNCHES. Teardowns have
 // slots of their own so that a deluge of stops queues here, bounded, rather
 // than inside dockerd, which serializes the network side of each removal:
 // left to queue there, a mass stop made the daemon slow, then unresponsive,

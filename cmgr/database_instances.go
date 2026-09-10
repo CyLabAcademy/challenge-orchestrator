@@ -99,12 +99,12 @@ func (m *Manager) claimPort(instance InstanceId, worker string, name string, por
 // restarted in place (the rebuild path). stopContainers releases the previous
 // assignments along with the container records, and startContainers takes
 // the host port from instance.Ports; without a fresh reservation a restart
-// with CMGR_PORTS set would hand docker port 0, land on an ephemeral port
+// with CORK_PORTS set would hand docker port 0, land on an ephemeral port
 // outside the range, and record no port at all (finalizeInstance persists
 // read-back ports only when no range is configured). Each port first tries
 // the number it had, so players keep the address they were given, and falls
 // back to a new reservation if a concurrent launch took it or the old number
-// lies outside the current range (an instance from before CMGR_PORTS was
+// lies outside the current range (an instance from before CORK_PORTS was
 // set). No-op without a port range: docker assigns the ports and the
 // read-back records them.
 //

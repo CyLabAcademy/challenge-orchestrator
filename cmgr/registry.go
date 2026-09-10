@@ -19,7 +19,7 @@ import (
 // wedged registry.
 const registryRequestTimeout = 30 * time.Second
 
-// registryEndpoint splits CMGR_REGISTRY into the host dockerd dials and the
+// registryEndpoint splits CORK_REGISTRY into the host dockerd dials and the
 // path prefix under it, if any. A namespaced registry (host:5000/ctf) keeps
 // its distribution API at https://host:5000/v2/ with "ctf" as the leading
 // segment of every repository name -- and dockerd keys certs.d by the host
@@ -66,7 +66,7 @@ func manifestUnknown(err error) bool {
 // registryHTTPClient is an HTTP client trusting and authenticating with the
 // same TLS material dockerd uses for the challenge registry: ca.crt /
 // client.cert / client.key under /etc/docker/certs.d/<host> (overridable via
-// CMGR_REGISTRY_CERT_DIR). Needed only for what the daemon cannot do -- a
+// CORK_REGISTRY_CERT_DIR). Needed only for what the daemon cannot do -- a
 // tag delete -- and best-effort by contract there. Built once and shared,
 // but only a client that was built successfully is kept: material that was
 // missing or unreadable when first asked for is read again next time, so a
@@ -86,7 +86,7 @@ func (m *Manager) registryHTTPClient() (*http.Client, error) {
 }
 
 func (m *Manager) newRegistryHTTPClient() (*http.Client, error) {
-	certDir := os.Getenv(REGISTRY_CERT_DIR_ENV)
+	certDir := Getenv(REGISTRY_CERT_DIR_ENV)
 	if certDir == "" {
 		host, _ := m.registryEndpoint()
 		certDir = filepath.Join("/etc/docker/certs.d", host)
@@ -126,7 +126,7 @@ func (m *Manager) newRegistryHTTPClient() (*http.Client, error) {
 // https://<host>/v2/<prefix/><repo>/manifests/<tag>. imageName must be the
 // registry-qualified reference the fork uses everywhere (see
 // instanceImageName). The registry's credentials, when configured (the
-// CMGR_REGISTRY_USER/TOKEN pair dockerd is handed for pushes and pulls), go
+// CORK_REGISTRY_USER/TOKEN pair dockerd is handed for pushes and pulls), go
 // along as basic auth; the mTLS client identity is on the transport.
 func (m *Manager) registryManifestRequest(method, imageName string) (*http.Request, error) {
 	repoAndTag, ok := strings.CutPrefix(imageName, m.challengeRegistry+"/")
