@@ -416,3 +416,23 @@ func (m *Manager) staleChallengeSet() (map[ChallengeId]bool, error) {
 	}
 	return stale, nil
 }
+
+// storedGeneration is the retention pair a build row holds: the content
+// checksum of the generation it serves and that generation's rollback
+// target. A row opened but never finalized serves no generation, whatever
+// checksum openBuild stamped on it for the reference checks, and answers
+// zeros: nothing to retain, nothing to displace.
+func (m *Manager) storedGeneration(id BuildId) (checksum, prev uint32, err error) {
+	var row struct {
+		Flag         string `db:"flag"`
+		Checksum     uint32 `db:"checksum"`
+		PrevChecksum uint32 `db:"prevchecksum"`
+	}
+	if err := m.db.Get(&row, "SELECT flag, checksum, prevchecksum FROM builds WHERE id = ?;", id); err != nil {
+		return 0, 0, err
+	}
+	if row.Flag == "" {
+		return 0, 0, nil
+	}
+	return row.Checksum, row.PrevChecksum, nil
+}
