@@ -816,7 +816,7 @@ ok "cmgrd $(api GET /version | jq -r .version), zot, builder, and $NWORKERS work
 # ------------------------------- 1b. a fresh box makes its own directories
 
 if (( FULL )); then
-  step "fresh-box startup: cmgrd creates its artifact and database directories itself, and still refuses a missing challenge directory"
+  step "fresh-box startup: cmgrd creates its artifact and database directories itself, still refuses a missing challenge directory, and comes up without one on an external build plane"
   # The promise is about a box that has nothing on it yet: ansible drops the
   # unit file and the challenge tree, and cmgrd makes CMGR_ARTIFACT_DIR and
   # the directory holding CMGR_DB itself (MkdirAll in cmgr/filesystem.go
@@ -850,16 +850,18 @@ if (( FULL )); then
   DOCKER_HOST="$fresh_docker" \
     cmgrd --port 4299 >"$fresh/cmgrd.log" 2>&1 &
   FRESH_CMGRD=$! # from here the EXIT trap kills it if anything below fails
-  fresh_answers() {
+  fresh_answers() { # fresh_answers <pid> <port> <log> <which daemon>
     # Fail on a daemon that died rather than spend the whole retry budget on
     # a port nothing will ever answer on, and say why it died. NewManager
     # returns nil on any startup failure and cmgrd log.Fatals on that
     # (cmd/cmgrd/main.go:52-54), so a dead process here is the assertion.
-    kill -0 "$FRESH_CMGRD" 2>/dev/null ||
-      fail "the throwaway cmgrd exited instead of starting on a fresh box: $(tr '\n' ' ' <"$fresh/cmgrd.log" | tail -c 400)"
-    quiet curl -sSf --max-time 3 http://127.0.0.1:4299/version
+    # Its own short curl rather than the api helper: that one carries the
+    # fleet's ten-minute ceiling, and a probe has to give up in seconds.
+    kill -0 "$1" 2>/dev/null ||
+      fail "$4 exited instead of starting: $(tr '\n' ' ' <"$3" | tail -c 400)"
+    quiet curl -sSf --max-time 3 "http://127.0.0.1:$2/version"
   }
-  retry 30 "the throwaway cmgrd to answer on :4299" fresh_answers
+  retry 30 "the throwaway cmgrd to answer on :4299" fresh_answers "$FRESH_CMGRD" 4299 "$fresh/cmgrd.log" "the throwaway cmgrd on a fresh box"
   # Answering at all already means both directories were made. These two say
   # which one, and that the database really opened in a directory sqlite
   # would not have created.
@@ -898,8 +900,77 @@ if (( FULL )); then
   # "challenge directory" would pass whatever it exited on.
   grep -q "could not stat the challenge directory" "$fresh/refused.log" ||
     fail "cmgrd exited $rc for some reason other than the missing challenge directory: $(tr '\n' ' ' <"$fresh/refused.log" | tail -c 400)"
+  # A third daemon, on an external build plane (CMGR_BUILD_PLANE=external,
+  # cmgr/buildplane.go): no DOCKER_HOST -- the e2e service has none -- and
+  # the same missing CMGR_DIR that just refused a local start, this time to
+  # be named and ignored rather than obeyed. It must come up, say what it is
+  # on /version, still make its artifacts directory (it serves the bundles,
+  # whoever built them), serve an empty /state, and answer 409 to everything
+  # that would need a tree or a builder: the update and its dry run, a
+  # manual build, and the pins. None of those reaches the registry it names
+  # (that is what the 409s assert), so the fleet's zot is safe to name; its
+  # client material is this container's own certs.d mount, which the daemon
+  # now insists on at startup (below).
+  CMGR_BUILD_PLANE=external \
+  CMGR_DIR="$fresh/nope" \
+  CMGR_REGISTRY="$E2E_REGISTRY" \
+  CMGR_ARTIFACT_DIR="$fresh/a3" \
+  CMGR_DB="$fresh/d3/cmgr.db" \
+    cmgrd --port 4297 >"$fresh/external.log" 2>&1 &
+  FRESH_CMGRD=$!
+  retry 30 "the external-build-plane cmgrd to answer on :4297" fresh_answers "$FRESH_CMGRD" 4297 "$fresh/external.log" "the throwaway cmgrd on an external build plane"
+  # Explicit curls with their own short ceilings, not the api helpers: those
+  # carry the fleet's ten-minute ceiling for updates and converges, and a
+  # throwaway daemon that wedges must fail this step in seconds.
+  EXT_SERVER=http://127.0.0.1:4297
+  plane=$(curl -sS --max-time 5 "$EXT_SERVER/version" | jq -r .build_plane) ||
+    fail "GET /version failed on the external-build-plane daemon"
+  [[ "$plane" == external ]] ||
+    fail "GET /version reports build_plane '$plane' on a daemon started with CMGR_BUILD_PLANE=external"
+  grep -q "CMGR_DIR is set but ignored" "$fresh/external.log" ||
+    fail "an external build plane did not say it ignores CMGR_DIR: $(tr '\n' ' ' <"$fresh/external.log" | tail -c 400)"
+  [[ -d "$fresh/a3" ]] ||
+    fail "an external build plane did not create CMGR_ARTIFACT_DIR: it still serves the bundles, whoever built them"
+  for req in "POST|/update|" "POST|/update|{\"dry_run\":true}" \
+             "POST|/challenges/cmgr/examples/custom-socat|{\"seeds\":[1]}" "GET|/pins|" "POST|/pins|"; do
+    IFS='|' read -r method path body <<<"$req"
+    code=$(curl -sS -o "$fresh/refused.body" -w '%{http_code}' --connect-timeout 5 --max-time 30 \
+      -X "$method" -H 'Content-Type: application/json' ${body:+-d "$body"} "$EXT_SERVER$path")
+    [[ "$code" == 409 ]] ||
+      fail "$method $path answered $code on an external build plane, want 409: $(tr '\n' ' ' <"$fresh/refused.body" | tail -c 300)"
+    grep -q "build plane is external" "$fresh/refused.body" ||
+      fail "$method $path answered 409 without saying why: $(cat "$fresh/refused.body")"
+  done
+  state=$(curl -sS --max-time 5 "$EXT_SERVER/state") ||
+    fail "GET /state failed on the external-build-plane daemon"
+  [[ "$state" == "[]" ]] ||
+    fail "GET /state on the empty external-build-plane daemon returned: $state"
+  kill "$FRESH_CMGRD" >/dev/null 2>&1 || true
+  wait "$FRESH_CMGRD" 2>/dev/null || true
+  FRESH_CMGRD=""
+  # refuses_to_start <what> <port> <log> <expected message>: a cmgrd started
+  # with the environment given on the call must exit by itself, saying why.
+  refuses_to_start() {
+    local what=$1 port=$2 log=$3 want=$4 rc=0
+    timeout 30 cmgrd --port "$port" >"$log" 2>&1 || rc=$?
+    (( rc != 0 )) || fail "cmgrd started $what"
+    grep -q "$want" "$log" ||
+      fail "cmgrd exited $rc $what, but for some other reason: $(tr '\n' ' ' <"$log" | tail -c 400)"
+  }
+  # Without a registry it must not start at all: the workers pull every
+  # image from the registry, and an external build plane has no other copy.
+  CMGR_BUILD_PLANE=external CMGR_ARTIFACT_DIR="$fresh/a4" CMGR_DB="$fresh/d4/cmgr.db" \
+    refuses_to_start "on an external build plane with no CMGR_REGISTRY (nothing could ever be launched from it)" \
+      4296 "$fresh/noregistry.log" "CMGR_REGISTRY is required on an external build plane"
+  # Nor with a registry it has no client material for: destroy and prune
+  # untag in the registry alone on this plane, and a client that fails per
+  # tag would only ever be a warning after the fact.
+  CMGR_BUILD_PLANE=external CMGR_REGISTRY="$E2E_REGISTRY" CMGR_REGISTRY_CERT_DIR="$fresh/nocerts" \
+  CMGR_ARTIFACT_DIR="$fresh/a5" CMGR_DB="$fresh/d5/cmgr.db" \
+    refuses_to_start "on an external build plane with no registry client material (every untag would fail silently)" \
+      4295 "$fresh/nocerts.log" "the registry client could not be built"
   rm -rf "$fresh"
-  ok "a cmgrd started on a fresh path created CMGR_ARTIFACT_DIR and its database directory itself and served /version; one pointed at a missing CMGR_DIR exited $rc in ${refuse_took}s and created neither"
+  ok "a cmgrd started on a fresh path created CMGR_ARTIFACT_DIR and its database directory itself and served /version; one pointed at a missing CMGR_DIR exited $rc in ${refuse_took}s and created neither; on an external build plane one came up with that same missing CMGR_DIR ignored, reported build_plane=external and answered 409 to update, dry run, build and pins, and neither one without a registry nor one without registry client material would start"
 else
   deselect "fresh-box startup directories"
 fi
