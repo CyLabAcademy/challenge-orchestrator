@@ -172,6 +172,20 @@ Relevant environment variables:
       only moves when the pins are refreshed (POST /pins). Challenge
       Dockerfiles are never modified on disk.
 
+  CMGR_BUILD_PLANE - where challenge images are built: 'local' (the default)
+      on the docker daemon DOCKER_HOST names, from the tree in CMGR_DIR; or
+      'external', where something else builds, pushes to CMGR_REGISTRY and
+      hands the finished builds to cmgrd. External means no local docker
+      daemon and no challenge tree at all: CMGR_DIR, CMGR_BASE_PINS,
+      DOCKER_HOST and CMGR_PURGE_AFTER_PUSH are ignored (each is named at
+      startup if set); CMGR_REGISTRY and the material to talk to it
+      (CMGR_REGISTRY_CERT_DIR, the registry being where destroy and prune
+      untag) are required, and a missing DOCKER_CERT_PATH is warned about;
+      POST /update, POST /challenges/<id> and GET/POST /pins answer 409; a
+      schema operation answers 409 naming any build that has not been
+      handed over; and a launch with no worker registered fails instead of
+      running locally.
+
 HTTP API:
   cmgrd owns all state; every action goes through its API (the cmgrd-cli
   binary is a thin wrapper around it). In addition to the challenge, build,
@@ -180,14 +194,15 @@ HTTP API:
   "prune_old": false} — prune_old removes image generations displaced from
   rollback retention, on the build daemon and in the registry),
   GET /state dumps the full challenge/build/instance state,
-  GET /version reports the server version, and GET/POST /pins list the
-  base image pins and re-resolve them.
+  GET /version reports the server version and its build plane, and GET/POST
+  /pins list the base image pins and re-resolve them.
 
 Workers:
   When docker workers are configured (GET/POST/PATCH/DELETE on /workers or
   cmgrd-cli worker-*), new instances are placed on them round robin,
   skipping overloaded and down workers; with none configured, cmgrd behaves
-  as a single-host daemon using DOCKER_HOST. Worker connections use the TLS
+  as a single-host daemon using DOCKER_HOST (on a local build plane; an
+  external one refuses the launch). Worker connections use the TLS
   material from DOCKER_CERT_PATH with the server name pinned to
   'academy-docker-worker' (the shared worker certificate), dockerd on port
   2376, and the telemetry agent on port 2136.
@@ -336,6 +351,9 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 			body, err = json.Marshal(meta)
 		}
 	case "POST":
+		if s.refuseOnExternalBuildPlane(w) {
+			return
+		}
 		var data []byte
 		var buildReq BuildChallengeRequest
 		data, err = ioutil.ReadAll(r.Body)
@@ -602,6 +620,7 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 
 	var body []byte
 	var err error
+	var errStatus int
 	respCode := http.StatusOK
 	switch r.Method {
 	case "GET":
@@ -627,7 +646,8 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 			} else {
 				errs := s.mgr.UpdateSchema(schemaDef)
 				if len(errs) > 0 {
-					err = fmt.Errorf("%v", errs)
+					err = errors.Join(errs...)
+					errStatus = schemaStatus(errs)
 				}
 			}
 		}
@@ -643,6 +663,9 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 		respCode = http.StatusInternalServerError
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
+		}
+		if errStatus != 0 {
+			respCode = errStatus
 		}
 		body = []byte(err.Error())
 	}
@@ -682,6 +705,9 @@ func challengeIds(metas []*cmgr.ChallengeMetadata) []cmgr.ChallengeId {
 func (s state) updateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.refuseOnExternalBuildPlane(w) {
 		return
 	}
 
@@ -758,13 +784,55 @@ func (s state) versionHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	body, _ := json.Marshal(map[string]string{"version": cmgr.Version()})
+	body, _ := json.Marshal(map[string]string{"version": cmgr.Version(), "build_plane": s.mgr.BuildPlane()})
 	w.Write(body)
+}
+
+// schemaStatus maps the errors a schema operation returns to one status:
+// 409 when every one is a build not yet handed over
+// (cmgr.ErrExternalBuildPlane), 404 when every one is an unknown
+// identifier, 500 otherwise. A list that mixes either with a real failure
+// is a failure, whatever else it holds: a 409 that hid a launch error would
+// read as "hand over and retry" when the retry could not help.
+func schemaStatus(errs []error) int {
+	status := 0
+	for _, err := range errs {
+		code := http.StatusInternalServerError
+		var unknown *cmgr.UnknownIdentifierError
+		switch {
+		case errors.Is(err, cmgr.ErrExternalBuildPlane):
+			code = http.StatusConflict
+		case errors.As(err, &unknown):
+			code = http.StatusNotFound
+		}
+		if code == http.StatusInternalServerError || (status != 0 && status != code) {
+			return http.StatusInternalServerError
+		}
+		status = code
+	}
+	if status == 0 {
+		return http.StatusInternalServerError
+	}
+	return status
+}
+
+// refuseOnExternalBuildPlane answers 409 to a request only a local build
+// plane can serve -- an update, a manual build, the pins -- and reports
+// whether it did. The request is well-formed; this daemon is just not the
+// one that builds (see cmgr.ErrExternalBuildPlane).
+func (s state) refuseOnExternalBuildPlane(w http.ResponseWriter) bool {
+	if s.mgr.BuildPlane() != cmgr.BuildPlaneExternal {
+		return false
+	}
+	w.WriteHeader(http.StatusConflict)
+	w.Write([]byte(cmgr.ErrExternalBuildPlane.Error()))
+	return true
 }
 
 func (s state) schemaHandler(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	var err error
+	var errStatus int
 	respCode := http.StatusOK
 	switch r.Method {
 	case "GET":
@@ -785,7 +853,8 @@ func (s state) schemaHandler(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			errs := s.mgr.CreateSchema(schemaDef)
 			if len(errs) > 0 {
-				err = fmt.Errorf("%v", errs)
+				err = errors.Join(errs...)
+				errStatus = schemaStatus(errs)
 			} else {
 				respCode = http.StatusCreated
 			}
@@ -799,6 +868,9 @@ func (s state) schemaHandler(w http.ResponseWriter, r *http.Request) {
 		respCode = http.StatusInternalServerError
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
+		}
+		if errStatus != 0 {
+			respCode = errStatus
 		}
 		body = []byte(err.Error())
 	}

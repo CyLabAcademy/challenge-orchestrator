@@ -25,8 +25,14 @@ func (s state) pinsHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	switch r.Method {
 	case "GET":
+		if s.refuseOnExternalBuildPlane(w) {
+			return
+		}
 		pins, err = s.mgr.ListBasePins()
 	case "POST":
+		if s.refuseOnExternalBuildPlane(w) {
+			return
+		}
 		pins, err = s.mgr.RefreshBasePins()
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
