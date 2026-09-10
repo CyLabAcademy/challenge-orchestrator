@@ -80,7 +80,11 @@ jobs:
           CGO_ENABLED=1 go build -v -ldflags "$LDFLAGS" -o bin ./...
           cp LICENSE bin/LICENSE
           cat NOTICE NOTICE.release > bin/NOTICE
-          cd bin && tar czvf cmgr.tar.gz cmgrd cmgrd-cli LICENSE NOTICE
+          # The pre-rename names ride along as symlinks so an installer or a
+          # script that still says cmgrd or cmgrd-cli keeps working. They go
+          # away two minor releases after the rename.
+          cd bin && ln -s corkd cmgrd && ln -s cork cmgrd-cli
+          tar czvf cork.tar.gz corkd cork cmgrd cmgrd-cli LICENSE NOTICE
 
       - name: Get OS/architecture suffix
         id: suffix
@@ -94,6 +98,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./bin/cmgr.tar.gz
+          asset_path: ./bin/cork.tar.gz
+          asset_name: cork_${{ steps.suffix.outputs.arch_suffix }}.tar.gz
+          asset_content_type: application/octet-stream
+
+      # The same tarball under the pre-rename asset name, for installers that
+      # still fetch it (the ansible cork role, until its default moves). Dropped
+      # together with the symlinks above.
+      - name: Upload Binaries (pre-rename asset name)
+        id: upload-binaries-legacy-name
+        uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./bin/cork.tar.gz
           asset_name: cmgr_${{ steps.suffix.outputs.arch_suffix }}.tar.gz
           asset_content_type: application/octet-stream
