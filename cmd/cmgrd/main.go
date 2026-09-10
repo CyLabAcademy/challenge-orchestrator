@@ -175,7 +175,8 @@ Relevant environment variables:
   CMGR_BUILD_PLANE - where challenge images are built: 'local' (the default)
       on the docker daemon DOCKER_HOST names, from the tree in CMGR_DIR; or
       'external', where something else builds, pushes to CMGR_REGISTRY and
-      hands the finished builds to cmgrd. External means no local docker
+      hands the finished builds to cmgrd (PUT /challenges/<id>, under HTTP
+      API below). External means no local docker
       daemon and no challenge tree at all: CMGR_DIR, CMGR_BASE_PINS,
       DOCKER_HOST and CMGR_PURGE_AFTER_PUSH are ignored (each is named at
       startup if set); CMGR_REGISTRY and the material to talk to it
@@ -194,8 +195,20 @@ HTTP API:
   "prune_old": false} — prune_old removes image generations displaced from
   rollback retention, on the build daemon and in the registry),
   GET /state dumps the full challenge/build/instance state,
-  GET /version reports the server version and its build plane, and GET/POST
-  /pins list the base image pins and re-resolve them.
+  GET /version reports the server version and its build plane, GET/POST
+  /pins list the base image pins and re-resolve them, and on an external
+  build plane PUT /challenges/<id> takes a challenge and its builds handed
+  over by whatever built them: the JSON {"challenge": <the GET /state
+  element>, "pin_fingerprint": <the pin fingerprint the builds were made
+  under, 0 without pins>}, and nothing else -- artifact bundles stay on the
+  build plane that made them, and has_artifacts says what a build published
+  rather than promising bytes. ?prune_old=true is update's --prune-old.
+  Every build's identity is recomputed from those
+  inputs and every image tag asked of the registry before anything is
+  recorded (400 for a payload that contradicts itself, 409 for a tag the
+  registry does not serve); the answer is update's, with the challenge as
+  recorded. DELETE /challenges/<id> removes a challenge with no builds on
+  record (409 while it has any: they go with their schema).
 
 Workers:
   When docker workers are configured (GET/POST/PATCH/DELETE on /workers or
@@ -373,6 +386,12 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			body, err = json.Marshal(builds)
 		}
+	case "PUT":
+		s.handOverHandler(w, r, challenge)
+		return
+	case "DELETE":
+		err = s.mgr.RemoveChallenge(challenge)
+		respCode = http.StatusNoContent
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -383,10 +402,87 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
 		}
+		if errors.Is(err, cmgr.ErrChallengeHasBuilds) {
+			respCode = http.StatusConflict
+		}
 		body = []byte(err.Error())
 	}
 
 	w.WriteHeader(respCode)
+	w.Write(body)
+}
+
+// HandOverResponse is what PUT /challenges/{id} answers: the verdict as
+// POST /update reports one, the challenge as recorded (its builds with
+// their ids), and the errors of builds that could not be committed once the
+// writes had begun, with which the status is 500 rather than 200.
+type HandOverResponse struct {
+	UpdateResponse
+	Challenge *cmgr.ChallengeMetadata `json:"challenge,omitempty"`
+}
+
+// handOverJSONLimit bounds the body of a hand-over, which is one challenge's
+// metadata and image tags: large for what it carries, and nowhere near what
+// a body would have to be to be something else.
+const handOverJSONLimit = 16 << 20
+
+// handOverHandler is PUT /challenges/{id}, the hand-over of a challenge and
+// its builds from an external build plane (cmgr.HandOverChallenge): a JSON
+// cmgr.HandOver body, and nothing else. Artifact bundles do not travel with
+// it -- they stay on the build plane that made them, where what publishes
+// them to players reads them -- so a hand-over is metadata and image tags,
+// and its size is bounded by handOverJSONLimit alone. ?prune_old=true is
+// update's --prune-old.
+func (s state) handOverHandler(w http.ResponseWriter, r *http.Request, challenge cmgr.ChallengeId) {
+	refuse := func(code int, msg string) {
+		w.WriteHeader(code)
+		w.Write([]byte(msg))
+	}
+	var handOver cmgr.HandOver
+	if err := json.NewDecoder(io.LimitReader(r.Body, handOverJSONLimit)).Decode(&handOver); err != nil {
+		refuse(http.StatusBadRequest, "invalid hand-over JSON: "+err.Error())
+		return
+	}
+	options := cmgr.UpdateOptions{PruneOldImages: r.URL.Query().Get("prune_old") == "true"}
+
+	updates, err := s.mgr.HandOverChallenge(challenge, &handOver, options)
+	if err != nil {
+		code := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, cmgr.ErrHandOverInvalid):
+			code = http.StatusBadRequest
+		case errors.Is(err, cmgr.ErrNotInRegistry), errors.Is(err, cmgr.ErrLocalBuildPlane):
+			code = http.StatusConflict
+		}
+		refuse(code, err.Error())
+		return
+	}
+
+	resp := HandOverResponse{UpdateResponse: UpdateResponse{
+		Added:      challengeIds(updates.Added),
+		Refreshed:  challengeIds(updates.Refreshed),
+		Updated:    challengeIds(updates.Updated),
+		Stale:      challengeIds(updates.Stale),
+		Removed:    challengeIds(updates.Removed),
+		Unmodified: challengeIds(updates.Unmodified),
+		Errors:     make([]string, len(updates.Errors)),
+	}}
+	for i, updateErr := range updates.Errors {
+		resp.Errors[i] = updateErr.Error()
+	}
+	for _, bucket := range [][]*cmgr.ChallengeMetadata{updates.Added, updates.Updated, updates.Refreshed, updates.Stale, updates.Unmodified} {
+		if len(bucket) > 0 {
+			resp.Challenge = bucket[0]
+		}
+	}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		refuse(http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(updates.Errors) > 0 {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
 	w.Write(body)
 }
 

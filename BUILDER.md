@@ -6,11 +6,21 @@ images and pushes them to the registry. Workers only pull.
 
 That machine can also be told not to build at all. `CMGR_BUILD_PLANE=external`
 starts `cmgrd` with no docker daemon and no challenge tree: everything in this
-document then happens wherever the images are built before they are handed
-over (issue #18), `update`, manual builds and the pins commands answer 409, a
-schema converge only checks that every build it wants has already arrived,
-and a launch with no worker registered fails instead of running locally. The
-default, `local`, is the daemon this document describes.
+document then happens wherever the images are built, and each build reaches
+the daemon through `PUT /challenges/<id>` (issue #18): the challenge as scanned
+there and its builds as left there, the images already in the registry and the
+artifact archives in the request, verified before anything is recorded (every
+build's content checksum recomputed from the inputs the payload names, every
+image tag looked up in the registry, every archive taken and validated). A
+build whose row already serves the generation handed over is not built over
+again: handing the same thing over twice leaves the images, the archive and the
+flag as they are, and converges only what runs them, since the `instance_count`
+the hand-over carries is the schema's and may have moved. `update`, manual
+builds and the pins commands answer 409, a schema converge only checks that
+every build it wants has already arrived, and a launch with no worker
+registered fails instead of running locally. `add-schema` has no successful
+path there, since the builds handed over are the schema: `update-schema` is
+the operation. The default, `local`, is the daemon this document describes.
 
 ## What the build path does now
 
