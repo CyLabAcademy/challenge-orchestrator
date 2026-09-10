@@ -1,7 +1,7 @@
 # cork end-to-end simulation
 
 A compose project that runs the whole cork fleet on one machine and drives
-the real launch sequence through it: `cmgrd` built from this checkout, the
+the real launch sequence through it: `corkd` built from this checkout, the
 docker daemon it builds on, a zot registry, and two docker workers with the
 telemetry agent, all wired with the PKI that `config-examples/gen-docker-certs.sh`
 mints. It replaces nothing: the `cmgr test` suite that CI used to run built
@@ -12,9 +12,9 @@ and no solvers.
 
 ```
                  docker compose run --rm e2e  (scenario.sh)
-                               │ cmgrd-cli / curl
+                               │ cork / curl
                                ▼
- host:4200 ──▶ cork (cmgrd) ── DOCKER_HOST ──▶ builder (dind, tcp 2375) ── push (CN=cmgr) ──▶ zot.internal:443 (mTLS)
+ host:4200 ──▶ cork (corkd) ── DOCKER_HOST ──▶ builder (dind, tcp 2375) ── push (CN=cmgr) ──▶ zot.internal:443 (mTLS)
                  │                                                                              ▲
                  │ mTLS :2376 (CN=cmgr, server name academy-docker-worker)                      │ pull (CN=worker)
                  │ telemetry :2136                                                              │
@@ -25,7 +25,7 @@ and no solvers.
 
 | compose service | production box | provisioned by |
 | --- | --- | --- |
-| `cork` | orchestrator: `cmgrd` + `cmgrd-cli` | ansible role `cork` |
+| `cork` | orchestrator: `corkd` + `cork` | ansible role `cork` |
 | `builder` | the orchestrator's local docker daemon (image builds, pushes) | ansible role `docker` |
 | `zot` | image registry | ansible role `zot` |
 | `worker-a`, `worker-b` | challenge workers: dockerd behind mTLS | ansible role `multihost_docker` |
@@ -88,22 +88,22 @@ pull, and health transition is logged there.
 
 ## What the scenario checks
 
-1. **Fleet up.** cmgrd, zot (with cork's client certificate), the builder, and
+1. **Fleet up.** corkd, zot (with cork's client certificate), the builder, and
    each worker's dockerd (with cork's certificate, pinned to the shared server
    name) and telemetry endpoint answer. Any `cmgr.managed` containers and
    `cmgr-*` networks a failed earlier run left on a worker are swept, as
    docker-reaper would; instance ids are reused after a schema removal, so
    leftovers would otherwise collide.
-2. **Worker registration.** `cmgrd-cli worker-add <ip> <public name>` for each
+2. **Worker registration.** `cork worker-add <ip> <public name>` for each
    worker; both reach health `ok` from telemetry polling and the public
    address is recorded.
-3. **Challenge scan.** `cmgrd-cli update` over the challenge volume (seeded
+3. **Challenge scan.** `cork update` over the challenge volume (seeded
    from `../examples`); the schema's challenges are listed.
-4. **Schema converge.** `cmgrd-cli add-schema schema.yaml` builds four
+4. **Schema converge.** `cork add-schema schema.yaml` builds four
    challenges on the builder daemon, pushes them to zot, and starts the one
    persistent instance. The flag-only challenge gets a flag and lookup data but
    no instance; the persistent instance sits on a worker, reports that worker's
-   public address and a port inside `CMGR_PORTS`, its container is on that
+   public address and a port inside `CORK_PORTS`, its container is on that
    worker's dockerd, and the service answers.
 5. **Registry.** Every build's instance image is in zot under its
    content-addressed tag (`s<seed>-<checksum>-<host>`), as read back with the
@@ -118,11 +118,11 @@ pull, and health transition is logged there.
    over TCP, then stops: container and network gone from the worker.
 8. **Stop path.** `DELETE /instances/<id>` removes the containers and network
    on the worker; a second delete is a 204.
-9. **cmgrd restart** (outer socket). cork is restarted; the workers come back
+9. **corkd restart** (outer socket). cork is restarted; the workers come back
    from the database and are polled to `ok`, existing instances are still
    known with their worker and still served, new launches work.
 10. **Update, generation 2.** The scenario edits the on-demand and the
-    persistent challenge's sources and runs `cmgrd-cli update --prune-old`.
+    persistent challenge's sources and runs `cork update --prune-old`.
     Both rebuild: the build keeps its id and flag, gets a new checksum with the
     old one as `prev_checksum`, and zot holds both the new tag and the
     generation-1 tag (the rollback target). All on-demand instances are torn
@@ -134,13 +134,13 @@ pull, and health transition is logged there.
     rollback target, generation 1 is deleted from
     zot, the generation-2 instance is torn down, and four fresh launches
     across both workers serve generation 3.
-12. **worker-down.** After `cmgrd-cli worker-down`, new launches avoid that
-    worker; stopping an instance that lives on it clears cmgrd's records but
+12. **worker-down.** After `cork worker-down`, new launches avoid that
+    worker; stopping an instance that lives on it clears corkd's records but
     leaves the container running on the worker (docker-reaper's job in
     production, so the scenario reaps it itself); `worker-add` brings the worker
     back.
 13. **Telemetry silence** (outer socket). The worker's telemetry sidecar is
-    stopped; cmgrd marks the worker down after 30 s while its instances keep
+    stopped; corkd marks the worker down after 30 s while its instances keep
     running, keeps it down when telemetry returns (down is sticky), and
     `worker-add` recovers it.
 14. **Overloaded** (outer socket). The sidecar is replaced by a responder that
@@ -157,7 +157,7 @@ pull, and health transition is logged there.
 17. **worker-remove.** The worker is purged: it disappears from the list, its
     instance records are gone, its containers are still running (reaped by the
     scenario), and it can be re-added clean.
-18. **Base image pins** (full mode). `cmgrd-cli pin-refresh` resolves every base
+18. **Base image pins** (full mode). `cork pin-refresh` resolves every base
     the corpus names to a digest — `ubuntu:24.04` to a `sha256:`, and
     `cmgr/examples-guestfish-base`, which the `disks` example builds locally and
     no registry serves, reported and left unpinned without discarding the ones
@@ -206,7 +206,7 @@ block giving each container its own CPU ceiling, the private `builder` stage
 kept out of the registry, and the flag fetched over ssh from the back box
 through the front one); and a **database-busy** step, the only coverage of
 `ErrDatabaseBusy` in either handler, which holds SQLite's write lock with
-`sqlite3` from outside cmgrd and requires a launch and a stop to be answered
+`sqlite3` from outside corkd and requires a launch and a stop to be answered
 `503` + `Retry-After` and to go through unchanged on the retry. That step is
 the one place the scenario reaches behind the HTTP API, which is why the `e2e`
 service mounts `cork-data` and why `e2e/cork.Dockerfile` carries `sqlite`
@@ -225,9 +225,9 @@ mid-step, an EXIT trap unpauses the worker and restores the telemetry sidecar.
 ## Poking at it by hand
 
 ```sh
-docker compose exec cork cmgrd-cli worker-list
-docker compose exec cork cmgrd-cli list
-docker compose exec cork cmgrd-cli add-schema /opt/e2e/schema.yaml   # only inside the e2e service; from cork use a path under /challenges
+docker compose exec cork cork worker-list
+docker compose exec cork cork list
+docker compose exec cork cork add-schema /opt/e2e/schema.yaml   # only inside the e2e service; from cork use a path under /challenges
 curl -s localhost:4200/workers | jq
 curl -s -X POST localhost:4200/builds/1 -d '{"user_id":"me"}' | jq
 docker compose exec worker-a docker ps          # what really runs on a worker
@@ -239,23 +239,23 @@ docker compose exec cork curl -s --cacert /etc/docker/certs.d/zot.internal/ca.cr
 Instance ports are published from the workers as-is for worker-a
 (`localhost:20000-20029`) and shifted by 1000 for worker-b
 (`localhost:21000-21029`); inside the compose network the workers are
-`worker-a`/`worker-b`, which is also what cmgrd reports as `worker_public`.
+`worker-a`/`worker-b`, which is also what corkd reports as `worker_public`.
 
-Failure modes worth trying while watching `cmgrd-cli worker-list`:
+Failure modes worth trying while watching `cork worker-list`:
 
 ```sh
 docker compose stop worker-b-telemetry    # 30 s of silence -> down (sticky)
 docker compose pause worker-b             # next control call hangs 30 s -> down
 docker compose kill worker-b              # next control call is refused -> down
-docker compose exec cork cmgrd-cli worker-add 172.28.0.12 worker-b   # recovery, once the box is back
-docker compose exec cork cmgrd-cli worker-remove 172.28.0.12         # purge it and its instance records
+docker compose exec cork cork worker-add 172.28.0.12 worker-b   # recovery, once the box is back
+docker compose exec cork cork worker-remove 172.28.0.12         # purge it and its instance records
 ```
 
 ## Lifecycle
 
-`docker compose down` keeps the volumes: the PKI, the challenge tree, cmgrd's
+`docker compose down` keeps the volumes: the PKI, the challenge tree, corkd's
 database, the builder's and workers' image caches, and zot's store. Bringing the stack back
-is then a fleet restart: cmgrd reloads its worker table and instance records,
+is then a fleet restart: corkd reloads its worker table and instance records,
 and the workers' dockerds restart the instance containers (they run with
 `restart: always`, as in production). `docker compose down -v` wipes all of
 it, including the PKI, which `certgen` re-mints on the next `up`.
@@ -263,7 +263,7 @@ it, including the PKI, which `certgen` re-mints on the next `up`.
 `CHALLENGE_DIR=/path/to/challenges docker compose up -d` seeds the challenge
 volume from a different tree (only when the volume is empty, so `down -v`
 first to switch); the scenario itself is tied to the example challenges, so
-drive other content with `cmgrd-cli`.
+drive other content with `cork`.
 
 ## How this differs from production
 
