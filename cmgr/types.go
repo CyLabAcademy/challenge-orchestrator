@@ -3,6 +3,7 @@ package cmgr
 import (
 	"context"
 	"math/rand"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,27 +13,28 @@ import (
 )
 
 const (
-	DB_ENV                string = "CMGR_DB"
-	DIR_ENV               string = "CMGR_DIR"
-	ARTIFACT_DIR_ENV      string = "CMGR_ARTIFACT_DIR"
-	REGISTRY_ENV          string = "CMGR_REGISTRY"
-	REGISTRY_USER_ENV     string = "CMGR_REGISTRY_USER"
-	REGISTRY_TOKEN_ENV    string = "CMGR_REGISTRY_TOKEN"
-	REGISTRY_CERT_DIR_ENV string = "CMGR_REGISTRY_CERT_DIR"
-	LOGGING_ENV           string = "CMGR_LOGGING"
-	IFACE_ENV             string = "CMGR_INTERFACE"
-	PORTS_ENV             string = "CMGR_PORTS"
-	DISK_QUOTA_ENV        string = "CMGR_ENABLE_DISK_QUOTAS"
-	PRUNE_AGE_ENV         string = "CMGR_PRUNE_AGE"
-	DB_WAL_ENV            string = "CMGR_DB_WAL"
+	DB_ENV                  string = "CORK_DB"
+	DIR_ENV                 string = "CORK_DIR"
+	ARTIFACT_DIR_ENV        string = "CORK_ARTIFACT_DIR"
+	REGISTRY_ENV            string = "CORK_REGISTRY"
+	REGISTRY_USER_ENV       string = "CORK_REGISTRY_USER"
+	REGISTRY_TOKEN_ENV      string = "CORK_REGISTRY_TOKEN"
+	REGISTRY_CERT_DIR_ENV   string = "CORK_REGISTRY_CERT_DIR"
+	LOGGING_ENV             string = "CORK_LOGGING"
+	IFACE_ENV               string = "CORK_INTERFACE"
+	PORTS_ENV               string = "CORK_PORTS"
+	DISK_QUOTA_ENV          string = "CORK_ENABLE_DISK_QUOTAS"
+	PRUNE_AGE_ENV           string = "CORK_PRUNE_AGE"
+	DB_WAL_ENV              string = "CORK_DB_WAL"
+	CONCURRENT_LAUNCHES_ENV string = "CORK_CONCURRENT_LAUNCHES"
 
 	// Worker tunables (see workerTiming in workers.go).
-	WORKER_POLL_INTERVAL_ENV   string = "CMGR_WORKER_POLL_INTERVAL"
-	WORKER_POLL_TIMEOUT_ENV    string = "CMGR_WORKER_POLL_TIMEOUT"
-	WORKER_MAX_MISSES_ENV      string = "CMGR_WORKER_MAX_MISSES"
-	WORKER_CONTROL_TIMEOUT_ENV string = "CMGR_WORKER_CONTROL_TIMEOUT"
-	WORKER_PULL_TIMEOUT_ENV    string = "CMGR_WORKER_PULL_TIMEOUT"
-	WORKER_LAUNCH_WAIT_ENV     string = "CMGR_WORKER_LAUNCH_WAIT"
+	WORKER_POLL_INTERVAL_ENV   string = "CORK_WORKER_POLL_INTERVAL"
+	WORKER_POLL_TIMEOUT_ENV    string = "CORK_WORKER_POLL_TIMEOUT"
+	WORKER_MAX_MISSES_ENV      string = "CORK_WORKER_MAX_MISSES"
+	WORKER_CONTROL_TIMEOUT_ENV string = "CORK_WORKER_CONTROL_TIMEOUT"
+	WORKER_PULL_TIMEOUT_ENV    string = "CORK_WORKER_PULL_TIMEOUT"
+	WORKER_LAUNCH_WAIT_ENV     string = "CORK_WORKER_LAUNCH_WAIT"
 
 	DYNAMIC_INSTANCES int = -1
 	LOCKED            int = -2
@@ -54,14 +56,16 @@ type Manager struct {
 	challengeDockerfiles map[string][]byte
 	rand                 *rand.Rand
 	randMu               sync.Mutex
-	// updateMu serializes rebuilds (UpdateWithOptions): two of them would
-	// tear down and relaunch the same instances against each other.
+	// updateMu serializes rebuilds (UpdateWithOptions) and schema operations
+	// (CreateSchema, UpdateSchema, DeleteSchema) against each other: any two
+	// of them would tear down and relaunch the same instances against each
+	// other. Taken at the API boundary only; internal helpers assume it held.
 	updateMu sync.Mutex
 	// imageMu serializes the "is this content still referenced? if not, untag"
 	// critical sections (executeBuild cleanup, pruneReplacedImages,
 	// destroyImages) so a concurrent remover cannot delete a tag between
 	// another's reference check and its ImageRemove. Content-addressed tags are
-	// shared across build rows, so these checks race under cmgrd's concurrent
+	// shared across build rows, so these checks race under corkd's concurrent
 	// request handling.
 	imageMu sync.Mutex
 	// basePins rewrites `FROM name:tag` to a digest as build contexts are
@@ -74,24 +78,35 @@ type Manager struct {
 	challengeInterface string
 	challengeRegistry  string
 	authString         string
-	hostOSType         string // docker daemon OSType, cached once at initDocker (immutable for the daemon)
-	portLow            int
-	portHigh           int
-	lastPruneUnix      atomic.Int64 // atomic UnixNano timestamp used as CAS gate for prune interval
-	pruneInterval      time.Duration
-	pruneAge           time.Duration
-	localQueue         *daemonQueue // slots of the local daemon (instances with no worker)
-	policy             managerPolicy
+	// The registry API client (registry.go) for tag deletes, built on first
+	// successful use and shared; and the credentials handed to dockerd for
+	// pushes and pulls, sent along with it. Existence checks go through the
+	// daemon and need neither.
+	registryClient   *http.Client
+	registryClientMu sync.Mutex
+	registryUser     string
+	registryToken    string
+	// templateSums memoizes templateChecksum per challenge type: the embedded
+	// templates never change while the process runs.
+	templateSums  sync.Map
+	hostOSType    string // docker daemon OSType, cached once at initDocker (immutable for the daemon)
+	portLow       int
+	portHigh      int
+	lastPruneUnix atomic.Int64 // atomic UnixNano timestamp used as CAS gate for prune interval
+	pruneInterval time.Duration
+	pruneAge      time.Duration
+	localQueue    *daemonQueue // slots of the local daemon (instances with no worker)
+	policy        managerPolicy
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
-	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run
+	// corkd; the cmgr CLI leaves it false so CLI-started instances always run
 	// on the local daemon.
 	workersMu         sync.RWMutex
 	workers           map[string]*workerConn
 	workerOrder       []string // round-robin iteration order over workers
 	rrCursor          int      // guarded by workersMu
 	placementEnabled  bool
-	launchConcurrency int          // per-daemon launch (and teardown) slots from CMGR_CONCURRENT_LAUNCHES
+	launchConcurrency int          // per-daemon launch (and teardown) slots from CORK_CONCURRENT_LAUNCHES
 	workerTiming      workerTiming // poll/timeout tunables, from the environment (see timing())
 }
 
@@ -218,10 +233,19 @@ func (cm *ChallengeMetadata) NeedsInstance() bool {
 	return cm.DeliveryType == "" || cm.DeliveryType == DeliveryService
 }
 
+// ChallengeUpdates is DetectChanges' verdict on each challenge, one bucket per
+// challenge: Added (on disk, not in the database), Updated (source changed:
+// every build rebuilt), Refreshed (metadata only: re-persisted), Stale
+// (nothing changed on disk, but a build still serves an earlier generation
+// because its last rebuild failed), Unmodified, Removed. Updated outranks
+// Refreshed outranks Stale. Whatever a failed rebuild left behind is rebuilt
+// on the Refreshed and Stale paths alike, so a Stale verdict is only ever
+// given when there is nothing else to report.
 type ChallengeUpdates struct {
 	Added      []*ChallengeMetadata `json:"added"`
 	Refreshed  []*ChallengeMetadata `json:"refreshed"`
 	Updated    []*ChallengeMetadata `json:"updated"`
+	Stale      []*ChallengeMetadata `json:"stale"`
 	Removed    []*ChallengeMetadata `json:"removed"`
 	Unmodified []*ChallengeMetadata `json:"unmodified"`
 	Errors     []error              `json:"errors"`
@@ -247,12 +271,22 @@ type BuildMetadata struct {
 	// `rollback` operation would swap it with Checksum, re-extract /challenge
 	// from that image (see executeBuild's extraction step), and restart
 	// instances. Same-row rollback is format- and seed-stable by construction.
-	PrevChecksum uint32              `json:"prev_checksum,omitempty" db:"prevchecksum"`
-	Images       []Image             `json:"images"`
-	HasArtifacts bool                `json:"has_artifacts"`
-	LastSolved   int64               `json:"last_solved"`
-	Challenge    ChallengeId         `json:"challenge_id"`
-	Instances    []*InstanceMetadata `json:"instances,omitempty"`
+	PrevChecksum uint32 `json:"prev_checksum,omitempty" db:"prevchecksum"`
+	// SourceChecksum is the challenge source generation (ChallengeMetadata.
+	// SourceChecksum) this build's images were produced from; 0 until the
+	// build has been built. A build is current exactly when it equals the
+	// challenge's recorded source checksum, so a rebuild that failed — the
+	// challenge row already carries the new generation, the build still
+	// serves the old one — is visible as the difference rather than lost.
+	// It is deliberately the source generation and not Checksum: base-image
+	// pins are folded into Checksum and a pin refresh must not make every
+	// build look stale.
+	SourceChecksum uint32              `json:"source_checksum,omitempty" db:"sourcechecksum"`
+	Images         []Image             `json:"images"`
+	HasArtifacts   bool                `json:"has_artifacts"`
+	LastSolved     int64               `json:"last_solved"`
+	Challenge      ChallengeId         `json:"challenge_id"`
+	Instances      []*InstanceMetadata `json:"instances,omitempty"`
 
 	Schema        string `json:"schema"`
 	InstanceCount int    `json:"instance_count"`

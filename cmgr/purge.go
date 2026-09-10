@@ -1,8 +1,6 @@
 package cmgr
 
 import (
-	"os"
-
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/client"
 )
@@ -51,14 +49,14 @@ import (
 // registry the images are never pushed, ensureImages does not pull, and the
 // builder's copy is the only one there is. Purging there would break every
 // launch.
-const PURGE_AFTER_PUSH_ENV string = "CMGR_PURGE_AFTER_PUSH"
+const PURGE_AFTER_PUSH_ENV string = "CORK_PURGE_AFTER_PUSH"
 
-// initPurgeAfterPush reads CMGR_PURGE_AFTER_PUSH. On unless explicitly
-// disabled, matching CMGR_DB_WAL's spelling of the same idea; ignored outright
+// initPurgeAfterPush reads CORK_PURGE_AFTER_PUSH. On unless explicitly
+// disabled, matching CORK_DB_WAL's spelling of the same idea; ignored outright
 // when no registry is configured.
 func (m *Manager) initPurgeAfterPush() {
 	m.purgeAfterPush = true
-	if v, ok := os.LookupEnv(PURGE_AFTER_PUSH_ENV); ok && (v == "false" || v == "0" || v == "off") {
+	if v, ok := LookupEnv(PURGE_AFTER_PUSH_ENV); ok && (v == "false" || v == "0" || v == "off") {
 		m.purgeAfterPush = false
 	}
 
@@ -134,7 +132,7 @@ func (m *Manager) purgeBuiltImages(bMeta *BuildMetadata) {
 	}
 
 	// At INFO, because the alternative is a builder that fills up silently.
-	// cmgrd runs at INFO, so the per-image lines above are invisible there;
+	// corkd runs at INFO, so the per-image lines above are invisible there;
 	// without this the operator sees only the startup line promising that
 	// purging happens. Conflicts are the case that actually bites: with
 	// instances placed on the builder's own daemon every image with a live

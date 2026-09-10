@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// client is a minimal wrapper around the cmgrd HTTP API. Requests carry no
+// client is a minimal wrapper around the corkd HTTP API. Requests carry no
 // timeout: update/build calls legitimately run for minutes (image builds and
 // registry pushes happen synchronously on the server).
 type client struct {

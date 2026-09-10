@@ -263,15 +263,15 @@ func TestPinChecksumChangesContentIdentity(t *testing.T) {
 
 	// Turning pinning on re-stamps builds; leaving it off preserves whatever
 	// checksums an existing database already holds.
-	plain := contentChecksum(0xdeadbeef, "flag{%s}", 0)
-	if plain != contentChecksum(0xdeadbeef, "flag{%s}", 0) {
+	plain := contentChecksum(0xdeadbeef, "flag{%s}", 0, 0)
+	if plain != contentChecksum(0xdeadbeef, "flag{%s}", 0, 0) {
 		t.Fatalf("contentChecksum must be deterministic")
 	}
-	if plain == contentChecksum(0xdeadbeef, "flag{%s}", a.checksum()) {
+	if plain == contentChecksum(0xdeadbeef, "flag{%s}", a.checksum(), 0) {
 		t.Errorf("pinned and unpinned builds must not share a content identity")
 	}
-	if contentChecksum(0xdeadbeef, "flag{%s}", a.checksum()) ==
-		contentChecksum(0xdeadbeef, "flag{%s}", moved.checksum()) {
+	if contentChecksum(0xdeadbeef, "flag{%s}", a.checksum(), 0) ==
+		contentChecksum(0xdeadbeef, "flag{%s}", moved.checksum(), 0) {
 		t.Errorf("a moved base must produce a different content identity")
 	}
 }
@@ -452,7 +452,7 @@ func TestWriteBasePinsReplacesAndRoundTrips(t *testing.T) {
 	}
 
 	// The pin file is committed to the challenge repository and read by
-	// whatever user cmgrd runs as. os.CreateTemp makes its file 0600, so the
+	// whatever user corkd runs as. os.CreateTemp makes its file 0600, so the
 	// explicit Chmod is load-bearing -- without it the rename installs a pin
 	// file no one else can read, which the previous plain-WriteFile
 	// implementation never did.

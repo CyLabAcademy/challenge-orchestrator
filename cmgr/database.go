@@ -97,6 +97,7 @@ const schemaQuery string = `
 		seed INTEGER NOT NULL,
 		checksum INTEGER NOT NULL DEFAULT 0,
 		prevchecksum INTEGER NOT NULL DEFAULT 0,
+		sourcechecksum INTEGER NOT NULL DEFAULT 0,
 		hasartifacts INTEGER NOT NULL CHECK (hasartifacts = 0 OR hasartifacts = 1),
 		lastsolved INTEGER,
 		challenge TEXT NOT NULL,
@@ -108,6 +109,7 @@ const schemaQuery string = `
 	);
 
 	CREATE INDEX IF NOT EXISTS schemaIndex on builds(schema);
+	CREATE INDEX IF NOT EXISTS buildChallengeIndex on builds(challenge);
 
 	CREATE TABLE IF NOT EXISTS images (
 		id INTEGER PRIMARY KEY,
@@ -216,13 +218,13 @@ const schemaQuery string = `
 // ensures that the necessary tables and indexes exist and that the sqlite
 // engine is enforcing foreign key constraints.
 func (m *Manager) initDatabase() error {
-	dbPath, isSet := os.LookupEnv(DB_ENV)
+	dbPath, isSet := LookupEnv(DB_ENV)
 	if !isSet {
 		dbPath = "cmgr.db"
 	}
 
 	// SQLite creates the file but not its directory; a fresh box points
-	// CMGR_DB somewhere like /var/lib/cork that may not exist yet.
+	// CORK_DB somewhere like /var/lib/cork that may not exist yet.
 	if dir := filepath.Dir(dbPath); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			m.log.errorf("could not create the database directory %s: %s", dir, err)
@@ -244,7 +246,7 @@ func (m *Manager) initDatabase() error {
 	// the most recent committed transactions on a crash or power loss (potentially
 	// more than one), in exchange for better performance than FULL.
 	dsn := dbPath + "?_fk=true&_journal_mode=WAL&_busy_timeout=100&_synchronous=NORMAL"
-	if walEnv, ok := os.LookupEnv(DB_WAL_ENV); ok && (walEnv == "false" || walEnv == "0" || walEnv == "off") {
+	if walEnv, ok := LookupEnv(DB_WAL_ENV); ok && (walEnv == "false" || walEnv == "0" || walEnv == "off") {
 		dsn = dbPath + "?_fk=true&_busy_timeout=100"
 	}
 
@@ -334,6 +336,29 @@ func (m *Manager) initDatabase() error {
 			m.log.errorf("could not migrate builds.prevchecksum column: %s", err)
 			return err
 		}
+	}
+
+	// builds.sourcechecksum records the source generation each build's images
+	// were produced from (0 = not built yet): a build is current exactly when
+	// it equals the challenge's sourcechecksum. The column is added once; the
+	// backfill is driven by data (built rows still at 0) and runs on every
+	// start, like builds.checksum above.
+	var sourceChecksumCols int
+	err = db.QueryRow("SELECT COUNT(1) FROM pragma_table_info('builds') WHERE name='sourcechecksum';").Scan(&sourceChecksumCols)
+	if err != nil {
+		m.log.errorf("could not inspect builds schema: %s", err)
+		return err
+	}
+	if sourceChecksumCols == 0 {
+		_, err = db.Exec("ALTER TABLE builds ADD COLUMN sourcechecksum INTEGER NOT NULL DEFAULT 0;")
+		if err != nil {
+			m.log.errorf("could not migrate builds.sourcechecksum column: %s", err)
+			return err
+		}
+	}
+	if err = m.migrateBuildSourceChecksums(db); err != nil {
+		m.log.errorf("could not backfill builds.sourcechecksum: %s", err)
+		return err
 	}
 
 	// Bring an older `instances` table up to the current schema. created_at
@@ -490,6 +515,30 @@ func (m *Manager) initDatabase() error {
 		m.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 
+	return nil
+}
+
+// migrateBuildSourceChecksums backfills builds.sourcechecksum for built rows
+// (flag set) still at the default value (0), which predate the column. Each
+// is stamped with its challenge's current source checksum: the images were
+// produced from that source as of the last update, the same presumption
+// migrateBuildChecksums makes. A legacy row whose last rebuild had failed is
+// therefore presumed current once, exactly as it was before the column
+// existed; every rebuild from here on records the truth. Unbuilt rows stay at
+// 0 — there is no generation to record — and the join leaves a row without a
+// challenge alone. Called from initDatabase before m.db is assigned, so the
+// handle is passed in.
+func (m *Manager) migrateBuildSourceChecksums(db *sqlx.DB) error {
+	res, err := db.Exec(`UPDATE builds
+		SET sourcechecksum = c.sourcechecksum
+		FROM challenges AS c
+		WHERE c.id = builds.challenge AND builds.flag != '' AND builds.sourcechecksum = 0;`)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		m.log.infof("recorded the current source generation on %d build(s) that predate builds.sourcechecksum", n)
+	}
 	return nil
 }
 

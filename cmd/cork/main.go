@@ -12,7 +12,8 @@ const (
 	USAGE_ERROR   = -2
 )
 
-const serverEnv = "CMGRD_SERVER"
+const serverEnv = "CORK_SERVER"
+const legacyServerEnv = "CMGRD_SERVER" // pre-rename name, read when CORK_SERVER is unset
 const defaultServer = "http://127.0.0.1:4200"
 
 // Set at build time from ci/version.sh, which is the single definition of the
@@ -29,9 +30,12 @@ func clientVersion() string {
 func main() {
 	server := os.Getenv(serverEnv)
 	if server == "" {
+		server = os.Getenv(legacyServerEnv)
+	}
+	if server == "" {
 		server = defaultServer
 	}
-	flag.StringVar(&server, "server", server, "base URL of the cmgrd server")
+	flag.StringVar(&server, "server", server, "base URL of the corkd server")
 	help := flag.Bool("help", false, "display usage information")
 	flag.Parse()
 
@@ -108,14 +112,15 @@ func printUsage() {
 	fmt.Printf(`
 Usage: %s [--server <url>] <command> [<args>]
 
-A thin HTTP client for cmgrd: every command is an API call against the
+A thin HTTP client for corkd: every command is an API call against the
 server; nothing touches the database, docker, or the registry directly.
 
 Deployment:
   update [--dry-run] [--verbose] [--prune-old] [<dir>]
       re-scan the challenge directory on the server (rebuilding changed
-      challenges) and print the resulting changes; <dir> must be inside the
-      server's CMGR_DIR and defaults to all of it; --prune-old additionally
+      challenges, and any build a failed rebuild left at an earlier
+      generation) and print the resulting changes; <dir> must be inside the
+      server's CORK_DIR and defaults to all of it; --prune-old additionally
       removes the image generation each rebuild displaces from rollback
       retention, on the build daemon and in the registry
   update-schema <schema file>
@@ -146,7 +151,7 @@ Workers:
       repaired (its instances come back with it: their containers restart on
       their own); the optional public address is what players are given for
       its instances; containers and networks cmgr created on it for instances
-      it no longer records are removed first (as for every worker at cmgrd
+      it no longer records are removed first (as for every worker at corkd
       start). A daemon that stays unreachable while that runs is marked down
       and takes nothing until another worker-add; one that answers but leaves
       the cleanup unfinished takes placements anyway, with an error in the
@@ -176,6 +181,7 @@ Other:
       print client and server versions
 
 The server defaults to %s and can also be set via the
-%s environment variable.
-`, os.Args[0], defaultServer, serverEnv)
+%s environment variable (%s, its pre-rename name, is read when
+that is unset).
+`, os.Args[0], defaultServer, serverEnv, legacyServerEnv)
 }

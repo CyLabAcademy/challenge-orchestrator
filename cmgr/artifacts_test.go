@@ -262,7 +262,7 @@ func TestArtifactZeroFallbacksMatchInitPolicyDefaults(t *testing.T) {
 }
 
 // A literal "./" root entry is skipped but still counted, so a flood of root
-// entries cannot slip past CMGR_MAX_ARTIFACT_FILES.
+// entries cannot slip past CORK_MAX_ARTIFACT_FILES.
 func TestCacheArtifactsCountsSkippedRootEntries(t *testing.T) {
 	directory := t.TempDir()
 	manager := &Manager{

@@ -2,7 +2,7 @@ swagger: "2.0"
 info:
   description: "This is a minimal REST API for `cmgr` that allows front-ends for a CTF to remotely manage challenges and their templating for events.  It is not intended to replace `cmgr` entirely as it does not currently expose the challenge update process."
   version: "0.2.0"
-  title: "cmgrd"
+  title: "corkd"
   contact:
     email: "code@acictf.com"
   license:
@@ -413,6 +413,15 @@ definitions:
           The image generation displaced on the last rebuild, retained as a
           rollback target. Omitted when there is no retained rollback
           generation.
+      source_checksum:
+        type: integer
+        format: int64
+        description: >
+          The challenge source generation (its source_checksum) this build's
+          images were produced from. Equal to the challenge's current value
+          when the build is current; a different value means a rebuild
+          failed and the build still serves an earlier generation. Omitted
+          until the build has been built.
       images:
         type: array
         items:

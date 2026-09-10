@@ -33,7 +33,7 @@ The orchestrator builds with BuildKit, pins its base images by digest, and publi
 
 There is no quickstart. This product is meant for deployment in production, not testing. If you're a challenge developer, please follow the readme in [cmgr](https://github.com/picoCTF/cmgr) instead.
 
-To see the whole fleet run on one machine, `e2e/` holds a docker compose simulation of it (orchestrator, build daemon, registry, two workers with telemetry, real PKI) plus a scenario that drives the launch sequence through cmgrd and checks every box; see [e2e/README.md](e2e/README.md).
+To see the whole fleet run on one machine, `e2e/` holds a docker compose simulation of it (orchestrator, build daemon, registry, two workers with telemetry, real PKI) plus a scenario that drives the launch sequence through corkd and checks every box; see [e2e/README.md](e2e/README.md).
 
 These instructions relate to manual setup and should be replaced with ansible/terraform later
 
@@ -55,7 +55,7 @@ Both CA private keys (`docker-ca-key.pem`, `zot-ca-key.pem`) stay offline and ar
 
 ### Orchestrator
 
-1. Install cork on the server by cloning this repository and building using `go build -v -ldflags "$(sh ci/version.sh --ldflags)" -o bin ./...` in the challenge-orchestrator directory
+1. Install cork on the server by cloning this repository and building using `go build -v -ldflags "$(sh ci/version.sh --ldflags)" -o bin ./...` in the challenge-orchestrator directory. That produces `corkd`, the daemon, and `cork`, its CLI. Release tarballs (`cork_<os>_<arch>.tar.gz`) also carry `cmgrd` and `cmgrd-cli` as symlinks to them, and the same tarball is published under the pre-rename `cmgr_<os>_<arch>.tar.gz` name, so installers and scripts from before the rename keep working; those aliases go away two minor releases after the rename.
 2. Install docker on the server. Required to build images. https://docs.docker.com/engine/install/ubuntu/
 3. Install docker-reaper onto the server. This prevents stale containers and unused images from accumulating. https://github.com/picoCTF/docker-reaper. If you don't mind the orchestrator's local docker daemon, which is only used for building, being filled with build artifacts, then this can step can be skipped.
 4. Configure cork's environment variables
@@ -130,16 +130,17 @@ workers NEVER get a cmgr cert of either CA (that's the orchestrator's identity)
 ## Configuration/Usage
 
 ```
-Usage: ./cmgrd-cli [--server <url>] <command> [<args>]
+Usage: ./cork [--server <url>] <command> [<args>]
 
-A thin HTTP client for cmgrd: every command is an API call against the
+A thin HTTP client for corkd: every command is an API call against the
 server; nothing touches the database, docker, or the registry directly.
 
 Deployment:
   update [--dry-run] [--verbose] [--prune-old] [<dir>]
       re-scan the challenge directory on the server (rebuilding changed
-      challenges) and print the resulting changes; <dir> must be inside the
-      server's CMGR_DIR and defaults to all of it; --prune-old additionally
+      challenges, and any build a failed rebuild left at an earlier
+      generation) and print the resulting changes; <dir> must be inside the
+      server's CORK_DIR and defaults to all of it; --prune-old additionally
       removes the image generation each rebuild displaces from rollback
       retention, on the build daemon and in the registry
   update-schema <schema file>
@@ -170,7 +171,7 @@ Workers:
       repaired (its instances come back with it: their containers restart on
       their own); the optional public address is what players are given for
       its instances; containers and networks cmgr created on it for instances
-      it no longer records are removed first (as for every worker at cmgrd
+      it no longer records are removed first (as for every worker at corkd
       start). A daemon that stays unreachable while that runs is marked down
       and takes nothing until another worker-add; one that answers but leaves
       the cleanup unfinished takes placements anyway, with an error in the
@@ -185,6 +186,14 @@ Workers:
       mark the worker down, taking it out of placement but keeping its records
   worker-list
 
+Base image pins:
+  pin-list
+      show the pinned base images and how many challenges use each
+  pin-refresh
+      re-resolve every base image the challenge directory names to the digest
+      the registry serves now, and save it; this is the only time a mutable
+      tag is consulted, and it rebuilds nothing by itself
+
 Other:
   artifacts <build> [<output file>]
       download the build's artifacts tarball (default: <build>.tar.gz)
@@ -192,7 +201,8 @@ Other:
       print client and server versions
 
 The server defaults to http://127.0.0.1:4200 and can also be set via the
-CMGRD_SERVER environment variable.
+CORK_SERVER environment variable (CMGRD_SERVER, its pre-rename name, is read when
+that is unset).
 ```
 
 The canonical way to operate cork is through schemas and remote HTTP requests. 
@@ -208,30 +218,31 @@ If you would like to run your challenges manually, use the start and stop comman
 
 ## Environment Variables
 
+Every setting also answers to its pre-rename `CMGR_` name (`CMGR_DB` for `CORK_DB`, and so on), read when the `CORK_` name is unset, and `cork` reads `CMGRD_SERVER` when `CORK_SERVER` is unset. corkd lists the `CMGR_` names it finds at startup. The old names go away two minor releases after the rename, together with the binary aliases.
 
 | Variable                 | Meaning                                                                                                                            | Default                                                                  |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| CMGR_DB                  | SQLite DB Path                                                                                                                     | ./cmgr.db                                                                |
-| CMGR_DIR                 | Challenge root directory                                                                                                           | .                                                                        |
-| CMGR_ARTIFACT_DIR        | Artifact output dir                                                                                                                | .                                                                        |
-| CMGR_INTERFACE           | The interface where the challenge ports on the workers are exposed on                                                              | 0.0.0.0                                                                  |
-| CMGR_PORTS               | Range for challenge ports. Must be in format like 1024-65535                                                                       | unset (docker decides)                                                   |
-| CMGR_ENABLE_DISK_QUOTAS  | Enable disk quotas                                                                                                                 | unset (off)                                                              |
-| CMGR_PRUNE_AGE           | Maximum age of an on-demand instance (schema-managed instances are never pruned). Only affects the database, NOT the actual containers; docker-reaper cleans those | 1h                                                                       |
-| CMGR_DB_WAL              | Enable WAL journaling for SQLite                                                                                                   | on                                                                       |
-| CMGR_CONCURRENT_LAUNCHES | Launch slots per daemon (1-16), and as many teardown slots: network creation plus container starts, which dockerd serializes internally on either firewall backend; no gain measured past 2 | 2                                                                        |
-| CMGR_WORKER_POLL_INTERVAL | How often each worker's telemetry agent is polled                                                                                  | 500ms                                                                    |
-| CMGR_WORKER_POLL_TIMEOUT | Per-poll timeout; must be under the poll interval (clamped to half of it otherwise)                                                | 250ms                                                                    |
-| CMGR_WORKER_MAX_MISSES   | Consecutive failed polls before a worker is marked down (sticky until worker-add)                                                  | 60 (30s of silence)                                                      |
-| CMGR_WORKER_CONTROL_TIMEOUT | Ceiling for one container/network call to a worker's dockerd; hitting it marks the worker down                                     | 30s                                                                      |
-| CMGR_WORKER_PULL_TIMEOUT | Ceiling for one image pull before a launch; hitting it fails the launch as retryable (503) only. A restart during an update pulls under a 5m ceiling, or this value when it is longer | 30s                                                                      |
-| CMGR_WORKER_LAUNCH_WAIT  | How long a launch waits for a launch slot before failing as retryable (503 with Retry-After); one that would evidently wait longer is refused at once | 10s                                                                      |
-| CMGR_BASE_PINS           | JSON map of base image reference to digest. When present, `FROM name:tag` is rewritten to the digest in the build context, so the builder never re-resolves a mutable tag. See [BUILDER.md](BUILDER.md) | \<CMGR_DIR\>/base-pins.json (commit it at the corpus root; see BUILDER.md)                       |
-| CMGR_PURGE_AFTER_PUSH    | Drop the builder's local copy of a build's images once they are in the registry, so the image store does not grow with the whole fleet. On unless set to `false`/`0`/`off`, and ignored entirely without a registry (there the local copy is the only one). See [BUILDER.md](BUILDER.md) | on (registry mode only)                                                  |
-| CMGR_REGISTRY            | Registry host location                                                                                                             | unset, set with an IP                                                    |
-| CMGR_REGISTRY_USER       | Unused                                                                                                                             | unset                                                                    |
-| CMGR_REGISTRY_TOKEN      | Unused, identity set by TLS cert                                                                                                   | unset                                                                    |
-| CMGR_REGISTRY_CERT_DIR   | Location of certificates used to communicate with registry                                                                         | /etc/docker/certs.d/\<registry\>                                         |
+| CORK_DB                  | SQLite DB Path                                                                                                                     | ./cmgr.db                                                                |
+| CORK_DIR                 | Challenge root directory                                                                                                           | .                                                                        |
+| CORK_ARTIFACT_DIR        | Artifact output dir                                                                                                                | .                                                                        |
+| CORK_INTERFACE           | The interface where the challenge ports on the workers are exposed on                                                              | 0.0.0.0                                                                  |
+| CORK_PORTS               | Range for challenge ports. Must be in format like 1024-65535                                                                       | unset (docker decides)                                                   |
+| CORK_ENABLE_DISK_QUOTAS  | Enable disk quotas                                                                                                                 | unset (off)                                                              |
+| CORK_PRUNE_AGE           | Maximum age of an on-demand instance (schema-managed instances are never pruned). Only affects the database, NOT the actual containers; docker-reaper cleans those | 1h                                                                       |
+| CORK_DB_WAL              | Enable WAL journaling for SQLite                                                                                                   | on                                                                       |
+| CORK_CONCURRENT_LAUNCHES | Launch slots per daemon (1-16), and as many teardown slots: network creation plus container starts, which dockerd serializes internally on either firewall backend; no gain measured past 2 | 2                                                                        |
+| CORK_WORKER_POLL_INTERVAL | How often each worker's telemetry agent is polled                                                                                  | 500ms                                                                    |
+| CORK_WORKER_POLL_TIMEOUT | Per-poll timeout; must be under the poll interval (clamped to half of it otherwise)                                                | 250ms                                                                    |
+| CORK_WORKER_MAX_MISSES   | Consecutive failed polls before a worker is marked down (sticky until worker-add)                                                  | 60 (30s of silence)                                                      |
+| CORK_WORKER_CONTROL_TIMEOUT | Ceiling for one container/network call to a worker's dockerd; hitting it marks the worker down                                     | 30s                                                                      |
+| CORK_WORKER_PULL_TIMEOUT | Ceiling for one image pull before a launch; hitting it fails the launch as retryable (503) only. A restart during an update pulls under a 5m ceiling, or this value when it is longer | 30s                                                                      |
+| CORK_WORKER_LAUNCH_WAIT  | How long a launch waits for a launch slot before failing as retryable (503 with Retry-After); one that would evidently wait longer is refused at once | 10s                                                                      |
+| CORK_BASE_PINS           | JSON map of base image reference to digest. When present, `FROM name:tag` is rewritten to the digest in the build context, so the builder never re-resolves a mutable tag. See [BUILDER.md](BUILDER.md) | \<CORK_DIR\>/base-pins.json (commit it at the corpus root; see BUILDER.md)                       |
+| CORK_PURGE_AFTER_PUSH    | Drop the builder's local copy of a build's images once they are in the registry, so the image store does not grow with the whole fleet. On unless set to `false`/`0`/`off`, and ignored entirely without a registry (there the local copy is the only one). See [BUILDER.md](BUILDER.md) | on (registry mode only)                                                  |
+| CORK_REGISTRY            | Registry host location                                                                                                             | unset, set with an IP                                                    |
+| CORK_REGISTRY_USER       | Unused                                                                                                                             | unset                                                                    |
+| CORK_REGISTRY_TOKEN      | Unused, identity set by TLS cert                                                                                                   | unset                                                                    |
+| CORK_REGISTRY_CERT_DIR   | Location of certificates used to communicate with registry                                                                         | /etc/docker/certs.d/\<registry\>                                         |
 | DOCKER_HOST              | Location of the LOCAL docker daemon                                                                                                | unset. Defaults to local daemon. Does not need modification              |
 | DOCKER_API_VERSION       | API version use                                                                                                                    | Automatically set, does not need modification                            |
 | DOCKER_CERT_PATH         | Used to set the location for client certs to worker                                                                                | Expects /root/.docker_certs by default, but any directory can work. unset. |
@@ -242,10 +253,10 @@ If you would like to run your challenges manually, use the start and stop comman
 - The cork API has zero authentication or security. It relies completely on upstream gates to prevent flooding and abuse
 - The telemetry server provides neither authenticity nor secrecy. It's literally just a value that says whether the server is overloaded or not though.
 - If a launch fails, it is not retried on a different worker. Expectation is that the user will get frustrated and retry. This is expected behavior
-- Internally, cork uses the cmgr name for everything. This is a good target for a patch
+- The binaries, the settings and the release asset carry the cork name since the rename; internally (the Go package, the database file name, image tags, the log prefix, and the `CMGR_` variables a challenge container sees) cork still uses the cmgr name
 - There is no health check for zot, cork assumes that it is up at all times
-- CMGR_INTERFACE is pointless, it controls the interface to bind to for ALL WORKERS, which is meaningless
-- CMGR_LOGGING has been patched to do nothing. It defaults to INFO level
+- CORK_INTERFACE is pointless, it controls the interface to bind to for ALL WORKERS, which is meaningless
+- CORK_LOGGING has been patched to do nothing. It defaults to INFO level
 - If a schema doesn't declare a flag format, it defaults to `%!(EXTRA string=...)`
 
 # DEPRECATED - FOR REFERENCE ONLY
@@ -437,8 +448,8 @@ automatically as before, pulling the new image before the old containers go
 (under a five-minute ceiling, or `CMGR_WORKER_PULL_TIMEOUT` when that is
 longer);
 one that cannot be restarted (its worker down, the pull or the start failing)
-is removed like any stop on a down worker, and the next `update-schema`
-relaunches it.
+is removed like any stop on a down worker, and the same update relaunches it
+through placement once the build's restarts are done.
 
 **Note:** Challenge metadata includes a derived `delivery_type` field
 (`"service"`, `"artifact_only"`, or `"flag_only"`) describing what competitors

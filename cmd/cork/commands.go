@@ -13,7 +13,7 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-// Local mirrors of the cmgrd API types (the CLI deliberately does not import
+// Local mirrors of the corkd API types (the CLI deliberately does not import
 // the cmgr library — it talks JSON only).
 
 type Schema struct {
@@ -31,6 +31,7 @@ type UpdateResponse struct {
 	Added      []string `json:"added"`
 	Refreshed  []string `json:"refreshed"`
 	Updated    []string `json:"updated"`
+	Stale      []string `json:"stale"`
 	Removed    []string `json:"removed"`
 	Unmodified []string `json:"unmodified"`
 	Errors     []string `json:"errors"`
@@ -98,6 +99,7 @@ func updateCommand(c *client, args []string) int {
 	printSection("Added", resp.Added)
 	printSection("Refreshed", resp.Refreshed)
 	printSection("Updated", resp.Updated)
+	printSection("Stale", resp.Stale)
 	printSection("Removed", resp.Removed)
 	if *verbose {
 		printSection("Unmodified", resp.Unmodified)

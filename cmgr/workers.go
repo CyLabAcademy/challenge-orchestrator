@@ -30,7 +30,7 @@ const (
 	workerDockerPort    = 2376
 	workerTelemetryPort = 2136
 
-	// minPollInterval floors CMGR_WORKER_POLL_INTERVAL. The per-poll timeout
+	// minPollInterval floors CORK_WORKER_POLL_INTERVAL. The per-poll timeout
 	// is derived from the interval when it does not fit under it, and a
 	// timeout of zero would mean no timeout at all (http.Client), so an
 	// interval too small to leave room for one is refused rather than
@@ -57,7 +57,7 @@ const (
 //     under its own, longer ceiling (restartLimits in launch.go).
 //   - launchWait: how long a launch waits for a launch slot on its daemon
 //     before it is refused as busy, a retryable failure. That queue is
-//     cmgrd's own, no daemon involved, so it is kept short: under adverse
+//     corkd's own, no daemon involved, so it is kept short: under adverse
 //     load the platform's retry lands elsewhere (see launch.go).
 type workerTiming struct {
 	pollInterval   time.Duration
@@ -77,7 +77,7 @@ var defaultWorkerTiming = workerTiming{
 	launchWait:     10 * time.Second,
 }
 
-// workerTimingFromEnv returns defaultWorkerTiming with the CMGR_WORKER_*
+// workerTimingFromEnv returns defaultWorkerTiming with the CORK_WORKER_*
 // overrides applied. A value that does not parse (or is not positive) is
 // logged and ignored; the poll interval has a floor (minPollInterval) and a
 // poll timeout that does not fit inside it is clamped to half of it, so no
@@ -89,7 +89,7 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 	m.envDuration(WORKER_CONTROL_TIMEOUT_ENV, &t.controlTimeout)
 	m.envDuration(WORKER_PULL_TIMEOUT_ENV, &t.pullTimeout)
 	m.envDuration(WORKER_LAUNCH_WAIT_ENV, &t.launchWait)
-	if s, ok := os.LookupEnv(WORKER_MAX_MISSES_ENV); ok {
+	if s, ok := LookupEnv(WORKER_MAX_MISSES_ENV); ok {
 		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
 			t.maxMisses = n
 		} else {
@@ -115,7 +115,7 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 // envDuration overrides *d from the named variable when it holds a positive
 // duration; anything else is logged and leaves *d alone.
 func (m *Manager) envDuration(name string, d *time.Duration) {
-	s, ok := os.LookupEnv(name)
+	s, ok := LookupEnv(name)
 	if !ok {
 		return
 	}
@@ -136,7 +136,7 @@ func (m *Manager) timing() workerTiming {
 	return m.workerTiming
 }
 
-// Selection failures, distinguished so cmgrd can map them to 503 vs 500.
+// Selection failures, distinguished so corkd can map them to 503 vs 500.
 var (
 	ErrAllWorkersOverloaded = errors.New("all workers are overloaded")
 	ErrAllWorkersDown       = errors.New("no workers are reachable")
@@ -188,7 +188,7 @@ type WorkerInfo struct {
 }
 
 // EnableWorkerPlacement turns on worker selection for new instances. Only
-// cmgrd calls this; without it, configured workers are still routable for
+// corkd calls this; without it, configured workers are still routable for
 // operations on their existing instances, but new instances stay local.
 func (m *Manager) EnableWorkerPlacement() {
 	m.workersMu.Lock()
@@ -304,7 +304,7 @@ func (m *Manager) newWorkerConn(ip, public string) (*workerConn, error) {
 // (pollWorker). A pass that does not finish is retried at the poll cadence,
 // the worker staying out of placement meanwhile, for as long as the poller
 // tolerates telemetry silence (maxMisses polls). A daemon that is merely
-// still starting when cmgrd starts or the worker is added therefore costs
+// still starting when corkd starts or the worker is added therefore costs
 // seconds, not a worker-add.
 func (m *Manager) runWorker(w *workerConn) {
 	t := m.timing()
@@ -683,7 +683,7 @@ func (m *Manager) ListWorkers() ([]WorkerInfo, error) {
 	return infos, nil
 }
 
-// WorkersConfigured reports whether any workers exist; used by cmgrd to
+// WorkersConfigured reports whether any workers exist; used by corkd to
 // decide between the legacy single-host gate and worker placement.
 func (m *Manager) WorkersConfigured() bool {
 	m.workersMu.RLock()
@@ -789,7 +789,7 @@ func (m *Manager) instanceClient(instance *InstanceMetadata) (*client.Client, er
 }
 
 // daemonQueue holds one daemon's slots: launches (see launch.go) and
-// teardowns, as many of each as CMGR_CONCURRENT_LAUNCHES. Teardowns have
+// teardowns, as many of each as CORK_CONCURRENT_LAUNCHES. Teardowns have
 // slots of their own so that a deluge of stops queues here, bounded, rather
 // than inside dockerd, which serializes the network side of each removal:
 // left to queue there, a mass stop made the daemon slow, then unresponsive,

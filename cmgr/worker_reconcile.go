@@ -55,7 +55,7 @@ func (r reconcileResult) String() string {
 // no longer records there: the containers and cmgr-<id> networks that a
 // DB-only stop leaves behind while the worker is down or purged
 // (stopInstance, RemoveWorker). They are not merely untidy. A box that
-// rejoins placement, through worker-add or a cmgrd restart that starts every
+// rejoins placement, through worker-add or a corkd restart that starts every
 // worker afresh, would otherwise refuse any new instance that draws one of
 // their published host ports. It therefore runs before the worker's poller
 // starts (runWorker), so nothing is placed on the worker until they are gone.
@@ -108,7 +108,7 @@ func (m *Manager) reconcileWorker(w *workerConn) reconcileResult {
 	// Containers first: a network with endpoints refuses removal.
 	removedContainers, result := m.removeOrphans(w, "container", orphanContainers, func(ctx context.Context, cid string) error {
 		_, err := w.cli.ContainerRemove(ctx, cid, client.ContainerRemoveOptions{RemoveVolumes: true, Force: true})
-		// A conflict is a removal already in progress on the daemon (cmgrd's
+		// A conflict is a removal already in progress on the daemon (corkd's
 		// own, which timed out client-side while the daemon was hung): the
 		// container is on its way out just the same.
 		if errdefs.IsConflict(err) {
@@ -200,7 +200,7 @@ func (m *Manager) reclaimAfterGC(workers []string) {
 			continue
 		}
 		if result := m.reconcileWorker(w); result != reconcileDone {
-			m.log.errorf("worker %s: could not reclaim what a crashed launch left on it (%s); the next worker-add or cmgrd start will", ip, result)
+			m.log.errorf("worker %s: could not reclaim what a crashed launch left on it (%s); the next worker-add or corkd start will", ip, result)
 		}
 	}
 }

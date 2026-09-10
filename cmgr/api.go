@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"os"
 	"time"
 
 	"github.com/CyLabAcademy/challenge-orchestrator/cmgr/dockerfiles"
@@ -32,6 +31,7 @@ func NewManager(logLevel LogLevel) *Manager {
 	mgr.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	mgr.log.infof("version: %s", Version())
+	mgr.warnLegacyEnv()
 
 	if err := mgr.initPolicy(); err != nil {
 		mgr.log.error(err)
@@ -61,7 +61,7 @@ func NewManager(logLevel LogLevel) *Manager {
 	}
 
 	mgr.pruneInterval = 1 * time.Minute
-	pruneAgeStr, isSet := os.LookupEnv(PRUNE_AGE_ENV)
+	pruneAgeStr, isSet := LookupEnv(PRUNE_AGE_ENV)
 	if !isSet {
 		mgr.pruneAge = 1 * time.Hour
 	} else {
@@ -109,6 +109,14 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 		return cu
 	}
 
+	// One query for every challenge with a build left at an earlier
+	// generation, rather than one per unchanged challenge below; a probe
+	// that fails is an error of the scan, not a clean tree.
+	stale, err := m.staleChallengeSet()
+	if err != nil {
+		errs = append(errs, err)
+	}
+
 	for _, curr := range db_metadata {
 		newMeta, ok := challenges[curr.Id]
 		if !ok {
@@ -121,23 +129,38 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 		sourceChanged := curr.SourceChecksum != newMeta.SourceChecksum
 		metadataChanged := curr.MetadataChecksum != newMeta.MetadataChecksum
 		solvescriptChanged := curr.SolveScript != newMeta.SolveScript
-		if !sourceChanged && !metadataChanged && !solvescriptChanged {
-			if m.safeToRefresh(newMeta) {
-				cu.Unmodified = append(cu.Unmodified, curr)
-			} else {
-				// The checksums are unchanged but the persisted options disagree
-				// with what the current loader parses — e.g. a challenge that
-				// declared a seccomp profile before the binary understood the
-				// option, or a corrupt options row. Re-persist through the
-				// refresh path (no rebuild) so the declared options take effect.
-				m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
-				cu.Refreshed = append(cu.Refreshed, newMeta)
-			}
-		} else if !sourceChanged && m.safeToRefresh(newMeta) {
-			m.log.debugf("Marking %s as refresh", newMeta.Id)
-			cu.Refreshed = append(cu.Refreshed, newMeta)
-		} else {
+		// safeToRefresh is a full metadata lookup, so it is asked only where
+		// its answer can change the verdict: never for a source change.
+		switch {
+		case sourceChanged:
 			cu.Updated = append(cu.Updated, newMeta)
+		case metadataChanged || solvescriptChanged:
+			if m.safeToRefresh(newMeta) {
+				m.log.debugf("Marking %s as refresh", newMeta.Id)
+				cu.Refreshed = append(cu.Refreshed, newMeta)
+			} else {
+				cu.Updated = append(cu.Updated, newMeta)
+			}
+		case !m.safeToRefresh(newMeta):
+			// The checksums are unchanged but the persisted options disagree
+			// with what the current loader parses — e.g. a challenge that
+			// declared a seccomp profile before the binary understood the
+			// option, or a corrupt options row. Re-persist through the
+			// refresh path (no rebuild) so the declared options take effect.
+			m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
+			cu.Refreshed = append(cu.Refreshed, newMeta)
+		case stale[curr.Id]:
+			// Nothing changed on disk, but a build was produced from an
+			// earlier generation: its last rebuild failed after the challenge
+			// row had moved on (updateChallenges commits the metadata before
+			// it builds). Compared by checksums alone the challenge looks
+			// unmodified and the failure would be invisible to every later
+			// update; it stays reported, and rebuilt, until a rebuild
+			// succeeds. A challenge that is also Refreshed is reported as
+			// that, and its stale builds are rebuilt on that path all the same.
+			cu.Stale = append(cu.Stale, newMeta)
+		default:
+			cu.Unmodified = append(cu.Unmodified, curr)
 		}
 		delete(challenges, curr.Id)
 	}
@@ -173,11 +196,13 @@ type UpdateOptions struct {
 // modified should not be affected.
 //
 // In the presence of errors, this function will do addition and updates as
-// best it can in order to preserve a consistent system state.  However, if a
-// build fails, it will keep the existing instance running and rollback the
-// challenge metadata.  Additionally, in the presence of errors it will not
-// perform any removals of challenge metadata (removing a built challenge is
-// considered an error).
+// best it can in order to preserve a consistent system state.  If a build
+// fails, the build keeps its previous generation (row, images, instances)
+// while the challenge metadata is already updated; the challenge is then
+// reported as Stale by every later DetectChanges, and rebuilt by every later
+// update, until a rebuild succeeds.  Additionally, in the presence of errors
+// it will not perform any removals of challenge metadata (removing a built
+// challenge is considered an error).
 func (m *Manager) Update(fp string) *ChallengeUpdates {
 	return m.UpdateWithOptions(fp, UpdateOptions{})
 }
@@ -199,15 +224,13 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 		cu.Errors = append(cu.Errors, errs...)
 	}
 
-	errs = m.updateChallenges(cu.Refreshed, false, false)
-	if len(errs) != 0 {
-		cu.Errors = append(cu.Errors, errs...)
-	}
-
-	errs = m.updateChallenges(cu.Updated, true, options.PruneOldImages)
-	if len(errs) != 0 {
-		cu.Errors = append(cu.Errors, errs...)
-	}
+	// A source change rebuilds every build of the challenge; the other two
+	// persisted verdicts rebuild only what an earlier rebuild left at a
+	// previous generation, which for a Refreshed challenge is normally
+	// nothing. The buckets are disjoint, so the two share one pass.
+	leftovers := append(append([]*ChallengeMetadata{}, cu.Refreshed...), cu.Stale...)
+	cu.Errors = append(cu.Errors, m.updateChallenges(leftovers, m.staleBuildIds, options.PruneOldImages)...)
+	cu.Errors = append(cu.Errors, m.updateChallenges(cu.Updated, m.allBuildIds, options.PruneOldImages)...)
 
 	if len(cu.Errors) == 0 {
 		err := m.removeChallenges(cu.Removed)
@@ -224,7 +247,7 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 // functions.  This function may take a significant amount of time because it
 // will implicitly download base docker images and build the artifacts.
 //
-// NOTE: if `CMGR_REGISTRY` is specified, the generation this build displaces
+// NOTE: if `CORK_REGISTRY` is specified, the generation this build displaces
 // is offered to BuildKit as a cache source and the image produced carries
 // inline cache metadata, so a builder whose local cache was reclaimed recovers
 // the shared layers from the registry rather than re-running every install.
@@ -299,7 +322,7 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string, l
 		Containers: []string{},
 	}
 
-	// Placement (cmgrd only): pick a worker before the instance row is
+	// Placement (corkd only): pick a worker before the instance row is
 	// created so the worker is recorded with it. With no workers configured
 	// selectWorker returns "" and the instance runs on the local daemon.
 	if m.placementEnabled {
@@ -461,7 +484,21 @@ func (m *Manager) ListSchemas() ([]string, error) {
 // other API calls unless explicitly allowed by the schema.  This call is
 // likely to be extremely time and resource intensive as it will start creating
 // all of the requested builds immediately and not return until complete.
+//
+// Schema operations share updateMu with rebuilds (UpdateWithOptions): a
+// converge builds, stops and launches instances of the same builds an update
+// rebuilds and restarts, and the two interleaved would work over each other's
+// instances just as two updates would. The lock is taken here, at the API
+// boundary, and never inside: the unlocked helpers below are what the
+// operations call each other through.
 func (m *Manager) CreateSchema(schema *Schema) []error {
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+	return m.createSchema(schema)
+}
+
+// createSchema is CreateSchema without the lock; the caller holds updateMu.
+func (m *Manager) createSchema(schema *Schema) []error {
 	exists, err := m.schemaExists(schema.Name)
 	if err != nil {
 		return []error{err}
@@ -475,14 +512,18 @@ func (m *Manager) CreateSchema(schema *Schema) []error {
 // Updates the definition of the schema internally and then converges to the
 // new definition.  Certain updates are more expensive than others.  In
 // particular, updating the flag format will cause a complete rebuild of the
-// state.
+// state.  Serialized with rebuilds and other schema operations; see
+// CreateSchema.
 func (m *Manager) UpdateSchema(schema *Schema) []error {
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+
 	exists, err := m.schemaExists(schema.Name)
 	if err != nil {
 		return []error{err}
 	} else if !exists {
 		m.log.warnf("schema '%s' does not exist, creating...", schema.Name)
-		return m.CreateSchema(schema)
+		return m.createSchema(schema)
 	}
 
 	return m.convergeSchema(schema)
@@ -558,44 +599,66 @@ func (m *Manager) convergeSchema(schema *Schema) []error {
 				continue
 			}
 
-			instances, err := m.getBuildInstances(buildMeta.Id)
-			m.log.debugf("converging %s/%d: %d found, need %d", buildMeta.Challenge, buildMeta.Id, len(instances), target)
-			for i := target; i < len(instances); i++ {
-				iMeta, err := m.lookupInstanceMetadata(instances[i])
-				if err != nil {
-					errs = append(errs, err)
-					continue
-				}
-
-				err = m.stopInstance(iMeta)
-				if err != nil {
-					errs = append(errs, err)
-				}
-			}
-
-			for i := len(instances); i < target; i++ {
-				if len(buildMeta.Images) == 0 {
-					// Lazy lookup for case where we resized
-					buildMeta, err = m.lookupBuildMetadata(buildMeta.Id)
-					if err != nil {
-						errs = append(errs, err)
-						break
-					}
-				}
-				_, err = m.newInstance(buildMeta, nil, m.restartLimits())
-				if err != nil {
-					errs = append(errs, err)
-					break
-				}
-			}
+			errs = append(errs, m.convergeBuildInstances(buildMeta, cMeta, target)...)
 		}
 	}
 
 	return errs
 }
 
-// Tears down all instances and builds belonging to the schema.
+// convergeBuildInstances brings the number of instances of one build to
+// target: surplus ones are stopped, missing ones launched through placement
+// under the restart limits. It is the instance half of a schema converge, and
+// what a rebuild runs for a persistent build once its restarts are done, so an
+// instance the restart could not keep is relaunched by the same update that
+// removed it. The caller resolves target (0 for a non-service challenge, and
+// nothing to do for DYNAMIC_INSTANCES or LOCKED) and holds updateMu.
+func (m *Manager) convergeBuildInstances(buildMeta *BuildMetadata, cMeta *ChallengeMetadata, target int) []error {
+	errs := []error{}
+
+	instances, err := m.getBuildInstances(buildMeta.Id)
+	if err != nil {
+		return append(errs, err)
+	}
+	m.log.debugf("converging %s/%d: %d found, need %d", buildMeta.Challenge, buildMeta.Id, len(instances), target)
+	for i := target; i < len(instances); i++ {
+		iMeta, err := m.lookupInstanceMetadata(instances[i])
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		err = m.stopInstance(iMeta)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	for i := len(instances); i < target; i++ {
+		if len(buildMeta.Images) == 0 {
+			// Lazy lookup for case where we resized
+			buildMeta, err = m.lookupBuildMetadata(buildMeta.Id)
+			if err != nil {
+				errs = append(errs, err)
+				break
+			}
+		}
+		_, err = m.newInstance(buildMeta, nil, m.restartLimits())
+		if err != nil {
+			errs = append(errs, err)
+			break
+		}
+	}
+
+	return errs
+}
+
+// Tears down all instances and builds belonging to the schema.  Serialized
+// with rebuilds and other schema operations; see CreateSchema.
 func (m *Manager) DeleteSchema(name string) error {
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+
 	err := m.lockSchema(name)
 	if err != nil {
 		return err
@@ -816,11 +879,11 @@ func (m *Manager) Prune() error {
 	// Their workers are read first, because deleting the rows is what makes
 	// their leftovers findable. A launch killed mid-flight leaves containers
 	// running (RestartPolicy "always"), and reconcileWorker spares them for
-	// exactly as long as a row still names them: the pass at cmgrd start
+	// exactly as long as a row still names them: the pass at corkd start
 	// walks straight past them. Once these rows are gone they are orphans,
 	// which is the state that pass exists to clear — so run it again, for
 	// just those workers, rather than leaving them to hold their published
-	// ports until the next worker-add or cmgrd start.
+	// ports until the next worker-add or corkd start.
 	var gcWorkers []string
 	gcWorkerQuery := `SELECT DISTINCT worker FROM instances WHERE is_finalized = 0 AND created_at < datetime('now', '-5 minutes') AND worker != '';`
 	if err := m.db.Select(&gcWorkers, gcWorkerQuery); err != nil {

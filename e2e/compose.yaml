@@ -2,9 +2,9 @@
 #
 # One compose project stands in for the production boxes:
 #
-#   cork + builder   the orchestrator: cmgrd, plus the local docker daemon it
+#   cork + builder   the orchestrator: corkd, plus the local docker daemon it
 #                    builds challenge images on. In production both live on one
-#                    box and cmgrd uses the unix socket; here the daemon is a
+#                    box and corkd uses the unix socket; here the daemon is a
 #                    docker:dind sibling reached over plain TCP inside this
 #                    network (DOCKER_HOST).
 #   zot              the image registry (zot.internal:443): mTLS, identities from CN,
@@ -12,7 +12,7 @@
 #   worker-a/-b      two docker workers: dockerd on :2376 behind mTLS with the
 #                    shared "academy-docker-worker" server certificate, and the
 #                    cork-telemetry agent on :2136 in the same network namespace.
-#                    Fixed IPs, because cmgrd registers workers by IP.
+#                    Fixed IPs, because corkd registers workers by IP.
 #   certgen          mints the fleet PKI with config-examples/gen-docker-certs.sh
 #                    and hands each box only the files it gets in production
 #                    (one volume per box and trust domain; CA keys go nowhere).
@@ -64,14 +64,14 @@ x-worker: &worker
     certgen:
       condition: service_completed_successfully
 
-# cmgrd + cmgrd-cli from this checkout; the same image runs the scenario.
+# corkd + cork from this checkout; the same image runs the scenario.
 x-cork-build: &cork-build
   context: ..
   dockerfile: e2e/cork.Dockerfile
   args:
     CORK_VERSION: ${CORK_VERSION:-e2e}
 
-# The telemetry sidecar shares its worker's network namespace, so cmgrd
+# The telemetry sidecar shares its worker's network namespace, so corkd
 # polls it at the worker's IP on :2136.
 x-telemetry: &telemetry
   build:
@@ -134,23 +134,23 @@ services:
     environment:
       DOCKER_HOST: tcp://builder:2375
       DOCKER_CERT_PATH: /root/.docker_certs
-      CMGR_REGISTRY: zot.internal
-      CMGR_DIR: /challenges
-      CMGR_DB: /var/lib/cork/cmgr.db
-      CMGR_ARTIFACT_DIR: /var/lib/cork/artifacts
+      CORK_REGISTRY: zot.internal
+      CORK_DIR: /challenges
+      CORK_DB: /var/lib/cork/cmgr.db
+      CORK_ARTIFACT_DIR: /var/lib/cork/artifacts
       # Base image digest pins, at the corpus root as in production, where the
       # file is committed to the challenge repository and versioned with the
       # Dockerfiles it pins. Nothing creates it: absent means no pinning, which
       # is how every step before the pin step runs. restore_sources removes it,
       # so a volume reused across runs does not fail the seed-tree check.
-      CMGR_BASE_PINS: /challenges/base-pins.json
-      CMGR_PORTS: "20000-20029"
+      CORK_BASE_PINS: /challenges/base-pins.json
+      CORK_PORTS: "20000-20029"
       # Long enough that a slow run cannot prune the scenario's own
       # on-demand instances out from under it (production uses 1h).
-      CMGR_PRUNE_AGE: 24h
+      CORK_PRUNE_AGE: 24h
       # Detect a silent or hung worker in 10s instead of production's 30s.
-      CMGR_WORKER_MAX_MISSES: "20"
-      CMGR_WORKER_CONTROL_TIMEOUT: 10s
+      CORK_WORKER_MAX_MISSES: "20"
+      CORK_WORKER_CONTROL_TIMEOUT: 10s
       # How long a request launch waits for one of a worker's two launch slots
       # before it is refused as busy, and the threshold admission control
       # measures a daemon's backlog against. Production leaves this at the 10s
@@ -160,7 +160,7 @@ services:
       # With two slots and a per-launch hold of h, the last of N simultaneous
       # launches waits about (N-1)/2 x h, and the burst steps only prove
       # anything if that exceeds this wait. h is a property of whatever host
-      # the fleet is on, and N cannot grow past CMGR_PORTS -- so the room is in
+      # the fleet is on, and N cannot grow past CORK_PORTS -- so the room is in
       # this number being small, not in the bursts being large. At 500ms an
       # 18-launch burst overflows on any host slower than 59ms per launch; at
       # the 2s this used to be it needed 235ms, and a GitHub-hosted runner does
@@ -168,7 +168,7 @@ services:
       #
       # The scenario reads the same value (E2E_LAUNCH_WAIT_MS on the e2e
       # service below) instead of hard-coding it, so the two cannot drift.
-      CMGR_WORKER_LAUNCH_WAIT: ${E2E_LAUNCH_WAIT_MS:-500}ms
+      CORK_WORKER_LAUNCH_WAIT: ${E2E_LAUNCH_WAIT_MS:-500}ms
     volumes:
       # The challenge tree lives in a volume so the scenario can edit a
       # challenge and run `update`; cork-entrypoint.sh seeds it from the
@@ -199,7 +199,7 @@ services:
       default:
         ipv4_address: 172.28.0.11
     ports:
-      # Challenge instance ports (CMGR_PORTS), reachable from the host as-is.
+      # Challenge instance ports (CORK_PORTS), reachable from the host as-is.
       - "20000-20029:20000-20029"
     volumes:
       - ./worker/daemon.json:/etc/docker/daemon.json:ro
@@ -242,15 +242,15 @@ services:
     profiles: [test]
     entrypoint: ["bash", "/opt/e2e/scenario.sh"]
     environment:
-      CMGRD_SERVER: http://cork:4200
+      CORK_SERVER: http://cork:4200
       E2E_WORKERS: "172.28.0.11=worker-a 172.28.0.12=worker-b"
       E2E_SCHEMA: /opt/e2e/schema.yaml
       E2E_SCHEMA_FULL: /opt/e2e/schema-full.yaml
       E2E_REGISTRY: zot.internal
       E2E_CHAOS: ${E2E_CHAOS:-1}
       E2E_FULL: ${E2E_FULL:-0}
-      # The same value the cork service turns into CMGR_WORKER_LAUNCH_WAIT, so
-      # the burst steps size themselves against what cmgrd is actually running
+      # The same value the cork service turns into CORK_WORKER_LAUNCH_WAIT, so
+      # the burst steps size themselves against what corkd is actually running
       # with rather than a literal that has to be kept in step by hand.
       E2E_LAUNCH_WAIT_MS: ${E2E_LAUNCH_WAIT_MS:-500}
       E2E_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-cork-e2e}
@@ -265,8 +265,8 @@ services:
       - challenges:/challenges
       - cork-docker-certs:/root/.docker_certs:ro
       - cork-registry-certs:/etc/docker/certs.d/zot.internal:ro
-      # cmgrd's own state, writable, for the one step that has to hold
-      # SQLite's write lock from outside cmgrd. Nothing else reads it: every
+      # corkd's own state, writable, for the one step that has to hold
+      # SQLite's write lock from outside corkd. Nothing else reads it: every
       # other assertion goes through the HTTP API.
       - cork-data:/var/lib/cork
       # The outer docker socket (host-root-equivalent) is for the chaos steps
@@ -297,7 +297,7 @@ volumes:
   worker-registry-certs:  # worker -> zot, read-only (certs.d)
   zot-certs:              # registry server identity
   # State
-  challenges:             # writable copy of the challenge tree (CMGR_DIR)
+  challenges:             # writable copy of the challenge tree (CORK_DIR)
   cork-data:
   builder-data:
   zot-data:
