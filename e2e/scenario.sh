@@ -635,6 +635,46 @@ check_ondemand() {
   fi
 }
 
+# solve_instance <instance json> <build id> <challenge dir> <challenge id>:
+# play a live instance with the solve script the challenge ships, and check
+# the flag that comes back against the one cork recorded for that build.
+#
+# Its only inputs are what the orchestrator reported: the address and the
+# published port out of the launch response, and the flag off the build row.
+# Nothing here knows anything else about the challenge -- not the port's
+# name, not the protocol, not the flag. That is the point of it: ask the
+# orchestrator where the instance is and what it should be serving, and a
+# competitor handed that address has to get that flag out of it. It closes
+# the loop the rest of the scenario leaves open, which checks that a build
+# was made, pushed, pulled and launched but never that what came up is the
+# challenge cork thinks it is.
+#
+# Only for solvers that take --host/--port/--print. The upstream convention
+# is a solver container on the instance's own network reaching it by the DNS
+# name 'challenge' (examples/solvers.md); this fork records that a solver
+# exists but never runs one, so a solver that hardcodes that name cannot be
+# driven from out here.
+solve_instance() { # <instance json> <build id> <challenge dir> <challenge id>
+  local inst=$1 build=$2 dir=$3 id=$4 iid pub port nports want got out
+  iid=$(jq -r .id <<<"$inst")
+  pub=$(jq -r .worker_public <<<"$inst")
+  nports=$(jq -r '.ports | length' <<<"$inst")
+  (( nports == 1 )) ||
+    fail "instance $iid of $id publishes $nports port(s) and solve_instance reaches an instance only where the orchestrator said it is, with no way to choose between them: $(jq -c .ports <<<"$inst")"
+  port=$(jq -r '.ports | to_entries[0].value' <<<"$inst")
+  want=$(api GET "/builds/$build" | jq -r '.flag // empty')
+  [[ -n "$want" ]] || fail "build $build carries no flag to check a solve against"
+  [[ -f "$CHALLENGES/$dir/solver/solve.py" ]] ||
+    fail "$id ships no solver at $CHALLENGES/$dir/solver/solve.py"
+  out=$(timeout 60 python3 "$CHALLENGES/$dir/solver/solve.py" \
+    --host "$pub" --port "$port" --print 2>&1) ||
+    fail "the solve script of $id failed against instance $iid at $pub:$port (exit $?): $out"
+  got=$(sed -n 's/^flag: //p' <<<"$out")
+  [[ "$got" == "$want" ]] ||
+    fail "solving instance $iid of $id at $pub:$port returned '$got' and build $build carries '$want': the flag cork minted for this seed is not the one the running challenge serves (solver said: $out)"
+  note "solved instance $iid at $pub:$port with the challenge's own solver: the flag it served is build $build's own"
+}
+
 # image_tag <build json> <host>: BuildMetadata.dockerId, s<seed>-<checksum hex>-<host>
 image_tag() { printf 's%d-%x-%s' "$(jq -r .seed <<<"$1")" "$(jq -r .checksum <<<"$1")" "$2"; }
 # The artifact endpoints, which are the platform's and a competitor's only view
@@ -2282,6 +2322,17 @@ port=$(jq -r .ports.socat <<<"$inst")
 assert_on_worker "$w" "$inst"
 retry 30 "the BinEx101 prompt at $pub:$port" tcp_says "$pub" "$port" '1\n1\n' 'Give me a number'
 
+# And it really is the challenge behind that prompt, not just a socket that
+# answers it. This is the challenge to solve here of the four: the prompt
+# above is socat's, the artifacts step reads the bundle rather than the
+# running challenge, and check_ondemand reads a flag the server prints out
+# of its own environment. Here the flag went into the image as a build
+# argument (ARG FLAG, cmgr/dockerfiles/remote-make.Dockerfile) and the
+# binary reads it back at runtime, so solving it is what says the flag cork
+# minted for this seed survived the build, the push, the worker's pull and
+# the launch, and is what a competitor would actually come away with.
+solve_instance "$inst" "$MK_BUILD" remote-make "$CH_MAKE"
+
 ############################################################################
 # BLOCK 3 -- one line inside the existing remote-make step (both modes),
 #            after its tcp_says (line 1020)
@@ -2295,7 +2346,7 @@ MK_WORKER=$w
 note "instance $id on $w: $pub:$port prompts for input"
 cmgrd-cli stop "$id"
 assert_gone "$id" "$w" "$inst"
-ok "remote-make instance launched, answered, and was torn down on the worker"
+ok "remote-make instance launched, answered, was solved end to end with the challenge's own solve script for build $MK_BUILD's flag, and was torn down on the worker"
 
 ########################################################################
 # BLOCK 1 -- insert after e2e/scenario.sh:1024
