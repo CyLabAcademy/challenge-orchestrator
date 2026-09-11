@@ -20,8 +20,10 @@ FROM alpine:3.22
 # bash/curl/jq/nc are for the e2e scenario, which runs from this same image.
 # openssl backs the stalled-registry fixture (an s_server that never answers)
 # and sqlite the database-busy step (it holds SQLite's write lock from outside
-# cmgrd). Neither is used by cmgrd itself.
-RUN apk add --no-cache ca-certificates bash curl jq netcat-openbsd openssl sqlite
+# cmgrd). python3 runs a challenge's own solve script against a live instance
+# (the remote-make step); the examples' solvers are plain stdlib. None of
+# these is used by cmgrd itself.
+RUN apk add --no-cache ca-certificates bash curl jq netcat-openbsd openssl sqlite python3
 COPY --from=build /out/cmgrd /out/cmgrd-cli /out/cork-build /usr/local/bin/
 COPY e2e/cork-entrypoint.sh /usr/local/bin/cork-entrypoint.sh
 EXPOSE 4200
