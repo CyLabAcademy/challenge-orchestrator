@@ -232,6 +232,7 @@ ORPHAN_CID=""         # the container holding that network open
 FRESH_CMGRD=""        # pid of the throwaway cmgrd of the fresh-box step
 HO_CMGRD=""           # pid of the throwaway cmgrd of the hand-over step
 CB_CMGRD=""           # pid of the throwaway cmgrd of the cork-build step
+MH_CMGRD=""           # pid of the throwaway cmgrd of the multi-host hand-over
 EDITED_META=""        # a challenge metadata file a step edited under CMGR_DIR
 ORPHAN_TAG=""         # a content tag an update deliberately orphaned, which cork never reclaims
 STOPPED_REGISTRY=""   # outer container id of the registry this run stopped
@@ -293,6 +294,7 @@ cleanup() {
   if [[ -n "$FRESH_CMGRD" ]]; then kill "$FRESH_CMGRD" >/dev/null 2>&1 || true; fi
   if [[ -n "$HO_CMGRD" ]]; then kill "$HO_CMGRD" >/dev/null 2>&1 || true; fi
   if [[ -n "$CB_CMGRD" ]]; then kill "$CB_CMGRD" >/dev/null 2>&1 || true; fi
+  if [[ -n "$MH_CMGRD" ]]; then kill "$MH_CMGRD" >/dev/null 2>&1 || true; fi
   # The stand-in holds the registry's own network alias, so it lets go first;
   # the probe build is destroyed last, so its registry untag has a registry to
   # talk to. t=1 because the stand-in's entrypoint is a pipeline and bash
@@ -5466,6 +5468,63 @@ if (( FULL )); then
   [[ "$(registry_tags "$CH_MULTI" | grep -c .)" == 2 ]] ||
     fail "the registry holds $(registry_tags "$CH_MULTI" | grep -c .) tag(s) of $CH_MULTI, expected the 2 launched stages: $(registry_tags "$CH_MULTI" | tr '\n' ' ')"
 
+  # ------- the hand-over of a multi-host build (issue #18)
+  #
+  # Every other hand-over in this scenario carries a single-host build, so
+  # this is the only payload whose image list and host list can disagree --
+  # and the only place a real registry sees the builder-stage exception.
+  # checkHandOver requires an image for every host the challenge names
+  # (cmgr/handover.go): the local build path makes exactly one per host by
+  # construction, nothing further down would notice one missing, and a build
+  # short of one would launch the hosts it had and report finalized.
+  # requireInRegistry meanwhile skips host 'builder', and the assertions just
+  # above have proved zot does not serve that tag -- so a hand-over that
+  # asked after it would be refused here and nowhere else in this scenario.
+  #
+  # Placed before the pins step like the other hand-overs, so the fingerprint
+  # stated is 0, which is what these builds were made under.
+  [[ "$(api GET /pins | jq -r '.pins | length')" == 0 ]] ||
+    fail "the fleet already pins base images: the multi-host hand-over below states pin fingerprint 0 and would be refused"
+  [[ "$(jq -r .has_artifacts <<<"$MULTI_META")" == false ]] ||
+    fail "$CH_MULTI now publishes artifacts: the hand-over below sends no archive part and would be refused for the wrong reason"
+  MH=$(mktemp -d)
+  CMGR_BUILD_PLANE=external \
+  CMGR_REGISTRY="$E2E_REGISTRY" \
+  CMGR_ARTIFACT_DIR="$MH/artifacts" \
+  CMGR_DB="$MH/db/cmgr.db" \
+    cmgrd --port 4292 >"$MH/cmgrd.log" 2>&1 &
+  MH_CMGRD=$! # the EXIT trap kills it if anything below fails
+  retry 30 "the multi-host hand-over cmgrd to answer on :4292" fresh_answers "$MH_CMGRD" 4292 "$MH/cmgrd.log" "the throwaway cmgrd taking the multi-host hand-over"
+  mh_put() { # mh_put <json file>: PUT it, print the status, body in $MH/body
+    curl -sS -o "$MH/body" -w '%{http_code}' --connect-timeout 5 --max-time 120 \
+      -X PUT -F "hand_over=<$1;type=application/json" \
+      "http://127.0.0.1:4292/challenges/$CH_MULTI"
+  }
+  api GET /state | jq --arg id "$CH_MULTI" \
+    '{challenge: (.[] | select(.id == $id) | del(.builds[].instances)), pin_fingerprint: 0}' >"$MH/multi.json"
+  [[ "$(jq -r '.challenge.builds | length' "$MH/multi.json")" == 1 ]] ||
+    fail "the state element of $CH_MULTI carries $(jq -r '.challenge.builds | length' "$MH/multi.json") builds, expected the one this schema names"
+  code=$(mh_put "$MH/multi.json")
+  [[ "$code" == 200 ]] ||
+    fail "the hand-over of the multi-host $CH_MULTI answered $code, want 200 -- if it names '$MULTI_PRIVATE' the registry check stopped skipping the builder stage: $(tr '\n' ' ' <"$MH/body" | tail -c 400)"
+  mh_want=$(printf '%s\n' "$MULTI_FRONT" "$MULTI_BACK" "$MULTI_PRIVATE" | sort | tr '\n' ' ' | sed 's/ $//')
+  mh_got=$(jq -r '[.challenge.builds[0].images[].host] | sort | join(" ")' "$MH/body")
+  [[ "$mh_got" == "$mh_want" ]] ||
+    fail "the daemon recorded the multi-host build with images for '$mh_got', want all three stages ($mh_want)"
+  # And the other way round: a host the build has no image for. Nothing
+  # downstream would catch it, so the refusal has to come from here.
+  jq --arg h "$MULTI_BACK" '.challenge.builds[0].images |= map(select(.host != $h))' "$MH/multi.json" >"$MH/short.json"
+  code=$(mh_put "$MH/short.json")
+  [[ "$code" == 400 ]] ||
+    fail "a hand-over of $CH_MULTI missing the $MULTI_BACK image answered $code, want 400: $(cat "$MH/body")"
+  grep -q "no image for host '$MULTI_BACK'" "$MH/body" ||
+    fail "the refusal does not name the host left without an image: $(cat "$MH/body")"
+  kill "$MH_CMGRD" >/dev/null 2>&1 || true
+  wait "$MH_CMGRD" 2>/dev/null || true
+  MH_CMGRD=""
+  rm -rf "$MH"
+  note "the multi-host build handed over whole: all three stages recorded, '$MULTI_PRIVATE' never asked of the registry, and a payload missing the $MULTI_BACK image refused"
+
   # Only the front box publishes: `# PUBLISH 22 AS ssh` sits under the work
   # stage alone, so the instance's port map has exactly one entry.
   minst=$(launch "$MULTI_BUILD" multi-1 e2e) || fail "launching build $MULTI_BUILD failed"
@@ -5575,7 +5634,7 @@ if (( FULL )); then
       fail "the $host image of build $MULTI_BUILD is still on the builder after its schema was removed; destroyImages left it behind$([[ "$host" == "$MULTI_PRIVATE" ]] && printf ' -- and that stage holds the flag and the ssh key in plain text')"
     fi
   done
-  ok "schema $MULTI_SCHEMA converged alongside $SCHEMA_NAME without touching its builds or its persistent instance; $CH_MULTI shipped two runtime images and kept '$MULTI_PRIVATE' out of the registry; instance $multi_done ran $MULTI_FRONT (0.5 cpu, published at $mpub:$mport) and $MULTI_BACK (0.25 cpu, unpublished) on one cmgr network and returned its flag over ssh from $MULTI_BACK through $MULTI_FRONT; the stop removed both containers and the network, and remove-schema left $SCHEMA_NAME whole"
+  ok "schema $MULTI_SCHEMA converged alongside $SCHEMA_NAME without touching its builds or its persistent instance; $CH_MULTI shipped two runtime images and kept '$MULTI_PRIVATE' out of the registry; it handed over whole to a daemon that builds nothing, all three stages recorded and a payload missing one refused; instance $multi_done ran $MULTI_FRONT (0.5 cpu, published at $mpub:$mport) and $MULTI_BACK (0.25 cpu, unpublished) on one cmgr network and returned its flag over ssh from $MULTI_BACK through $MULTI_FRONT; the stop removed both containers and the network, and remove-schema left $SCHEMA_NAME whole"
 else
   deselect "a second schema and the multi-container delivery shape"
 fi
