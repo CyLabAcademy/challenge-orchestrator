@@ -14,34 +14,18 @@ import (
 	"strings"
 )
 
-// Reads the environment variable CMGR_CHALLENGE_DIR and then normalizes it
-// to an absolute path and validates that it is a directory.
+// Resolves the artifacts directory and, on a local build plane, the
+// challenge directory from their environment variables.
 func (m *Manager) setDirectories() error {
 	var err error
 
-	chalDir, isSet := os.LookupEnv(DIR_ENV)
-	if !isSet {
-		chalDir = "."
-	}
-
-	m.chalDir, err = filepath.Abs(chalDir)
-
-	if err != nil {
-		m.log.errorf("could not resolve challenge directory: %s", err)
+	if m.externalBuildPlane {
+		// No challenge tree: the build plane has it, and nothing here reads
+		// one (DetectChanges and the pins refuse, the converge does not
+		// scan). m.chalDir stays empty.
+		m.noteIgnoredSetting(DIR_ENV)
+	} else if err = m.setChallengeDirectory(); err != nil {
 		return err
-	}
-
-	m.log.infof("challenge directory: %s", m.chalDir)
-
-	info, err := os.Stat(m.chalDir)
-	if err != nil {
-		m.log.errorf("could not stat the challenge directory: %s", err)
-		return err
-	}
-
-	if !info.IsDir() {
-		m.log.error("challenge directory must be a directory")
-		return errors.New(m.chalDir + " is not a directory")
 	}
 
 	artifactsDir, isSet := os.LookupEnv(ARTIFACT_DIR_ENV)
@@ -64,6 +48,38 @@ func (m *Manager) setDirectories() error {
 	if err = os.MkdirAll(m.artifactsDir, 0o755); err != nil {
 		m.log.errorf("could not create the artifacts directory: %s", err)
 		return err
+	}
+
+	return nil
+}
+
+// setChallengeDirectory reads CMGR_DIR, normalizes it to an absolute path
+// and requires it to be a directory that exists: a mistyped challenge path
+// must fail the start, not bring a daemon up over an empty catalogue.
+func (m *Manager) setChallengeDirectory() error {
+	chalDir, isSet := os.LookupEnv(DIR_ENV)
+	if !isSet {
+		chalDir = "."
+	}
+
+	var err error
+	m.chalDir, err = filepath.Abs(chalDir)
+	if err != nil {
+		m.log.errorf("could not resolve challenge directory: %s", err)
+		return err
+	}
+
+	m.log.infof("challenge directory: %s", m.chalDir)
+
+	info, err := os.Stat(m.chalDir)
+	if err != nil {
+		m.log.errorf("could not stat the challenge directory: %s", err)
+		return err
+	}
+
+	if !info.IsDir() {
+		m.log.error("challenge directory must be a directory")
+		return errors.New(m.chalDir + " is not a directory")
 	}
 
 	return nil

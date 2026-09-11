@@ -226,6 +226,18 @@ func (b *basePins) replace(m map[string]string) {
 // initBasePins resolves the pin file's location and loads it if present. A
 // missing file is not an error: pinning is opt-in.
 func (m *Manager) initBasePins() error {
+	if m.externalBuildPlane {
+		// Pins are applied as build contexts are made, which happens on the
+		// build plane; their fingerprint reaches this daemon inside each
+		// build's content checksum. With m.basePins nil the fingerprint
+		// computed here is 0, and nothing persists it: openBuild would
+		// stamp it on the row it inserts for a build nobody has handed
+		// over, and a converge on this plane never gets that far
+		// (requireHandedOver refuses first), while a row that exists keeps
+		// the checksum it was handed over with.
+		m.noteIgnoredSetting(BASE_PINS_ENV)
+		return nil
+	}
 	path, isSet := os.LookupEnv(BASE_PINS_ENV)
 	if !isSet {
 		path = filepath.Join(m.chalDir, ".base-pins.json")
@@ -428,6 +440,15 @@ func (m *Manager) basePinsChecksum() uint32 {
 	return m.basePins.checksum()
 }
 
+// BasePinFingerprint is the identity contribution of the pins in force
+// here: 0 with pinning off. It is an input to every build's content
+// checksum (contentChecksum), and the one input a daemon taking a hand-over
+// cannot derive for itself, the pins living where the builds are made, so
+// the build plane states it and the daemon recomputes with it (HandOver).
+func (m *Manager) BasePinFingerprint() uint32 {
+	return m.basePinsChecksum()
+}
+
 // pinBases applies the current pins to a Dockerfile on its way into a build
 // context.
 func (m *Manager) pinBases(challenge ChallengeId, dockerfile []byte) []byte {
@@ -456,6 +477,9 @@ type BasePin struct {
 
 // ListBasePins reports the current pins alongside how many challenges use each.
 func (m *Manager) ListBasePins() ([]BasePin, error) {
+	if m.externalBuildPlane {
+		return nil, ErrExternalBuildPlane
+	}
 	if m.basePins == nil {
 		return []BasePin{}, nil
 	}
@@ -589,6 +613,9 @@ func (m *Manager) basePinsRefreshBudget(n int) time.Duration {
 //
 // Existing pins are re-resolved too, so a refresh is how a base is moved.
 func (m *Manager) RefreshBasePins() ([]BasePin, error) {
+	if m.externalBuildPlane {
+		return nil, ErrExternalBuildPlane
+	}
 	if m.basePins == nil {
 		return nil, fmt.Errorf("base pinning is not configured")
 	}

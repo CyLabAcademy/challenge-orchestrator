@@ -67,6 +67,12 @@ type Manager struct {
 	// shared across build rows, so these checks race under cmgrd's concurrent
 	// request handling.
 	imageMu sync.Mutex
+	// stagedArchives holds the staging paths of every hand-over in flight in
+	// this process (stageHandOverArchives), so sweepStagedArchives leaves
+	// them alone and what it reclaims on age is only ever what an earlier
+	// process left behind.
+	stagedArchivesMu sync.Mutex
+	stagedArchives   map[string]bool
 	// basePins rewrites `FROM name:tag` to a digest as build contexts are
 	// synthesized, so BuildKit never re-resolves a mutable tag against the
 	// registry on every build (see basepins.go).
@@ -96,6 +102,17 @@ type Manager struct {
 	pruneAge      time.Duration
 	localQueue    *daemonQueue // slots of the local daemon (instances with no worker)
 	policy        managerPolicy
+	// externalBuildPlane: images are built elsewhere and handed to this
+	// daemon, which then has no local daemon at all (see buildplane.go).
+	// False, the zero value, is the local build plane there always was.
+	externalBuildPlane bool
+	// retiresRegistryTags lets this process take a tag back out of the
+	// challenge registry once no row it can see names that content any more
+	// (destroyImages, pruneReplacedImages). True for an orchestrator, whose
+	// database is the record of what the fleet is serving; false for a build
+	// plane, whose database is bookkeeping and knows only what it built
+	// (see AsBuildPlane).
+	retiresRegistryTags bool
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
 	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run

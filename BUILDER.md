@@ -4,6 +4,80 @@ Notes for whoever operates or changes cork's image build path. Everything here
 concerns the **orchestrator** host: the one machine that runs `cmgrd`, builds
 images and pushes them to the registry. Workers only pull.
 
+That machine can also be told not to build at all. `CMGR_BUILD_PLANE=external`
+starts `cmgrd` with no docker daemon and no challenge tree: everything in this
+document then happens wherever the images are built, and each build reaches
+the daemon through `PUT /challenges/<id>` (issue #18): the challenge as scanned
+there and its builds as left there, the images already in the registry and the
+artifact archives in the request, verified before anything is recorded (every
+build's content checksum recomputed from the inputs the payload names, every
+image tag looked up in the registry, every archive taken and validated). A
+build whose row already serves the generation handed over is not built over
+again: handing the same thing over twice leaves the images, the archive and the
+flag as they are, and converges only what runs them, since the `instance_count`
+the hand-over carries is the schema's and may have moved. `update`, manual
+builds and the pins commands answer 409, a schema converge only checks that
+every build it wants has already arrived, and a launch with no worker
+registered fails instead of running locally. `add-schema` has no successful
+path there, since the builds handed over are the schema: `update-schema` is
+the operation. The default, `local`, is the daemon this document describes.
+
+## cork-build, the build plane on its own
+
+`cork-build` is this document's machine as a binary: cmgr's build path with
+no orchestrator attached. It reads the schema files an event is defined by,
+scans `CMGR_DIR`, builds and pushes every build those schemas name, and hands
+the finished builds to one or more orchestrators over `PUT /challenges/<id>`.
+
+```
+cork-build --server https://orchestrator:4200 build event.yaml practice.yaml
+cork-build pins
+```
+
+It is the same scan and the same converge cmgrd runs, so it reads the same
+environment: `CMGR_DIR`, `CMGR_REGISTRY` (which must name the registry the
+orchestrator's workers pull from), `CMGR_BASE_PINS`, `CMGR_PURGE_AFTER_PUSH`,
+and docker's own variables. What it does not do is run anything: every schema
+is converged here with its builds on demand, which launches no instance, and
+the `instance_count` the schema really asks for travels in the hand-over for
+the orchestrator to converge to.
+
+Its database is bookkeeping rather than a source of truth. Keeping it between
+runs saves rebuilding what has not changed; losing it costs a re-derivation,
+in which every image already in the registry is adopted rather than built
+again (the registry is write-once, so a tag that is there is the content it
+names).
+
+Which is why it only ever pushes to the registry. Retiring a tag -- taking
+out a generation nothing needs any more -- means knowing every row that still
+names it, and this database knows only what this build plane built, while an
+orchestrator may still be serving builds these schemas have stopped naming.
+So dropping a seed here, or changing a flag format, reclaims nothing in the
+registry: the orchestrator's own `update-schema` releases those builds and
+untags them, against the database that does know what references them.
+
+One thing a kept database does not carry over: a pin refresh. A build is
+stamped with its identity when it is made, and refreshing the pins rebuilds
+nothing (below), so builds made before a refresh still carry the identity
+they were made under while the hand-over would state the fingerprint in
+force now. `cork-build` compares the two before it sends anything and
+refuses the run naming the builds that disagree; build them again from a
+database that does not hold them.
+
+Two things it and the orchestrator must agree on. The registry, since the
+hand-over is refused for an image the orchestrator cannot find there. And the
+version: the orchestrator recomputes every build's identity with its own copy
+of the challenge templates, so a template that changed between the two makes
+every identity disagree and every hand-over invalid. `cork-build` asks each
+orchestrator its version before it sends anything and says so when they
+differ.
+
+The base image pins live here too, which is why `pins` is a `cork-build`
+command: an orchestrator on an external build plane answers 409 to the pin
+endpoints, having no tree to read the bases from and nothing to build with
+them. Refresh before a build, not after -- a moved base reaches a challenge
+the next time that challenge is built.
+
 ## What the build path does now
 
 cork asks the Docker API for **BuildKit** explicitly (`version=2`) on every

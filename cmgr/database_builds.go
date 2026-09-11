@@ -390,6 +390,17 @@ func (m *Manager) allBuildIds(cMeta *ChallengeMetadata) ([]BuildId, error) {
 // DetectChanges consults it for every challenge whose source is unchanged --
 // where the tree's generation is the recorded one, so the two predicates
 // agree -- on every update, dry run and schema converge.
+// challengeHasStaleBuild is staleChallengeSet's question for one challenge:
+// a point lookup for the converge, which asks per challenge, where the
+// update asks once for every challenge.
+func (m *Manager) challengeHasStaleBuild(id ChallengeId) (bool, error) {
+	var count int
+	err := m.db.Get(&count, `SELECT COUNT(1) FROM builds AS b
+		JOIN challenges AS c ON c.id = b.challenge
+		WHERE b.challenge = ? AND b.flag != '' AND b.sourcechecksum != c.sourcechecksum;`, id)
+	return count > 0, err
+}
+
 func (m *Manager) staleChallengeSet() (map[ChallengeId]bool, error) {
 	ids := []ChallengeId{}
 	err := m.db.Select(&ids, `SELECT DISTINCT b.challenge FROM builds AS b
@@ -404,4 +415,24 @@ func (m *Manager) staleChallengeSet() (map[ChallengeId]bool, error) {
 		stale[id] = true
 	}
 	return stale, nil
+}
+
+// storedGeneration is the retention pair a build row holds: the content
+// checksum of the generation it serves and that generation's rollback
+// target. A row opened but never finalized serves no generation, whatever
+// checksum openBuild stamped on it for the reference checks, and answers
+// zeros: nothing to retain, nothing to displace.
+func (m *Manager) storedGeneration(id BuildId) (checksum, prev uint32, err error) {
+	var row struct {
+		Flag         string `db:"flag"`
+		Checksum     uint32 `db:"checksum"`
+		PrevChecksum uint32 `db:"prevchecksum"`
+	}
+	if err := m.db.Get(&row, "SELECT flag, checksum, prevchecksum FROM builds WHERE id = ?;", id); err != nil {
+		return 0, 0, err
+	}
+	if row.Flag == "" {
+		return 0, 0, nil
+	}
+	return row.Checksum, row.PrevChecksum, nil
 }

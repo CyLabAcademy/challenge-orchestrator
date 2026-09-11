@@ -57,6 +57,13 @@ const PURGE_AFTER_PUSH_ENV string = "CMGR_PURGE_AFTER_PUSH"
 // disabled, matching CMGR_DB_WAL's spelling of the same idea; ignored outright
 // when no registry is configured.
 func (m *Manager) initPurgeAfterPush() {
+	if m.externalBuildPlane {
+		// Nothing is built here, so there is nothing to purge; a setting
+		// left over from a local build plane is named, not obeyed.
+		m.purgeAfterPush = false
+		m.noteIgnoredSetting(PURGE_AFTER_PUSH_ENV)
+		return
+	}
 	m.purgeAfterPush = true
 	if v, ok := os.LookupEnv(PURGE_AFTER_PUSH_ENV); ok && (v == "false" || v == "0" || v == "off") {
 		m.purgeAfterPush = false

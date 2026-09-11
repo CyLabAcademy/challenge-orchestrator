@@ -34,49 +34,42 @@ import (
 //go:embed seccomp.json
 var seccompPolicy string
 
+// initDocker connects to the local docker daemon, on a local build plane,
+// and reads the settings every daemon this process drives shares: launch
+// slots, the challenge interface and ports, the registry.
 func (m *Manager) initDocker() error {
-	// Deliberately not client.FromEnv: DOCKER_CERT_PATH holds the worker mTLS
-	// material (see workers.go) and must not switch this local unix-socket
-	// client into HTTPS mode.
-	cli, err := client.NewClientWithOpts(
-		client.WithHostFromEnv(),
-		client.WithVersionFromEnv(),
-	)
-	if err != nil {
-		m.log.errorf("could not create docker client: %s", err)
-		return err
-	}
-
-	m.cli = cli
 	m.ctx = context.Background()
 
-	var ping client.PingResult
-	for attempt := 1; attempt <= 3; attempt++ {
-		ping, err = cli.Ping(m.ctx, client.PingOptions{})
-		if err == nil {
-			break
+	if m.externalBuildPlane {
+		// No local daemon: nothing is built here, and every instance runs
+		// on a worker (newInstance refuses a launch with none). m.cli stays
+		// nil, and every path that would use it is refused or, for the
+		// image removals, skipped. DOCKER_HOST is the one setting an
+		// operator might still expect to matter, so it is named;
+		// DOCKER_CERT_PATH is the workers' and still applies.
+		m.noteIgnoredSetting("DOCKER_HOST")
+		// The workers are all this daemon can run instances on, so their
+		// TLS material is checked here the way the registry's is below:
+		// material that cannot be loaded refuses the start (every
+		// worker-add would fail on it later), and none at all is said out
+		// loud, since a unit file trimmed of DOCKER_HOST tends to lose
+		// DOCKER_CERT_PATH with it. Not refused: a plain-tcp fleet is a
+		// legitimate test shape.
+		if tlsCfg, tlsErr := workerTLSConfig(); tlsErr != nil {
+			m.log.error(tlsErr)
+			return tlsErr
+		} else if tlsCfg == nil {
+			m.log.warn("DOCKER_CERT_PATH is unset: the workers will be dialed over plain tcp, which a dockerd with tlsverify refuses")
 		}
-		if attempt < 3 {
-			m.log.warnf("failed to ping docker engine (attempt %d/3): %s. retrying...", attempt, err)
-			time.Sleep(1 * time.Second)
-		}
-	}
-	if err != nil {
-		m.log.errorf("could not connect to docker engine: %s", err)
+		// OSType decides whether the linux seccomp profile applies. A local
+		// build plane reads it from its daemon; here the only daemons are
+		// the workers, which are linux.
+		m.hostOSType = "linux"
+	} else if err := m.connectDocker(); err != nil {
 		return err
 	}
 
-	m.log.infof("connected to docker (API v%s)", ping.APIVersion)
-
-	// OSType is immutable for the daemon's lifetime and is only used to decide
-	// whether to apply the linux seccomp profile. Fetch it once here so the hot
-	// launch and solve paths never have to call the (heavy) Info endpoint.
-	info, err := cli.Info(m.ctx, client.InfoOptions{})
-	if err != nil {
-		m.log.errorf("could not query docker engine info: %s", err)
-		return err
-	}
-	m.hostOSType = info.Info.OSType
+	var err error
 
 	// Per-daemon slots (see launch.go). dockerd serializes an instance's
 	// network creation and container starts internally on either firewall
@@ -106,6 +99,29 @@ func (m *Manager) initDocker() error {
 		m.authString = base64.StdEncoding.EncodeToString([]byte(authPayload))
 	}
 
+	if m.externalBuildPlane {
+		if m.challengeRegistry == "" {
+			// Without a registry the images an instance runs are the
+			// builder's own copies, and an external build plane leaves
+			// this daemon none.
+			err = fmt.Errorf("%s is required on an external build plane: the workers pull every image from it", REGISTRY_ENV)
+			m.log.error(err)
+			return err
+		}
+		// The registry client is the only image cleanup left here (destroy
+		// and prune untag in the registry alone), and its material lives
+		// under a docker-owned path by default, which a box with no docker
+		// need not have. A client that cannot be built is refused now, not
+		// discovered as a warning per tag after every schema delete. Built
+		// and dropped rather than kept: the one the untags use is made on
+		// first use as before, so a rotation before then is picked up.
+		if _, err = m.newRegistryHTTPClient(); err != nil {
+			err = fmt.Errorf("the registry client could not be built, and an external build plane untags images in the registry only: %w (set %s, or place ca.crt, client.cert and client.key under /etc/docker/certs.d/<registry>)", err, REGISTRY_CERT_DIR_ENV)
+			m.log.error(err)
+			return err
+		}
+	}
+
 	// After challengeRegistry is known: without a registry there is nothing to
 	// push to and the local images are the only copy, so purging is refused.
 	m.initPurgeAfterPush()
@@ -115,6 +131,66 @@ func (m *Manager) initDocker() error {
 		m.log.errorf("%s", err)
 	}
 
+	return err
+}
+
+// connectDocker creates the local docker client, waits for the daemon to
+// answer, and caches its OSType.
+func (m *Manager) connectDocker() error {
+	// Deliberately not client.FromEnv: DOCKER_CERT_PATH holds the worker mTLS
+	// material (see workers.go) and must not switch this local unix-socket
+	// client into HTTPS mode.
+	cli, err := client.NewClientWithOpts(
+		client.WithHostFromEnv(),
+		client.WithVersionFromEnv(),
+	)
+	if err != nil {
+		m.log.errorf("could not create docker client: %s", err)
+		return err
+	}
+
+	m.cli = cli
+
+	var ping client.PingResult
+	for attempt := 1; attempt <= 3; attempt++ {
+		ping, err = cli.Ping(m.ctx, client.PingOptions{})
+		if err == nil {
+			break
+		}
+		if attempt < 3 {
+			m.log.warnf("failed to ping docker engine (attempt %d/3): %s. retrying...", attempt, err)
+			time.Sleep(1 * time.Second)
+		}
+	}
+	if err != nil {
+		m.log.errorf("could not connect to docker engine: %s", err)
+		return err
+	}
+
+	m.log.infof("connected to docker (API v%s)", ping.APIVersion)
+
+	// OSType is immutable for the daemon's lifetime and is only used to decide
+	// whether to apply the linux seccomp profile. Fetch it once here so the hot
+	// launch and solve paths never have to call the (heavy) Info endpoint.
+	info, err := cli.Info(m.ctx, client.InfoOptions{})
+	if err != nil {
+		m.log.errorf("could not query docker engine info: %s", err)
+		return err
+	}
+	m.hostOSType = info.Info.OSType
+
+	return nil
+}
+
+// removeLocalImage is ImageRemove on the local daemon. An external build
+// plane holds no images, so there it answers "not found" without a daemon
+// to ask: the callers' handling of an image already gone is exactly right
+// for one that was never here, and their registry untag still runs.
+func (m *Manager) removeLocalImage(imageName string, iro client.ImageRemoveOptions) error {
+	if m.externalBuildPlane {
+		return errdefs.ErrNotFound
+	}
+	_, err := m.cli.ImageRemove(m.ctx, imageName, iro)
 	return err
 }
 
@@ -171,6 +247,10 @@ func (i *InstanceMetadata) getNetworkName() string {
 func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 	if len(builds) == 0 {
 		return nil
+	}
+
+	if m.externalBuildPlane {
+		return m.requireIngestedBuilds(builds)
 	}
 
 	buildsComplete := true
@@ -282,6 +362,36 @@ func (m *Manager) generateBuilds(builds []*BuildMetadata) error {
 	return nil
 }
 
+// requireIngestedBuilds is generateBuilds on an external build plane: there
+// is no tree to detect drift in and nothing to build, both being the build
+// plane's. convergeSchema has required every build the schema names to be
+// handed over before it locked anything (requireHandedOver) and holds
+// updateMu while it converges, so what reaches here is on record; a build
+// without a hand-over is the same refusal again, as the safety net under
+// the lock. Of what a local converge would still say, one thing needs no
+// tree: a build produced from an earlier source generation, whose rebuild
+// is the build plane's to hand over.
+func (m *Manager) requireIngestedBuilds(builds []*BuildMetadata) error {
+	challenge := builds[0].Challenge
+	missing := []int{}
+	for _, build := range builds {
+		if build.Flag == "" {
+			missing = append(missing, build.Seed)
+		}
+	}
+	if len(missing) > 0 {
+		err := missingHandOverError(challenge, builds[0].Schema, builds[0].Format, missing)
+		m.log.error(err)
+		return err
+	}
+	if stale, err := m.challengeHasStaleBuild(challenge); err != nil {
+		m.log.warnf("could not check whether the builds of '%s' are current: %s", challenge, err)
+	} else if stale {
+		m.log.warnf("a build of '%s' was produced from an earlier source generation; hand over a rebuild", challenge)
+	}
+	return nil
+}
+
 type dockerError struct {
 	Error string `json:"error"`
 }
@@ -390,6 +500,17 @@ func (m *Manager) buildContentChecksum(sourceChecksum uint32, format string, cha
 	return contentChecksum(sourceChecksum, format, m.basePinsChecksum(), m.templateChecksum(challengeType))
 }
 
+// ContentChecksum is the identity a build has under the inputs given: its
+// source generation, its flag format, a base image pin fingerprint and the
+// challenge type whose template it is built from. It is what a hand-over
+// states and what the daemon taking one recomputes (see checkHandOver), so
+// a build plane can ask the same question of its own builds before it
+// hands them over -- a build made under other pins carries an identity
+// these inputs do not give, and would be refused.
+func (m *Manager) ContentChecksum(sourceChecksum uint32, format string, pinFingerprint uint32, challengeType string) uint32 {
+	return contentChecksum(sourceChecksum, format, pinFingerprint, m.templateChecksum(challengeType))
+}
+
 // dockerId is the docker tag for one of the build's images. It is derived
 // from portable build identity — seed plus content checksum — rather than the
 // local autoincrement build id, so the same challenge content yields the same
@@ -414,7 +535,25 @@ func (bMeta *BuildMetadata) dockerId(image Image) string {
 // start. Called from initDatabase before m.db is assigned, so the handle is
 // passed in explicitly; m.cli is nil when the database is initialized without
 // docker (tests), in which case retagging is skipped.
+// unmigratedBuilds counts the builds still at the checksum=0 resume marker
+// that migrateBuildChecksums would select: those with a challenge row. An
+// orphan (foreign keys off during an out-of-band edit) is neither migrated
+// nor counted, so an external build plane's refusal (checkExternalBuildPlane)
+// never sends the operator to a local start that could not clear it.
+func unmigratedBuilds(db *sqlx.DB) (int, error) {
+	var count int
+	err := db.Get(&count, `SELECT COUNT(1) FROM builds AS b JOIN challenges AS c ON b.challenge = c.id
+		WHERE b.checksum = 0;`)
+	return count, err
+}
+
 func (m *Manager) migrateBuildChecksums(db *sqlx.DB) error {
+	if m.externalBuildPlane {
+		// The retag and push need the local daemon. Rows still at 0 are
+		// refused once the migrations are through (checkExternalBuildPlane)
+		// rather than stamped with a checksum whose tags exist nowhere.
+		return nil
+	}
 	rows := []struct {
 		Id             BuildId
 		Seed           int
@@ -1062,9 +1201,12 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		// one found present belonged to someone else) is taken back out, or
 		// a generation no row names would sit in the registry for good --
 		// prune and destroy reconstruct tags from rows, so they would never
-		// find it. Best-effort, like every registry delete, and outside
-		// imageMu: each call may wait out the registry timeout, and the
-		// purge and prune paths queue on that lock.
+		// find it. registryDeleteTag directly rather than retireRegistryTag:
+		// this is not a retirement but a push being taken back, of content
+		// nothing outside this build has been told about yet, so a build
+		// plane does it too (see AsBuildPlane). Best-effort, like every
+		// registry delete, and outside imageMu: each call may wait out the
+		// registry timeout, and the purge and prune paths queue on that lock.
 		if unreferenced {
 			for _, imageName := range pushed {
 				if derr := m.registryDeleteTag(imageName); derr != nil {
@@ -1542,7 +1684,7 @@ func (m *Manager) pruneReplacedImages(replaced []replacedImages) {
 			continue
 		}
 		for _, tag := range r.tags {
-			if _, err := m.cli.ImageRemove(m.ctx, tag, iro); err != nil {
+			if err := m.removeLocalImage(tag, iro); err != nil {
 				if errdefs.IsNotFound(err) {
 					// Already removed — e.g. a build in another schema shared
 					// the tuple and its entry was pruned first.
@@ -1556,10 +1698,8 @@ func (m *Manager) pruneReplacedImages(replaced []replacedImages) {
 			// Registry mode: also untag the generation in the registry, or it
 			// accumulates one immutable tag per rebuild forever. Best-effort —
 			// a leaked registry tag is recoverable, a failed update is not.
-			if m.challengeRegistry != "" {
-				if err := m.registryDeleteTag(tag); err != nil {
-					m.log.warnf("could not prune replaced registry tag %s: %s", tag, err)
-				}
+			if err := m.retireRegistryTag(tag); err != nil {
+				m.log.warnf("could not prune replaced registry tag %s: %s", tag, err)
 			}
 		}
 	}
@@ -1614,7 +1754,7 @@ func (m *Manager) destroyImages(build BuildId) error {
 	} else {
 		for _, image := range bMeta.Images {
 			imageName := m.instanceImageName(bMeta.Challenge, bMeta, image)
-			if _, err := m.cli.ImageRemove(m.ctx, imageName, iro); err != nil {
+			if err := m.removeLocalImage(imageName, iro); err != nil {
 				if errdefs.IsNotFound(err) {
 					// Debug, not warn: with purge-after-push on (the default
 					// in registry mode) the builder no longer holds these by
@@ -1628,8 +1768,8 @@ func (m *Manager) destroyImages(build BuildId) error {
 				}
 			}
 			// Best-effort registry untag, mirroring pruneReplacedImages.
-			if m.challengeRegistry != "" && image.Host != "builder" {
-				if err := m.registryDeleteTag(imageName); err != nil {
+			if image.Host != "builder" {
+				if err := m.retireRegistryTag(imageName); err != nil {
 					m.log.warnf("could not remove registry tag %s: %s", imageName, err)
 				}
 			}
@@ -1649,11 +1789,11 @@ func (m *Manager) destroyImages(build BuildId) error {
 		if !m.contentReferenced(&prevMeta, bMeta.Id) {
 			for _, image := range bMeta.Images {
 				imageName := m.instanceImageName(bMeta.Challenge, &prevMeta, image)
-				if _, err := m.cli.ImageRemove(m.ctx, imageName, iro); err != nil && !errdefs.IsNotFound(err) {
+				if err := m.removeLocalImage(imageName, iro); err != nil && !errdefs.IsNotFound(err) {
 					m.log.warnf("could not remove rollback-generation image %s: %s", imageName, err)
 				}
-				if m.challengeRegistry != "" && image.Host != "builder" {
-					if err := m.registryDeleteTag(imageName); err != nil {
+				if image.Host != "builder" {
+					if err := m.retireRegistryTag(imageName); err != nil {
 						m.log.warnf("could not remove rollback-generation registry tag %s: %s", imageName, err)
 					}
 				}

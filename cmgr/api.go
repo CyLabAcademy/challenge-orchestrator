@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/CyLabAcademy/challenge-orchestrator/cmgr/dockerfiles"
@@ -25,16 +26,30 @@ func Version() string {
 
 // Creates a new instance of the challenge manager validating the appropriate
 // environment variables in the process.  A return value of `nil` indicates
-// a fatal error occurred during intitialization.
-func NewManager(logLevel LogLevel) *Manager {
+// a fatal error occurred during intitialization.  The options say what the
+// calling process is, which its environment does not get to contradict (see
+// ManagerOption).
+func NewManager(logLevel LogLevel, options ...ManagerOption) *Manager {
 	mgr := new(Manager)
 	mgr.log = newLogger(logLevel)
 	mgr.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+	// An orchestrator unless its caller says otherwise: the daemon and the
+	// CLI both serve what they build, and only a build plane does not.
+	mgr.retiresRegistryTags = true
+	for _, option := range options {
+		option(mgr)
+	}
 
 	mgr.log.infof("version: %s", Version())
 
 	if err := mgr.initPolicy(); err != nil {
 		mgr.log.error(err)
+		return nil
+	}
+
+	// Before the directories, the pins and docker: on an external build
+	// plane each of those skips what only a local one reads.
+	if err := mgr.initBuildPlane(); err != nil {
 		return nil
 	}
 
@@ -53,6 +68,10 @@ func NewManager(logLevel LogLevel) *Manager {
 	}
 
 	if err := mgr.initDatabase(); err != nil {
+		return nil
+	}
+
+	if err := mgr.checkExternalBuildPlane(); err != nil {
 		return nil
 	}
 
@@ -89,24 +108,26 @@ func NewManager(logLevel LogLevel) *Manager {
 // making any other API calls for affected challenges.  Failure to follow this
 // guidance could result in inconsistencies in deployed challenges.
 func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
+	// No tree to scan: drift is detected where the tree is, on the build
+	// plane, and this daemon learns of a change when the build arrives.
+	if m.externalBuildPlane {
+		return &ChallengeUpdates{Errors: []error{ErrExternalBuildPlane}}
+	}
+
 	if fp == "" {
 		fp = m.chalDir
 	}
 
-	cu := new(ChallengeUpdates)
-
 	fp, err := m.normalizeDirPath(fp)
 	if err != nil {
-		cu.Errors = []error{err}
-		return cu
+		return &ChallengeUpdates{Errors: []error{err}}
 	}
 
 	challenges, errs := m.inventoryChallenges(fp)
 	db_metadata, err := m.listChallenges()
 
 	if err != nil {
-		cu.Errors = append(errs, err)
-		return cu
+		return &ChallengeUpdates{Errors: append(errs, err)}
 	}
 
 	// One query for every challenge with a build left at an earlier
@@ -117,60 +138,120 @@ func (m *Manager) DetectChanges(fp string) *ChallengeUpdates {
 		errs = append(errs, err)
 	}
 
-	for _, curr := range db_metadata {
-		newMeta, ok := challenges[curr.Id]
+	// A row the scan did not find was removed only if the scan covered
+	// where it lived: under the scanned path, or outside the tree
+	// altogether (a stray this daemon could never see again).
+	cu := m.classifyChallenges(challenges, db_metadata, stale, func(row *ChallengeMetadata) bool {
+		return pathInDirectory(row.Path, fp) || !pathInDirectory(row.Path, m.chalDir)
+	})
+	cu.Errors = errs
+	return cu
+}
+
+// classifyChallenges sorts an inventory of challenges, keyed by id, against
+// the rows the database holds, into the verdicts of classifyChallenge plus
+// Removed: a row the inventory lacks, when `removed` says the inventory
+// would have had it. The directory scan is its caller; a hand-over of one
+// challenge asks classifyChallenge for its one verdict instead. It
+// classifies and does not scan, so the errors are the caller's.
+func (m *Manager) classifyChallenges(inventory map[ChallengeId]*ChallengeMetadata, current []*ChallengeMetadata, stale map[ChallengeId]bool, removed func(*ChallengeMetadata) bool) *ChallengeUpdates {
+	cu := new(ChallengeUpdates)
+	seen := make(map[ChallengeId]bool, len(current))
+
+	for _, curr := range current {
+		newMeta, ok := inventory[curr.Id]
 		if !ok {
-			if pathInDirectory(curr.Path, fp) || !pathInDirectory(curr.Path, m.chalDir) {
+			if removed(curr) {
 				cu.Removed = append(cu.Removed, curr)
 			}
 			continue
 		}
+		seen[curr.Id] = true
 
-		sourceChanged := curr.SourceChecksum != newMeta.SourceChecksum
-		metadataChanged := curr.MetadataChecksum != newMeta.MetadataChecksum
-		solvescriptChanged := curr.SolveScript != newMeta.SolveScript
-		// safeToRefresh is a full metadata lookup, so it is asked only where
-		// its answer can change the verdict: never for a source change.
-		switch {
-		case sourceChanged:
+		switch m.classifyChallenge(curr, newMeta, stale[curr.Id]) {
+		case verdictUpdated:
 			cu.Updated = append(cu.Updated, newMeta)
-		case metadataChanged || solvescriptChanged:
-			if m.safeToRefresh(newMeta) {
-				m.log.debugf("Marking %s as refresh", newMeta.Id)
-				cu.Refreshed = append(cu.Refreshed, newMeta)
-			} else {
-				cu.Updated = append(cu.Updated, newMeta)
-			}
-		case !m.safeToRefresh(newMeta):
-			// The checksums are unchanged but the persisted options disagree
-			// with what the current loader parses — e.g. a challenge that
-			// declared a seccomp profile before the binary understood the
-			// option, or a corrupt options row. Re-persist through the
-			// refresh path (no rebuild) so the declared options take effect.
-			m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
+		case verdictRefreshed:
 			cu.Refreshed = append(cu.Refreshed, newMeta)
-		case stale[curr.Id]:
-			// Nothing changed on disk, but a build was produced from an
-			// earlier generation: its last rebuild failed after the challenge
-			// row had moved on (updateChallenges commits the metadata before
-			// it builds). Compared by checksums alone the challenge looks
-			// unmodified and the failure would be invisible to every later
-			// update; it stays reported, and rebuilt, until a rebuild
-			// succeeds. A challenge that is also Refreshed is reported as
-			// that, and its stale builds are rebuilt on that path all the same.
+		case verdictStale:
 			cu.Stale = append(cu.Stale, newMeta)
-		default:
+		case verdictUnmodified:
 			cu.Unmodified = append(cu.Unmodified, curr)
 		}
-		delete(challenges, curr.Id)
 	}
 
-	for _, metadata := range challenges {
-		cu.Added = append(cu.Added, metadata)
+	for id, metadata := range inventory {
+		if !seen[id] {
+			cu.Added = append(cu.Added, metadata)
+		}
 	}
 
-	cu.Errors = errs
 	return cu
+}
+
+// challengeVerdict is what one challenge's inventory entry means against
+// the row the database holds for it; see classifyChallenge.
+type challengeVerdict int
+
+const (
+	// No row yet.
+	verdictAdded challengeVerdict = iota
+	// The source changed, or metadata changed in a way a refresh cannot
+	// carry: a rebuild.
+	verdictUpdated
+	// Metadata or the solve script only, or persisted options that no
+	// longer match the parsed ones: re-persisted, nothing rebuilt.
+	verdictRefreshed
+	// Unchanged, but a build of it was produced from an earlier generation.
+	verdictStale
+	verdictUnmodified
+)
+
+// classifyChallenge is the verdict for one challenge: newMeta as the
+// inventory describes it (a scan of the tree, or a hand-over), current as
+// the database holds it, nil when it holds nothing, and stale whether a
+// build of it stands at an earlier source generation. Refreshed outranks
+// Stale: whatever a failed rebuild left behind is rebuilt on both paths, so
+// Stale is only given when there is nothing else to report.
+func (m *Manager) classifyChallenge(current, newMeta *ChallengeMetadata, stale bool) challengeVerdict {
+	if current == nil {
+		return verdictAdded
+	}
+	sourceChanged := current.SourceChecksum != newMeta.SourceChecksum
+	metadataChanged := current.MetadataChecksum != newMeta.MetadataChecksum
+	solvescriptChanged := current.SolveScript != newMeta.SolveScript
+	// safeToRefresh is a full metadata lookup, so it is asked only where
+	// its answer can change the verdict: never for a source change.
+	switch {
+	case sourceChanged:
+		return verdictUpdated
+	case metadataChanged || solvescriptChanged:
+		if m.safeToRefresh(newMeta) {
+			m.log.debugf("Marking %s as refresh", newMeta.Id)
+			return verdictRefreshed
+		}
+		return verdictUpdated
+	case !m.safeToRefresh(newMeta):
+		// The checksums are unchanged but the persisted options disagree
+		// with what the current loader parses -- e.g. a challenge that
+		// declared a seccomp profile before the binary understood the
+		// option, or a corrupt options row. Re-persist through the
+		// refresh path (no rebuild) so the declared options take effect.
+		m.log.infof("Marking %s as refresh: persisted options differ from parsed metadata", newMeta.Id)
+		return verdictRefreshed
+	case stale:
+		// Nothing changed on disk, but a build was produced from an
+		// earlier generation: its last rebuild failed after the challenge
+		// row had moved on (updateChallenges commits the metadata before
+		// it builds). Compared by checksums alone the challenge looks
+		// unmodified and the failure would be invisible to every later
+		// update; it stays reported, and rebuilt, until a rebuild
+		// succeeds. A challenge that is also Refreshed is reported as
+		// that, and its stale builds are rebuilt on that path all the same.
+		return verdictStale
+	default:
+		return verdictUnmodified
+	}
 }
 
 // UpdateOptions adjusts the behavior of `UpdateWithOptions`.
@@ -210,6 +291,12 @@ func (m *Manager) Update(fp string) *ChallengeUpdates {
 // UpdateWithOptions is identical to Update but takes explicit options; Update
 // is equivalent to calling this with the zero-value UpdateOptions.
 func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *ChallengeUpdates {
+	// Refused before the lock: a schema operation waiting behind it would
+	// otherwise queue on a request that can do nothing.
+	if m.externalBuildPlane {
+		return &ChallengeUpdates{Errors: []error{ErrExternalBuildPlane}}
+	}
+
 	// One rebuild at a time. Two of them would work over the same instances:
 	// each tearing down what the other just started, reassigning the same
 	// ports twice, and taking the network the other had just created for a
@@ -254,6 +341,9 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 // See cacheRefsFor and BUILDER.md. (This replaced a per-challenge "freeze"
 // image, which is gone.)
 func (m *Manager) Build(challenge ChallengeId, seeds []int, flagFormat string) ([]*BuildMetadata, error) {
+	if m.externalBuildPlane {
+		return nil, ErrExternalBuildPlane
+	}
 	schema := fmt.Sprintf("%s%x", manualSchemaPrefix, m.rand.Int63())
 	instanceCount := -1
 
@@ -324,13 +414,19 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string, l
 
 	// Placement (cmgrd only): pick a worker before the instance row is
 	// created so the worker is recorded with it. With no workers configured
-	// selectWorker returns "" and the instance runs on the local daemon.
+	// selectWorker returns "" and the instance runs on the local daemon --
+	// on a local build plane. An external one has no local daemon, so a
+	// launch with nowhere to go is refused here, before anything is
+	// recorded, as a failure of the fleet rather than a retryable one.
 	if m.placementEnabled {
 		worker, err := m.selectWorker()
 		if err != nil {
 			return 0, err
 		}
 		iMeta.Worker = worker
+	}
+	if iMeta.Worker == "" && m.externalBuildPlane {
+		return 0, ErrNoWorkers
 	}
 
 	// Refuse at once what would only be refused after the wait (admit).
@@ -416,14 +512,35 @@ func (m *Manager) Stop(instance InstanceId) error {
 	return m.stopInstance(iMeta)
 }
 
+// unreachable reports an instance no daemon of this process can reach: one
+// on a down (or purged) worker, or one placed on the local daemon, which an
+// external build plane does not have. Both are stopped by clearing records
+// alone (stopInstance); instanceClient refuses the latter outright.
+func (m *Manager) unreachable(instance *InstanceMetadata) bool {
+	if instance.Worker == "" {
+		return m.externalBuildPlane
+	}
+	return m.workerIsDown(instance.Worker)
+}
+
+// whereUnreachable says why an instance is out of reach, for the log.
+func (m *Manager) whereUnreachable(instance *InstanceMetadata) string {
+	if instance.Worker == "" {
+		return "placed on the local daemon, which an external build plane has none of"
+	}
+	return fmt.Sprintf("worker %s down", instance.Worker)
+}
+
 func (m *Manager) stopInstance(instance *InstanceMetadata) error {
-	// A down (or purged) worker cannot be reached: clear our records and
-	// report success so callers (the platform's stop/restart/TTL flows) are
-	// never wedged behind a dead box. Any containers actually left running
-	// are removed if the box rejoins placement (reconcileWorker, on
-	// worker-add and at startup); until then they are docker-reaper's.
-	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
-		m.log.warnf("worker %s down: clearing instance %d records without docker teardown", instance.Worker, instance.Id)
+	// A daemon that cannot be reached -- a down (or purged) worker, or the
+	// local daemon an external build plane does not have: clear our records
+	// and report success so callers (the platform's stop/restart/TTL flows,
+	// a schema delete, a prune) are never wedged behind it. Any containers
+	// actually left running on a worker are removed if the box rejoins
+	// placement (reconcileWorker, on worker-add and at startup); until then
+	// they are docker-reaper's.
+	if m.unreachable(instance) {
+		m.log.warnf("%s: clearing instance %d records without docker teardown", m.whereUnreachable(instance), instance.Id)
 		return m.removeInstanceMetadata(instance.Id)
 	}
 
@@ -433,7 +550,7 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 		// the worker went down while it waited for its slot: finish the way a
 		// stop on a down worker does, so the caller gets its success now
 		// rather than from a second attempt.
-		if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+		if m.unreachable(instance) {
 			m.log.warnf("worker %s went down during the stop of instance %d: clearing its records without further docker teardown", instance.Worker, instance.Id)
 			return m.removeInstanceMetadata(instance.Id)
 		}
@@ -530,6 +647,18 @@ func (m *Manager) UpdateSchema(schema *Schema) []error {
 }
 
 func (m *Manager) convergeSchema(schema *Schema) []error {
+	// On an external build plane nothing is built here, so every build the
+	// schema wants must already have been handed over. Checked before
+	// anything is locked or torn down: a schema whose builds have not
+	// arrived is refused whole, with the running state untouched, rather
+	// than after cleanupSchemaResources has released the builds it
+	// displaces and openBuild has written placeholder rows for the rest.
+	if m.externalBuildPlane {
+		if errs := m.requireHandedOver(schema); len(errs) > 0 {
+			return errs
+		}
+	}
+
 	// Mark existing state as locked/outdated
 	err := m.lockSchema(schema.Name)
 	if err != nil {
@@ -669,6 +798,9 @@ func (m *Manager) DeleteSchema(name string) error {
 
 func (m *Manager) cleanupSchemaResources(name string) error {
 	instances, err := m.removedSchemaInstances(name)
+	if err != nil {
+		return err
+	}
 	for _, id := range instances {
 		iMeta, err := m.lookupInstanceMetadata(id)
 		if err != nil {
@@ -682,6 +814,9 @@ func (m *Manager) cleanupSchemaResources(name string) error {
 	}
 
 	builds, err := m.removedSchemaBuilds(name)
+	if err != nil {
+		return err
+	}
 	for _, id := range builds {
 		err = m.destroyImages(id)
 		if err != nil {
@@ -744,6 +879,14 @@ func (m *Manager) GetChallengeMetadata(challenge ChallengeId) (*ChallengeMetadat
 
 func (m *Manager) GetBuildMetadata(build BuildId) (*BuildMetadata, error) {
 	return m.lookupBuildMetadata(build)
+}
+
+// BuildArtifactsPath is where this daemon keeps a build's artifact bundle,
+// the file GET /builds/<id>/artifacts.tar.gz serves. A build plane reads it
+// back from here to put it in the hand-over.
+func (m *Manager) BuildArtifactsPath(build BuildId) string {
+	meta := BuildMetadata{Id: build}
+	return filepath.Join(m.artifactsDir, meta.getArtifactsFilename())
 }
 
 func (m *Manager) GetInstanceMetadata(instance InstanceId) (*InstanceMetadata, error) {
