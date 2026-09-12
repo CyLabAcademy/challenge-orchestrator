@@ -270,8 +270,11 @@ func loadSchema(path string) (*cmgr.Schema, error) {
 	if err != nil {
 		return nil, err
 	}
-	if schema.Name == "" {
-		return nil, fmt.Errorf("schema file '%s' has no name", path)
+	// The name addresses the schema on every orchestrator that takes it, in
+	// a URL path with no escaping, so it is checked where it is read rather
+	// than where it first fails to address anything (validSchemaName).
+	if err := validSchemaName(schema.Name); err != nil {
+		return nil, fmt.Errorf("schema file '%s': %w", path, err)
 	}
 	if schema.FlagFormat == "" {
 		return nil, fmt.Errorf("schema file '%s' has no flag format", path)

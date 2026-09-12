@@ -66,6 +66,45 @@ func TestLoadDestinations(t *testing.T) {
 	}
 }
 
+// What `destinations` prints. Sorted, and saying which one an unrouted
+// schema means -- the two things an operator reads it to find out, and the
+// order is worth pinning because a map would give a different one each run.
+func TestDestinationsListing(t *testing.T) {
+	none, err := loadDestinations("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := none.listing(); !strings.Contains(got, DESTINATIONS_ENV) {
+		t.Errorf("with none configured the listing does not name %s: %q", DESTINATIONS_ENV, got)
+	}
+
+	many, err := loadDestinations(writeDestinations(t, "spring: http://spring:4200\nautumn: http://autumn:4200\nlibrary: http://library:4200\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(many.listing(), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("%d line(s) for three destinations: %q", len(lines), lines)
+	}
+	for i, want := range []string{"autumn", "library", "spring"} {
+		if !strings.HasPrefix(lines[i], want) {
+			t.Errorf("line %d is %q, want the destinations in name order starting with %q", i, lines[i], want)
+		}
+	}
+	// No default with more than one, so nothing is marked as one.
+	if strings.Contains(many.listing(), "the default") {
+		t.Errorf("a default was named although there are three destinations: %q", many.listing())
+	}
+
+	one, err := loadDestinations(writeDestinations(t, "library: http://library:4200\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := one.listing(); !strings.Contains(got, "the default") {
+		t.Errorf("the only destination is not marked as the one an unrouted schema means: %q", got)
+	}
+}
+
 // A schema that names no destination means the only one there is, and is
 // refused once there is more than one. The rule changes exactly when the
 // risk appears: nothing to be ambiguous about with one configured, and a

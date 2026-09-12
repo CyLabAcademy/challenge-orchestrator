@@ -138,7 +138,7 @@ func main() {
 	// Where the destination names schemas use point: deployment topology,
 	// written by the same ansible that stands the orchestrators up, so a
 	// rebuilt build plane gets its routing back the way it gets everything
-	// else. Read before the command runs: a build routes by it.
+	// else. Read before any command, since all three route.
 	dests, err := loadDestinations(os.Getenv(DESTINATIONS_ENV))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -149,6 +149,12 @@ func main() {
 	switch flag.Arg(0) {
 	case "build":
 		exitCode = buildCommand(mgr, servers, dests, flag.Args()[1:])
+	case "remove-schema":
+		exitCode = removeSchemaCommand(mgr, servers, dests, flag.Args()[1:])
+	case "migrate-schema":
+		exitCode = migrateSchemaCommand(mgr, servers, dests, flag.Args()[1:])
+	case "destinations":
+		exitCode = destinationsCommand(dests)
 	case "pins":
 		exitCode = pinsCommand(mgr)
 	case "version":
@@ -182,6 +188,23 @@ Commands:
       Build the schemas that share a challenge in one run: one
       content-addressed tag cannot be served by two orchestrators, and that
       is checked across the schemas of a run.
+  remove-schema <schema name>
+      take the schema out of service: the orchestrator serving it drops its
+      builds and retires their images from the registry, and this build
+      plane drops its own rows for them. Destructive on both sides -- a
+      later build of the same schema builds and pushes it again. A name and
+      not a file, since nothing else about the schema survives this: which
+      orchestrator has it is found by asking them, and --server names one
+      directly.
+  migrate-schema <schema file>
+      move the schema to the destination its file now names. Its images stay
+      in the registry and are adopted by the orchestrator taking it: a
+      build's identity does not depend on which orchestrator serves it, so a
+      migration rebuilds nothing and takes seconds, and the orchestrator
+      taking it is converged, so the move finishes rather than half of it.
+  destinations
+      list the destination names configured and the orchestrators they
+      stand for.
   pins
       re-resolve every base image the challenge directory names to the
       digest the registry serves now, and write CMGR_BASE_PINS. Nothing is
