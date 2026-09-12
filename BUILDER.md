@@ -205,11 +205,24 @@ builds on demand, which launches no instance, and the `instance_count` the
 schema really asks for travels in the hand-over for the orchestrator to
 converge to.
 
-Its database is bookkeeping rather than a source of truth. Keeping it between
-runs saves rebuilding what has not changed; losing it costs a re-derivation,
-in which every image already in the registry is adopted rather than built
-again (the registry is write-once, so a tag that is there is the content it
-names).
+Its database is bookkeeping rather than a source of truth, but it is not
+disposable while anything it built is in service. Keeping it between runs
+saves rebuilding what has not changed. Losing it costs a re-derivation, in
+which every image already in the registry is adopted rather than built again
+(the registry is write-once, so a tag that is there is the content it names)
+— but a re-derivation draws new build ids, and an orchestrator records each
+build under the id this plane gave it, since that is the id its artifact
+bundle is named by and the only id the platform has to address those files
+with. So a hand-over of a re-derived build is refused, naming the id it is
+already on record under.
+
+Keep this database for as long as any schema it built is being served. If it
+is lost anyway, recovery is `remove-schema` on the orchestrator and then
+`build` — which is destructive on both sides and rebuilds rather than
+adopting, because remove-schema retires the tags the adoption would have
+used. Releasing without retiring (`DELETE /schemas/<name>?retire=false`, the
+call `migrate-schema` makes) is the cheaper path where the situation allows
+it: the tags survive, so the rebuild adopts them and the new ids stick.
 
 Which is why it only ever pushes to the registry. Retiring a tag -- taking
 out a generation nothing needs any more -- means knowing every row that still

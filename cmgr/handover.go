@@ -3,6 +3,7 @@ package cmgr
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -52,8 +53,11 @@ type HandOver struct {
 	// and instance count as the schema names them there, the flag and
 	// lookup data, the images with their exposed ports, whether the build
 	// published artifacts, and the content and source checksums the build
-	// was stamped with. Ids, instances, last-solved times and the rollback
-	// generation are this daemon's own and are ignored.
+	// was stamped with. A build's id is adopted as delivered -- the build
+	// plane's bundle is named by it and the platform addresses the artifact
+	// files by the id this daemon reports, so the two numberings are one.
+	// Instances, last-solved times and the rollback generation are this
+	// daemon's own and are ignored.
 	Challenge *ChallengeMetadata `json:"challenge"`
 	// PinFingerprint is the base image pin fingerprint the builds were made
 	// under, 0 with pinning off: an input to the content checksum this
@@ -206,6 +210,13 @@ func (m *Manager) checkHandOver(id ChallengeId, handOver *HandOver) error {
 	if challenge.Id != id {
 		return invalid("the payload describes '%s', the request '%s'", challenge.Id, id)
 	}
+	// An id is a name this daemon will put in a registry URL and an image
+	// tag, and on an external plane it arrives from the network rather than
+	// from a tree this daemon scanned. Nothing downstream re-checks it, so
+	// an id the loader could never have produced is refused here.
+	if !validChallengeId(id) {
+		return invalid("'%s' is not a challenge id: %s", id, challengeIdShape)
+	}
 	if challenge.ChallengeType == "" {
 		return invalid("'%s' has no challenge type", id)
 	}
@@ -214,6 +225,14 @@ func (m *Manager) checkHandOver(id ChallengeId, handOver *HandOver) error {
 	}
 	hosts := map[string]bool{}
 	for _, host := range challenge.Hosts {
+		// A host name is the other half of an image tag (see dockerId) and
+		// so reaches a registry URL exactly as the challenge id does. It is
+		// a Dockerfile stage name on the plane that produced it, which the
+		// loader matches with `\w+`, so anything else could not have been
+		// built here.
+		if !validHostName(host.Name) {
+			return invalid("'%s' names the host %q, which is not a stage name: %s", id, host.Name, hostNameShape)
+		}
 		hosts[host.Name] = true
 	}
 	for name, port := range challenge.PortMap {
@@ -233,6 +252,15 @@ func (m *Manager) checkHandOver(id ChallengeId, handOver *HandOver) error {
 		where := handOverBuildName(i, id, build)
 		if build.Challenge != "" && build.Challenge != id {
 			return invalid("%s belongs to '%s'", where, build.Challenge)
+		}
+		// A build arrives under the id its artifact bundle is named by on
+		// the plane that made it, and that id is what this daemon records
+		// and reports for the platform to address those files with. A
+		// payload with no id would be given one drawn here, which is the
+		// mismatch the adoption exists to close, so it is refused rather
+		// than quietly numbered.
+		if build.Id <= 0 {
+			return invalid("%s carries no build id, and the id a build is handed over under is the id its artifact bundle is named by", where)
 		}
 		if build.Schema == "" || build.Format == "" {
 			return invalid("%s names no schema or no flag format", where)
@@ -323,6 +351,13 @@ func (m *Manager) requireInRegistry(challenge *ChallengeMetadata) error {
 // build whose rebuild failed (see rebuildBuilds), and reported.
 func (m *Manager) commitHandedOverBuild(cMeta *ChallengeMetadata, delivered *BuildMetadata, index int, revPortMap map[string]string, pruneOldImages bool) (*replacedImages, []error) {
 	row := &BuildMetadata{
+		// The build plane's own id, adopted rather than replaced. The bundle
+		// it extracted is named by this number and an artifact server
+		// publishes it under that name, while the platform can only address
+		// the files by the id this daemon reports -- so the two numberings
+		// have to be one. There is exactly one build plane, so its ids are
+		// an id space this daemon can borrow whole.
+		Id:            delivered.Id,
 		Seed:          delivered.Seed,
 		Format:        delivered.Format,
 		Challenge:     cMeta.Id,
@@ -334,6 +369,20 @@ func (m *Manager) commitHandedOverBuild(cMeta *ChallengeMetadata, delivered *Bui
 	}
 	if err := m.openBuild(row); err != nil {
 		return nil, []error{err}
+	}
+	// openBuild reads the row back, so a build already on record under a
+	// different number says so here: the build plane has been rebuilt and
+	// renumbered since this build was handed over. Adopting the new id would
+	// mean renumbering a row that images, lookupData and instances all
+	// reference ON UPDATE RESTRICT -- and every finalized build has image and
+	// lookup rows, so the update is always blocked, not only when something
+	// is running. It is refused instead, and refused loudly, because the
+	// alternative is the orchestrator reporting an id that addresses no
+	// bundle.
+	if delivered.Id != 0 && row.Id != delivered.Id {
+		return nil, []error{fmt.Errorf(
+			"%s is on record as build %d and was handed over as build %d: the build plane has renumbered it, and its artifact bundle is now named for the new id; release the schema (remove-schema) and hand it over again",
+			handOverBuildName(index, cMeta.Id, delivered), row.Id, delivered.Id)}
 	}
 	// A row with no generation on it -- opened now, or by a hand-over that
 	// did not finish -- is dropped if this one does not finish either.
@@ -420,4 +469,40 @@ func (m *Manager) RemoveChallenge(id ChallengeId) error {
 		return fmt.Errorf("challenge '%s' has %d build(s) on record: %w", id, builds, ErrChallengeHasBuilds)
 	}
 	return m.removeChallenges([]*ChallengeMetadata{meta})
+}
+
+// challengeIdShape describes challengeIdRe for the operator reading a refusal.
+const challengeIdShape = "an optional namespace of '/'-separated lowercase alphanumeric segments, then a name of lowercase letters, numerals and '-' that neither starts nor ends with '-'"
+
+// challengeIdRe is exactly what the loader can produce: an optional namespace
+// of lowercase alphanumeric segments (validated in loadMarkdownChallenge) and
+// a name that sanitizeName has lowercased, had its non-alphanumerics turned
+// into '-' and been trimmed of leading and trailing '-'. Runs of '-' are
+// deliberately allowed: sanitizeName leaves one per non-alphanumeric, so "over
+// the wire" becomes "over-the-wire" and "a  b" becomes "a--b".
+var challengeIdRe = regexp.MustCompile(`^([a-z0-9]+(/[a-z0-9]+)*/)?[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// validChallengeId reports whether an id is one the loader could have made.
+// It is the whole of the defence for the strings that reach a registry URL
+// path and an image tag: a hand-over is taken from the network, and neither
+// instanceImageName nor registryManifestRequest can tell a challenge id from
+// the punctuation that would re-divide the request they build.
+func validChallengeId(id ChallengeId) bool {
+	return challengeIdRe.MatchString(string(id))
+}
+
+// hostNameShape describes validHostName for the operator reading a refusal.
+const hostNameShape = "letters, numerals and '_'"
+
+// hostNameRe is what a host name can be: a Dockerfile stage name, which the
+// loader finds with `FROM +\S+(?: +[aA][sS] +(\w+))?` (see loadChallenge), so
+// \w+ is the whole of it. A host name goes into an image tag beside the
+// challenge id (dockerId) and from there into a registry URL path, and on an
+// external build plane it arrives from the network like everything else in a
+// hand-over.
+var hostNameRe = regexp.MustCompile(`^\w+$`)
+
+// validHostName reports whether a host name is one a build could have made.
+func validHostName(name string) bool {
+	return hostNameRe.MatchString(name)
 }

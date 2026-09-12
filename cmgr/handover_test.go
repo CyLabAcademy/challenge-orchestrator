@@ -61,8 +61,15 @@ func (f *handOverFixture) handOver(id ChallengeId, source, pins uint32, builds .
 
 // delivered is one build as a hand-over carries it: on demand, so nothing
 // is launched when it lands, with one image on the challenge host.
+//
+// The id is the build plane's own, which every hand-over carries and this
+// daemon adopts, because the bundle on that plane is named by it. Derived
+// from the seed so that two builds of one challenge differ, and offset well
+// clear of 1 so that a test asserting an id cannot pass against a locally
+// drawn one by coincidence.
 func delivered(seed int, flag string, artifacts bool) *BuildMetadata {
 	return &BuildMetadata{
+		Id:            BuildId(900 + seed),
 		Schema:        "event",
 		Format:        "flag{%s}",
 		Seed:          seed,
@@ -104,7 +111,9 @@ func TestHandOverRecordsWhatTheBuildPlaneBuilt(t *testing.T) {
 	id := ChallengeId("test/handed-over")
 	first := delivered(1, "flag{one}", true)
 	second := delivered(2, "flag{two}", false)
-	// The build plane's own ids and instances mean nothing here.
+	// The build plane's ids are adopted, because its artifact bundles are
+	// named by them and the platform addresses the files by the id this
+	// daemon reports. Its instances still mean nothing here.
 	first.Id, second.Id = 900, 901
 	first.Instances = []*InstanceMetadata{{Id: 77}}
 	ho := f.handOver(id, 0x1111, 0, first, second)
@@ -131,8 +140,13 @@ func TestHandOverRecordsWhatTheBuildPlaneBuilt(t *testing.T) {
 
 	for i, want := range []*BuildMetadata{first, second} {
 		got := recorded.Builds[i]
-		if got.Id == 0 || got.Id == want.Id {
-			t.Errorf("build %d recorded under id %d, want this daemon's own", i, got.Id)
+		// The id the build plane gave it, exactly: the bundle it extracted is
+		// <id>.tar.gz there, an artifact server publishes it under that
+		// number, and the platform has only the id this daemon reports to
+		// build the download link from. A daemon numbering builds for itself
+		// would report ids that address no files.
+		if got.Id != want.Id {
+			t.Errorf("build %d recorded under id %d, want the build plane's %d", i, got.Id, want.Id)
 		}
 		if got.Flag != want.Flag || got.Checksum != want.Checksum || got.SourceChecksum != 0x1111 || got.HasArtifacts != want.HasArtifacts {
 			t.Errorf("build %d recorded as %+v", i, got)

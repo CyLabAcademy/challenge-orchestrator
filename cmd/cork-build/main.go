@@ -311,9 +311,13 @@ Environment, all as cmgrd reads them (this is cmgrd's build path):
       registry or the hand-over is refused for images the orchestrator
       cannot find
 
-  CMGR_DB - this builder's own database (defaults to 'cmgr.db'). It is
-      bookkeeping and may be thrown away: keeping it between runs only
-      saves rebuilding what has not changed
+  CMGR_DB - this builder's own database (defaults to 'cmgr.db'). Keep it
+      for as long as any schema it built is being served: an orchestrator
+      records each build under the id this plane gave it, because that is
+      the id the bundle is named by, so a plane rebuilt from scratch draws
+      new ids and its hand-over is refused. Recovering from losing it means
+      remove-schema on the orchestrator and then build, which rebuilds and
+      re-pushes rather than adopting
 
   CMGR_ARTIFACT_DIR - where built artifact bundles are kept until they are
       handed over (defaults to '.')

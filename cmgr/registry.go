@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -285,8 +286,21 @@ func (m *Manager) registryManifestRequest(method, imageName string) (*http.Reque
 		repo = prefix + "/" + repo
 	}
 
-	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", host, repo, tag)
-	req, err := http.NewRequestWithContext(m.ctx, method, url, nil)
+	// Built structurally rather than with Sprintf: repo and tag carry a
+	// challenge id and a host name, which on an external build plane arrive
+	// from the network. A '#' or '?' in either would end the path and re-aim
+	// the request at another repository, and a '..' would climb out of /v2/
+	// entirely -- with this daemon's registry credentials and client
+	// certificate on it. url.URL escapes Path when it writes the request, and
+	// Opaque is not cleaned, so the segments stay the segments they were.
+	// checkHandOver refuses such an id outright (validChallengeId); this is
+	// the second lock, on the one line that turns a name into a request.
+	ref := &url.URL{
+		Scheme: "https",
+		Host:   host,
+		Path:   "/v2/" + repo + "/manifests/" + tag,
+	}
+	req, err := http.NewRequestWithContext(m.ctx, method, ref.String(), nil)
 	if err != nil {
 		return nil, err
 	}

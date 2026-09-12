@@ -2,6 +2,7 @@ package cmgr
 
 import (
 	"fmt"
+	"strings"
 )
 
 const openBuildQuery string = `
@@ -17,6 +18,40 @@ const openBuildQuery string = `
         instancecount
     )
     VALUES (
+        :flag,
+        :seed,
+        :format,
+        :checksum,
+        :hasartifacts,
+        :lastsolved,
+        :challenge,
+        :schema,
+        :instancecount
+    ) ON CONFLICT (schema, format, challenge, seed) DO
+    UPDATE SET
+    	instancecount = excluded.instancecount;`
+
+// openBuildWithIdQuery opens a build under an id chosen by the caller rather
+// than by SQLite. Only a hand-over uses it: a bundle on the build plane is
+// named by the build id there, and the artifact server publishes it under
+// that number, so the orchestrator has to record the build under the same one
+// for the id it reports to address the files (see commitHandedOverBuild).
+// Otherwise identical to openBuildQuery, conflict clause included.
+const openBuildWithIdQuery string = `
+	INSERT INTO builds (
+        id,
+        flag,
+        seed,
+        format,
+        checksum,
+        hasartifacts,
+        lastsolved,
+        challenge,
+        schema,
+        instancecount
+    )
+    VALUES (
+        :id,
         :flag,
         :seed,
         :format,
@@ -49,10 +84,39 @@ func (m *Manager) openBuild(build *BuildMetadata) error {
 		}
 	}
 
-	_, err := m.db.NamedExec(openBuildQuery, build)
+	// A build that arrives with an id keeps it: a hand-over adopts the build
+	// plane's numbering, because the artifact bundle on that plane is named
+	// by it and the platform addresses the files by the id this daemon
+	// reports. A local build has no id yet and SQLite draws one.
+	query := openBuildQuery
+	if build.Id != 0 {
+		query = openBuildWithIdQuery
+	}
+	_, err := m.db.NamedExec(query, build)
 	m.log.debugf("Opening %v", build)
 
 	if err != nil {
+		// An id already drawn by a different build is the one failure worth
+		// naming: it is what a rebuilt build plane looks like from here, and
+		// the raw constraint error says nothing an operator can act on.
+		if build.Id != 0 && strings.Contains(err.Error(), "UNIQUE constraint failed: builds.id") {
+			// Name the row that actually holds the id. The remedy is to
+			// release the schema HOLDING it, which is rarely the one being
+			// handed over -- saying "this challenge's builds" sent an
+			// operator to release the wrong schema, and releasing the wrong
+			// one both fails to free the id and takes a live event down.
+			var holder struct {
+				Challenge string `db:"challenge"`
+				Schema    string `db:"schema"`
+				Seed      int    `db:"seed"`
+			}
+			if lookupErr := m.db.Get(&holder, "SELECT challenge, schema, seed FROM builds WHERE id = ?;", build.Id); lookupErr == nil {
+				err = fmt.Errorf("build id %d is already build %d of '%s' (schema '%s', seed %d): the build plane has reused its numbering, and schema '%s' must be released on this daemon before a build can be handed over under that id",
+					build.Id, build.Id, holder.Challenge, holder.Schema, holder.Seed, holder.Schema)
+			} else {
+				err = fmt.Errorf("build id %d is already another build's on this daemon and that row could not be read (%s): the build plane has reused its numbering, and whichever schema holds that id must be released before a build can be handed over under it", build.Id, lookupErr)
+			}
+		}
 		m.log.errorf("failed to open build (%s): %s", build.Challenge, err)
 		return err
 	}
