@@ -290,7 +290,11 @@ drive other content with `cmgrd-cli`.
 - The registry is `zot.internal` on 443 rather than `<host>:5000`: the address
   names the certs.d directory, and a mount target with a colon is refused by
   the daemon.
-- No artifact server; artifacts land in the `cork-data` volume.
+- No artifact server. Bundles are left where the build plane wrote them — the
+  `cork-data` volume for the fleet's own cmgrd, a temporary directory for the
+  `cork-build` and routing steps — and the scenario reads them off disk. What
+  a real deployment runs beside the build plane to publish them is out of
+  scope here; nothing in cork serves artifacts.
 - The stack mounts the outer docker socket into the `e2e` service. It is
   host-root-equivalent and is used for five steps: restarting cork, stopping
   or replacing a telemetry sidecar (silence, overloaded, all overloaded), and

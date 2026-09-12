@@ -681,13 +681,22 @@ solve_instance() { # <instance json> <build id> <challenge dir> <challenge id>
 
 # image_tag <build json> <host>: BuildMetadata.dockerId, s<seed>-<checksum hex>-<host>
 image_tag() { printf 's%d-%x-%s' "$(jq -r .seed <<<"$1")" "$(jq -r .checksum <<<"$1")" "$2"; }
-# The artifact endpoints, which are the platform's and a competitor's only view
-# of what a build publishes. artifact_get writes the body to disk (an artifact
-# is gzip, which no shell variable survives) and prints the status instead of
-# failing, exactly as api_status does, so the caller judges it.
-artifact_get() { # artifact_get <build id> <member|artifacts.tar.gz> <output file>
-  curl -sS -o "$3" -w '%{http_code}' --connect-timeout 5 --max-time 60 \
-    "$CMGRD_SERVER/builds/$1/$2"
+# Where a build plane leaves what it published. cork serves no artifacts: a
+# bundle stays on the plane that built it and reaches players from there (an
+# artifact server uploads it), so the e2e reads bundles off the cork-data
+# volume it shares with the cork service rather than over the API. This is the
+# directory that service's CMGR_ARTIFACT_DIR names.
+ART_ROOT=/var/lib/cork/artifacts
+# artifact_file <build id> [namespace]: the path of a build's bundle, or
+# non-zero when it has none. A build plane sorts bundles into a directory per
+# destination (cmgr.SetArtifactNamespace) and everything else leaves them in
+# the artifact directory itself, so both are looked at.
+artifact_file() {
+  local candidate
+  for candidate in "$ART_ROOT/${2:+$2/}$1.tar.gz" "$ART_ROOT/$1.tar.gz"; do
+    if [[ -f "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
 }
 # art_members <file>: the archive's member names, sorted, on one line, so a
 # bundle's contents can be compared against a literal. Non-zero (pipefail) when
@@ -979,8 +988,10 @@ if (( FULL )); then
     fail "GET /version reports build_plane '$plane' on a daemon started with CMGR_BUILD_PLANE=external"
   grep -q "CMGR_DIR is set but ignored" "$fresh/external.log" ||
     fail "an external build plane did not say it ignores CMGR_DIR: $(tr '\n' ' ' <"$fresh/external.log" | tail -c 400)"
-  [[ -d "$fresh/a3" ]] ||
-    fail "an external build plane did not create CMGR_ARTIFACT_DIR: it still serves the bundles, whoever built them"
+  grep -q "CMGR_ARTIFACT_DIR is set but ignored" "$fresh/external.log" ||
+    fail "an external build plane did not say it ignores CMGR_ARTIFACT_DIR: $(tr '\n' ' ' <"$fresh/external.log" | tail -c 400)"
+  [[ ! -e "$fresh/a3" ]] ||
+    fail "an external build plane created CMGR_ARTIFACT_DIR: it holds no bundles at all -- they stay on the plane that built them -- and a directory here is one an operator would wait on forever"
   for req in "POST|/update|" "POST|/update|{\"dry_run\":true}" \
              "POST|/challenges/cmgr/examples/custom-socat|{\"seeds\":[1]}" "GET|/pins|" "POST|/pins|"; do
     IFS='|' read -r method path body <<<"$req"
@@ -1030,7 +1041,7 @@ if (( FULL )); then
     refuses_to_start "on an external build plane with no registry client material (every untag would fail silently)" \
       4295 "$fresh/nocerts.log" "the registry client could not be built"
   rm -rf "$fresh"
-  ok "a cmgrd started on a fresh path created CMGR_ARTIFACT_DIR and its database directory itself and served /version; one pointed at a missing CMGR_DIR exited $rc in ${refuse_took}s and created neither; on an external build plane one came up with that same missing CMGR_DIR ignored, reported build_plane=external, answered 409 to update, dry run, build, pins and a schema naming challenges nobody handed over, and neither one without a registry nor one without registry client material would start"
+  ok "a cmgrd started on a fresh path created CMGR_ARTIFACT_DIR and its database directory itself and served /version; one pointed at a missing CMGR_DIR exited $rc in ${refuse_took}s and created neither; on an external build plane one came up with that same missing CMGR_DIR ignored and CMGR_ARTIFACT_DIR ignored and unmade, reported build_plane=external, answered 409 to update, dry run, build, pins and a schema naming challenges nobody handed over, and neither one without a registry nor one without registry client material would start"
 else
   deselect "fresh-box startup directories"
 fi
@@ -1134,17 +1145,18 @@ note "chaos target is $WB (${PUBLIC[$WB]}); the persistent instance stays on $WA
 # --------------------------------------------- 3b. artifact delivery
 
 if (( FULL )); then
-  step "artifacts: every published bundle downloads, holds exactly the challenge's files, and decrypts to the build's flag"
+  step "artifacts: every published bundle is where an artifact server would find it, holds exactly the challenge's files, and decrypts to the build's flag"
   # The half of the player contract nothing else in this scenario touches: the
-  # platform hands a competitor a download, not a flag, and cork is the only
-  # thing that serves it. cork's artifact directory lives in the cork-data
-  # volume, which this container deliberately does not mount (compose.yaml), so
-  # every assertion below travels the same HTTP a player's download does.
+  # platform hands a competitor a download, not a flag. cork does not serve
+  # that download -- the bundle stays on the plane that built it and an
+  # artifact server publishes it from there -- so what is asserted here is
+  # everything cork is responsible for: that the file exists, where that
+  # server would look for it, holding what the challenge published.
   # Placed here on purpose: it must run before the first set_generation edit,
   # which appends an argument to the advertised openssl command, because the
   # round trip at the end runs the command the service hands out.
   # The decrypt round trip needs openssl, which this image does not carry.
-  # Everything else this step asserts — that the bundle downloads, holds
+  # Everything else this step asserts — that the bundle is there, holds
   # exactly the challenge's files, and belongs to this build — does not, so the
   # round trip degrades to a note rather than taking the step down with it.
   ART_OPENSSL=1
@@ -1170,16 +1182,17 @@ if (( FULL )); then
   FLAG_BUILD=$(build_id "$CH_FLAGONLY")
   for b in "$OD_BUILD" "$FLAG_BUILD"; do
     [[ "$(api GET "/builds/$b" | jq -r .has_artifacts)" == false ]] ||
-      fail "build $b publishes no artifacts.tar.gz but reports has_artifacts=true: the platform would offer a download cork cannot serve"
+      fail "build $b publishes no artifacts.tar.gz but reports has_artifacts=true: the platform would offer a download nothing published"
   done
 
-  # The operator's path (cmgrd-cli artifacts) and the player's path
-  # (GET /builds/<id>/artifacts.tar.gz) are the same handler; the CLI is used
-  # here so its exit status is covered too (cmd/cmgrd-cli/commands.go:421-445).
-  out=$(cmgrd-cli artifacts "$PERSIST_BUILD" "$ART_G1" 2>&1) ||
-    fail "cmgrd-cli artifacts $PERSIST_BUILD did not succeed: $out"
+  # The bundle is read off disk where the build left it. Copied first, because
+  # the two artifact steps after the rebuilds compare against this generation's
+  # bytes and the file itself is replaced in place by a rebuild.
+  src=$(artifact_file "$PERSIST_BUILD") ||
+    fail "build $PERSIST_BUILD reports has_artifacts=true but published no bundle under $ART_ROOT: the artifact server would have nothing to upload and every {{url_for}} link in its text would 404"
+  cp "$src" "$ART_G1" || fail "could not copy $src"
   members=$(art_members "$ART_G1") ||
-    fail "the bundle served for build $PERSIST_BUILD is not a readable gzip tar"
+    fail "the bundle build $PERSIST_BUILD published is not a readable gzip tar"
   # Exactly the files examples/custom/Dockerfile publishes, and nothing else: a
   # member the challenge never published is a leak (the image's own /challenge
   # tree would be one), and a missing member is a broken player download that
@@ -1188,34 +1201,34 @@ if (( FULL )); then
     fail "the bundle for build $PERSIST_BUILD holds '$members', expected 'secret.enc time.txt' (examples/custom/Dockerfile publishes exactly those two)"
 
   ART_MK="$ART_TMP/make.tar.gz"
-  out=$(cmgrd-cli artifacts "$MK_BUILD" "$ART_MK" 2>&1) ||
-    fail "cmgrd-cli artifacts $MK_BUILD did not succeed: $out"
+  src=$(artifact_file "$MK_BUILD") ||
+    fail "build $MK_BUILD reports has_artifacts=true but published no bundle under $ART_ROOT"
+  cp "$src" "$ART_MK" || fail "could not copy $src"
   members=$(art_members "$ART_MK") ||
-    fail "the bundle served for build $MK_BUILD is not a readable gzip tar"
+    fail "the bundle build $MK_BUILD published is not a readable gzip tar"
   # The remote-make challenge tars its own archive in its Makefile and the
   # built-in Dockerfile moves it into /challenge, so this is the second,
   # independent way a bundle reaches cork's artifact directory.
   [[ "$members" == "BinEx101 BinEx101.c" ]] ||
     fail "the bundle for build $MK_BUILD holds '$members', expected 'BinEx101 BinEx101.c' (the artifacts.tar.gz target of examples/remote-make/Makefile)"
 
-  # The per-file path is a different branch of the same handler: it walks the
-  # stored tar and copies one member out (cmd/cmgrd/main.go:493-514). Comparing
-  # it against the same member of the bundle just downloaded is what proves it
-  # serves the raw file rather than the gzip, a prefix of it, or the wrong
-  # member -- none of which a status check alone would catch.
-  code=$(artifact_get "$PERSIST_BUILD" secret.enc "$ART_TMP/secret.enc")
-  [[ "$code" == 200 ]] ||
-    fail "GET /builds/$PERSIST_BUILD/secret.enc answered HTTP $code: the per-file path is how every {{url_for}} link in a challenge's text is served"
-  tar -xzOf "$ART_G1" secret.enc >"$ART_TMP/secret.from-bundle" ||
+  # A member comes out of the bundle whole, which is what the artifact server
+  # explodes it into and what every {{url_for}} link in the challenge's text
+  # resolves to.
+  tar -xzOf "$ART_G1" secret.enc >"$ART_TMP/secret.enc" ||
     fail "could not read secret.enc out of the bundle for build $PERSIST_BUILD"
-  same_bytes "$ART_TMP/secret.enc" "$ART_TMP/secret.from-bundle" ||
-    fail "the per-file download of secret.enc differs from the same member of the same build's bundle: the tar walk at cmd/cmgrd/main.go:493-514 served something other than the stored member"
-  # A name the archive does not hold is a 404, not a 500 and not an empty 200:
-  # the platform renders {{url_for}} links out of the challenge text, so a typo
-  # there must read as missing rather than as a broken cmgrd.
-  code=$(api_status GET "/builds/$PERSIST_BUILD/e2e-not-a-member")
-  [[ "$code" == 404 ]] ||
-    fail "GET /builds/$PERSIST_BUILD/e2e-not-a-member answered HTTP $code, expected 404 for a member the bundle does not hold (the io.EOF arm of the tar walk, cmd/cmgrd/main.go:511-514)"
+  [[ -s "$ART_TMP/secret.enc" ]] ||
+    fail "secret.enc came out of build $PERSIST_BUILD's bundle empty"
+
+  # cork does not serve artifacts, and the endpoints cmgr had for it are gone.
+  # Asserted rather than assumed: an orchestrator holds no bundles at all now,
+  # so a handler that came back would serve one build's files under another's
+  # id, or 500 on every link the platform renders.
+  for path in "/builds/$PERSIST_BUILD/artifacts.tar.gz" "/builds/$PERSIST_BUILD/secret.enc"; do
+    code=$(api_status GET "$path")
+    [[ "$code" == 404 ]] ||
+      fail "GET $path answered HTTP $code, expected 404: cork serves no artifacts (cmd/cmgrd/main.go, buildHandler)"
+  done
 
   # The round trip, which is the whole reason anything is published: the file
   # the player downloads, decrypted with the command the running service hands
@@ -1236,28 +1249,19 @@ if (( FULL )); then
       fail "secret.enc from build $PERSIST_BUILD's bundle decrypts to '$dec', not to the build's flag '$PERSIST_FLAG': the archive cork serves is not this build's"
   fi
 
-  # Negative space. A build that publishes nothing must never hand out bytes:
-  # the served path is <artifact dir>/<build id>.tar.gz, so a build id that
-  # collided with another build's archive would answer 200 here and give one
-  # challenge's files to another's players.
-  code=$(api_status GET "/builds/$OD_BUILD/artifacts.tar.gz")
-  [[ "$code" != 200 ]] ||
-    fail "build $OD_BUILD reports has_artifacts=false yet GET /builds/$OD_BUILD/artifacts.tar.gz answered 200: cork served an archive for a build that publishes none"
-  # Deliberately not asserted as 404, which is what the unknown-build arm below
-  # really does answer: for a KNOWN build with no artifacts the guard at
-  # cmd/cmgrd/main.go:478 reads "ok || (err != nil && !meta.HasArtifacts)", and
-  # err is nil on that path, so the handler falls through to an os.Open that
-  # cannot succeed and answers 500. Asserting 404 here would fail today against
-  # behaviour nobody has changed; "not 200" fails only for the case that costs a
-  # player someone else's files, and keeps passing once the guard is corrected.
-  [[ "$code" == 404 ]] ||
-    note "a build without artifacts answers HTTP $code rather than 404 (cmd/cmgrd/main.go:478 tests err != nil where err == nil was meant)"
-  [[ "$(api_status GET "/builds/999999/artifacts.tar.gz")" == 404 ]] ||
-    fail "GET /builds/999999/artifacts.tar.gz was not a 404: an unknown build must come back as an UnknownIdentifierError, not a 500 (cmd/cmgrd/main.go:474-479)"
+  # Negative space. A build that publishes nothing leaves no file behind: the
+  # bundle's name is <build id>.tar.gz, so a build that wrote one under an id
+  # it does not own would have the artifact server publish one challenge's
+  # files under another's links.
+  for b in "$OD_BUILD" "$FLAG_BUILD"; do
+    if stray=$(artifact_file "$b"); then
+      fail "build $b reports has_artifacts=false yet left $stray behind: the artifact server would publish it"
+    fi
+  done
 
-  ok "has_artifacts is true for exactly the two builds that publish; both bundles hold exactly their challenge's files; the per-file path serves the stored member byte for byte and 404s an unknown one; secret.enc decrypts to build $PERSIST_BUILD's flag with the command the service advertises; a build without artifacts serves nothing and an unknown build is a 404"
+  ok "has_artifacts is true for exactly the two builds that publish; both bundles are readable gzip tars holding exactly their challenge's files, where the build plane left them for an artifact server to take; secret.enc decrypts to build $PERSIST_BUILD's flag with the command the service advertises; a build that publishes nothing leaves no bundle; and cork itself serves no artifacts at all"
 else
-  deselect "artifacts: bundles download, hold the challenge's files, and decrypt to the flag"
+  deselect "artifacts: bundles are published where they belong, hold the challenge's files, and decrypt to the flag"
 fi
 
 # ============================================================================
@@ -1294,8 +1298,8 @@ if (( FULL )); then
   # PUT /challenges/<id> is how a build reaches a daemon that does not build
   # (cmgr/handover.go): the GET /state element of the challenge with the pin
   # fingerprint the builds were made under, as JSON, and nothing else --
-  # artifact bundles stay on the plane that built them. The daemon
-  # recomputes every build's identity from those inputs and asks zot for
+  # artifact bundles stay on the plane that built them. The daemon recomputes
+  # every build's identity from those inputs and asks zot for
   # every image tag before it records anything. The throwaway daemon here
   # is the fresh-box step's external-plane shape again: zot's client
   # material is this container's certs.d mount, and no worker is registered,
@@ -1313,11 +1317,19 @@ if (( FULL )); then
     cmgrd --port 4294 >"$HO/cmgrd.log" 2>&1 &
   HO_CMGRD=$! # the EXIT trap kills it if anything below fails
   HO_SERVER=http://127.0.0.1:4294
+  HO_ARTIFACTS="$HO/artifacts"
   retry 30 "the hand-over cmgrd to answer on :4294" fresh_answers "$HO_CMGRD" 4294 "$HO/cmgrd.log" "the throwaway cmgrd taking the hand-over"
+  # CMGR_ARTIFACT_DIR was set above and means nothing here: a daemon that
+  # builds nothing holds no bundles, so it neither makes the directory nor
+  # says nothing about it -- the note is what tells an operator who grew this
+  # unit file from a build plane's that bundles are not going to arrive.
+  [[ ! -e "$HO_ARTIFACTS" ]] ||
+    fail "the hand-over daemon created $HO_ARTIFACTS: an orchestrator holds no artifacts and should make no directory for them"
+  grep -q "CMGR_ARTIFACT_DIR is set but ignored" "$HO/cmgrd.log" ||
+    fail "the hand-over daemon did not say CMGR_ARTIFACT_DIR is ignored on an external build plane: $(tail -5 "$HO/cmgrd.log")"
   # hand_over <challenge> <json file>: PUT the hand-over, print the status,
   # leave the body in $HO/body. Its own curl, because it must fail in seconds
-  # here rather than hang the step. One JSON body and nothing else: a
-  # hand-over carries metadata and image tags, never artifact bytes.
+  # here rather than hang the step.
   hand_over() {
     curl -sS -o "$HO/body" -w '%{http_code}' --connect-timeout 5 --max-time 120 \
       -X PUT -H 'Content-Type: application/json' --data-binary "@$2" "$HO_SERVER/challenges/$1"
@@ -1355,9 +1367,14 @@ if (( FULL )); then
   # This is the whole artifact contract of a hand-over: the orchestrator is
   # told the build published a bundle so the platform offers the download, and
   # holds none itself -- the build plane kept it for an artifact server to
-  # take.
+  # take. A daemon that had taken delivery would have a file here, and its
+  # operator an artifact volume nobody asked for.
   [[ "$(jq -r .has_artifacts <<<"$handed")" == true ]] ||
     fail "the hand-over lost has_artifacts for build $HO_MK_BUILD: the platform would never offer its download"
+  # Checked again after the hand-over, not only at startup: taking delivery
+  # of an archive is what would have made the directory.
+  [[ ! -e "$HO_ARTIFACTS" ]] ||
+    fail "the hand-over daemon created $HO_ARTIFACTS taking $CH_MAKE: artifacts do not travel with a hand-over"
   note "$CH_MAKE recorded as build $HO_MK_BUILD, has_artifacts carried and no bundle taken"
 
   # The same hand-over again: unmodified, the same row.
@@ -1489,6 +1506,8 @@ EOF
     cmgrd --port 4293 >"$CB/cmgrd.log" 2>&1 &
   CB_CMGRD=$! # the EXIT trap kills it if anything below fails
   CB_SERVER=http://127.0.0.1:4293
+  CB_ARTIFACTS="$CB/artifacts" # the orchestrator's, which stays empty
+  CB_BUILD_ARTIFACTS="$CB/built" # the build plane's, where the bundles land
   retry 30 "the cork-build cmgrd to answer on :4293" fresh_answers "$CB_CMGRD" 4293 "$CB/cmgrd.log" "the throwaway cmgrd taking cork-build's hand-over"
 
   # Two refusals before the real run, because both are about what cork-build
@@ -1561,15 +1580,22 @@ EOF
   [[ "$(jq -r '[.[].builds[] | (.instances // [])[]] | length' <<<"$cb_state")" == 0 ]] ||
     fail "the cork-build hand-over started instances on a daemon with no workers: $cb_state"
 
-  # The archive travelled with it, and is served.
+  # The archive did not travel with it, and the fact that there is one did.
+  # cork-build built this challenge itself, so its bundle is in the build
+  # plane's own artifact directory under the destination it was built for,
+  # waiting for an artifact server -- and nowhere on the orchestrator.
   cb_build=$(jq -r --arg id "$CH_MAKE" '.[] | select(.id == $id) | .builds[0].id' <<<"$cb_state")
-  code=$(curl -sS -o "$CB/served.tar.gz" -w '%{http_code}' --connect-timeout 5 --max-time 60 "$CB_SERVER/builds/$cb_build/artifacts.tar.gz")
-  [[ "$code" == 200 ]] ||
-    fail "the cork-build daemon does not serve the archive it was handed for $CH_MAKE ($code)"
-  [[ "$(artifact_get "$MK_BUILD" artifacts.tar.gz "$CB/fleet.tar.gz")" == 200 ]] ||
-    fail "could not download this fleet's archive for build $MK_BUILD"
-  [[ "$(art_members "$CB/served.tar.gz")" == "$(art_members "$CB/fleet.tar.gz")" ]] ||
-    fail "the archive cork-build handed over holds $(art_members "$CB/served.tar.gz"), this fleet's holds $(art_members "$CB/fleet.tar.gz")"
+  [[ "$(jq -r --arg id "$CH_MAKE" '.[] | select(.id == $id) | .builds[0].has_artifacts' <<<"$cb_state")" == true ]] ||
+    fail "cork-build handed $CH_MAKE over without has_artifacts: the platform would never offer its download"
+  # The directory, not just the file: an orchestrator ignores
+  # CMGR_ARTIFACT_DIR entirely, so the one this daemon was started with was
+  # never made. Asserting the file alone would pass for the wrong reason.
+  [[ ! -e "$CB_ARTIFACTS" ]] ||
+    fail "the cork-build daemon created $CB_ARTIFACTS: an orchestrator takes no artifacts and makes no directory for them"
+  cb_bundle=$(ls "$CB_BUILD_ARTIFACTS"/*.tar.gz 2>/dev/null | head -1) ||
+    fail "cork-build published no bundle under $CB_BUILD_ARTIFACTS for the challenges it built"
+  [[ "$(art_members "$cb_bundle")" == "BinEx101 BinEx101.c" ]] ||
+    fail "the bundle cork-build left at $cb_bundle holds $(art_members "$cb_bundle"), expected 'BinEx101 BinEx101.c'"
 
   # And cork-build converged it in the same run, which is what the whole
   # exchange is for and the half that used to be left to the operator: a
@@ -1633,7 +1659,7 @@ EOF
   wait "$CB_CMGRD" 2>/dev/null || true
   CB_CMGRD=""
   rm -rf "$CB"
-  ok "cork-build read the schema, built $CH_MAKE and $CH_FLAGONLY from $CHALLENGES against the same registry, and handed them to a cmgrd that builds nothing: same flags, content identities, images and archive as this fleet's own builds, at the instance counts the schema asks for rather than the on-demand ones it converged with, with nothing launched; cork-build converged the schema on it in the same run, and this fleet's own cmgrd was refused as a local build plane"
+  ok "cork-build read the schema, built $CH_MAKE and $CH_FLAGONLY from $CHALLENGES against the same registry, and handed them to a cmgrd that builds nothing: same flags, content identities and images as this fleet's own builds, its bundle left on the build plane, at the instance counts the schema asks for rather than the on-demand ones it converged with, with nothing launched; cork-build converged the schema on it in the same run, and this fleet's own cmgrd was refused as a local build plane"
 else
   deselect "cork-build, the build plane as a binary"
 fi
@@ -1667,6 +1693,8 @@ if (( FULL )); then
   done
   RT_A=http://127.0.0.1:4290   # "library"
   RT_B=http://127.0.0.1:4291   # "event"
+  RT_A_ARTIFACTS="$RT/artifacts-4290" # neither orchestrator ever holds a bundle
+  RT_B_ARTIFACTS="$RT/artifacts-4291"
   retry 30 "the library orchestrator on :4290" fresh_answers "$RT_A_CMGRD" 4290 "$RT/cmgrd-4290.log" "the library orchestrator"
   retry 30 "the event orchestrator on :4291" fresh_answers "$RT_B_CMGRD" 4291 "$RT/cmgrd-4291.log" "the event orchestrator"
 
@@ -1740,6 +1768,25 @@ EOF
   has_line "$(printf 's%d-%x-challenge' "$MK_SEED_RT" "$RT_CHECK")" registry_tags "$CH_MAKE" ||
     fail "the routed build's image is not in the registry"
 
+  # The bundle went to the destination's own directory under the build plane's
+  # artifact directory. This is what keeps one build plane's artifacts sorted
+  # for the several orchestrators it builds for: an artifact server watches one
+  # of these per destination and uploads it under that destination's prefix, so
+  # a bundle in the wrong one would publish this challenge's files where another
+  # event's players look. The directory is named for the destination exactly,
+  # with nothing prepended (cmgr.SetArtifactNamespace).
+  RT_BUILD_ID=$(curl -sS --max-time 30 "$RT_A/schemas/routed" | jq -r '.[0].builds[0].id')
+  rt_bundle=$(ls "$RT/built/library"/*.tar.gz 2>/dev/null | head -1) ||
+    fail "cork-build published no bundle under $RT/built/library for a schema bound to 'library': an artifact server watching that destination would have nothing to upload"
+  [[ "$(art_members "$rt_bundle")" == "BinEx101 BinEx101.c" ]] ||
+    fail "the bundle at $rt_bundle holds $(art_members "$rt_bundle"), expected this challenge's two files"
+  [[ ! -e "$RT/built/$(basename "$rt_bundle")" ]] ||
+    fail "the bundle is also in $RT/built itself: a schema with a destination writes only into that destination's directory"
+  # And not on the orchestrator, which takes no artifacts at all.
+  [[ ! -e "$RT_A_ARTIFACTS/$RT_BUILD_ID.tar.gz" ]] ||
+    fail "the library orchestrator holds $RT_A_ARTIFACTS/$RT_BUILD_ID.tar.gz: artifacts do not travel with a hand-over"
+  note "the routed bundle is at $rt_bundle, in its destination's directory and nowhere else"
+
   # show-schema answers from this plane's own database and says on stderr
   # which orchestrator is serving the schema -- which only a build plane can
   # answer, being the one thing that sees them all. The note is on stderr so
@@ -1782,7 +1829,22 @@ EOF
   # them, so without it a migrated schema is rows on a daemon serving nobody.
   grep -q "converged 'routed' on event" "$RT/migrate.log" ||
     fail "the migration handed the builds to the event orchestrator and did not converge the schema there: the event would hold every build and serve none of them (see $RT/migrate.log)"
-  note "migrated library -> event in ${took}s, image untouched at checksum $RT_CHECK"
+  # The bundle followed the schema. A migration deletes the schema on this
+  # plane and builds it again for the new destination, so its bundle is
+  # written into the new destination's directory -- and the old one's copy is
+  # removed although nothing told the destroy which directory to look in
+  # (cmgr.removeArtifactBundle searches, because remove-schema is given a name
+  # and a migration reads the destination a schema is moving TO). A bundle
+  # left in library/ would keep being uploaded under the old event's prefix
+  # long after the challenge moved.
+  rt_bundle=$(ls "$RT/built/event"/*.tar.gz 2>/dev/null | head -1) ||
+    fail "the migration left no bundle under $RT/built/event: the event's artifact server would have nothing to upload for a schema it now serves"
+  [[ "$(art_members "$rt_bundle")" == "BinEx101 BinEx101.c" ]] ||
+    fail "the migrated bundle at $rt_bundle holds $(art_members "$rt_bundle")"
+  left=$(ls "$RT/built/library"/*.tar.gz 2>/dev/null || true)
+  [[ -z "$left" ]] ||
+    fail "the migration left $left behind in the destination the schema moved away from: the build plane would keep every bundle it ever built and the old destination's artifact server would go on publishing this challenge"
+  note "migrated library -> event in ${took}s, image untouched at checksum $RT_CHECK, bundle moved to $rt_bundle"
 
   # 3. Removing it is destructive on both sides: the orchestrator's builds
   #    and the registry tag go, and so do the build plane's own rows -- or
@@ -1804,6 +1866,14 @@ EOF
   if has_line "$(printf 's%d-%x-challenge' "$MK_SEED_RT" "$RT_CHECK")" registry_tags "$CH_MAKE"; then
     fail "remove-schema left the image in the registry: a removal is destructive, and nothing is coming back for it"
   fi
+  # The bundle goes with it, from the namespace it was written into. This is
+  # the other half of removeArtifactBundle's search: remove-schema is given a
+  # name and never learns a destination at all, so a bundle it could not find
+  # is one the build plane keeps forever and an artifact server goes on
+  # publishing for a challenge that no longer exists.
+  left=$(ls "$RT/built/event"/*.tar.gz 2>/dev/null || true)
+  [[ -z "$left" ]] ||
+    fail "remove-schema left $left behind: the bundle of a removed schema is still on disk and still being published"
   # The build plane's own rows: the proof is that building it again works,
   # which it only can if this plane knows it has to push again.
   write_routed_schema event
@@ -1840,7 +1910,7 @@ EOF
   wait "$RT_A_CMGRD" "$RT_B_CMGRD" 2>/dev/null || true
   RT_A_CMGRD=""; RT_B_CMGRD=""
   rm -rf "$RT"
-  ok "a schema went to the destination it names and not to the other orchestrator; migrating it moved the schema in ${took}s with the image untouched in the registry and nothing rebuilt; removing it by name alone found the orchestrator serving it and destroyed the builds, the tag and this plane's own rows; building it again brought it back"
+  ok "a schema went to the destination it names and not to the other orchestrator; migrating it moved the schema in ${took}s with the image untouched in the registry and nothing rebuilt; removing it by name alone found the orchestrator serving it and destroyed the builds, the tag, this plane's own rows and the bundle in its destination directory; building it again brought it back"
 else
   deselect "routing and migration between two orchestrators"
 fi
@@ -3278,19 +3348,20 @@ ok "persistent instance $PERSIST_INST restarted in place on $w:$port (same addre
 # ------------------------------ 9b. the rebuilt build's artifacts
 
 if (( FULL )); then
-  step "artifacts after the rebuild: the bundle served for the rebuilt build is generation 2, promoted in place"
+  step "artifacts after the rebuild: the bundle published for the rebuilt build is generation 2, promoted in place"
   # cacheArtifacts stages the new archive as .<id>.tar.gz.staged and only
   # renames it onto <id>.tar.gz once validateBuild has passed (cmgr/docker.go:
-  # 777-789 and 813-824). The rename itself is invisible from here -- this
-  # container cannot see cork's artifact directory -- but its consequence is
-  # not: the same URL, for the same build id, must now serve the new
-  # generation's files. A rebuild that promoted nothing serves generation 1
-  # forever, and until this step nothing in the run ever looked.
+  # 777-789 and 813-824). The consequence is what is asserted: the same file,
+  # for the same build id, must now hold the new generation's contents, since
+  # that path is all an artifact server watches. A rebuild that promoted
+  # nothing publishes generation 1 forever, and until this step nothing in the
+  # run ever looked.
   ART_G2="$ART_TMP/persist-g2.tar.gz"
-  out=$(cmgrd-cli artifacts "$PERSIST_BUILD" "$ART_G2" 2>&1) ||
-    fail "cmgrd-cli artifacts $PERSIST_BUILD did not succeed after the rebuild: $out"
+  src=$(artifact_file "$PERSIST_BUILD") ||
+    fail "build $PERSIST_BUILD published no bundle under $ART_ROOT after the rebuild"
+  cp "$src" "$ART_G2" || fail "could not copy $src"
   members=$(art_members "$ART_G2") ||
-    fail "the bundle served for build $PERSIST_BUILD after the rebuild is not a readable gzip tar"
+    fail "the bundle published for build $PERSIST_BUILD after the rebuild is not a readable gzip tar"
   [[ "$members" == "secret.enc time.txt" ]] ||
     fail "the rebuilt bundle for build $PERSIST_BUILD holds '$members', expected 'secret.enc time.txt'"
   gen=$(tar -xzOf "$ART_G2" time.txt) ||
@@ -3319,15 +3390,14 @@ if (( FULL )); then
   [[ "$(jq -r .flag <<<"$pbuild")" == "$PERSIST_FLAG" ]] ||
     fail "build $PERSIST_BUILD's flag changed across the rebuild: every artifact a player had already downloaded would decrypt to the wrong answer"
   PERSIST_CHECKSUM_G2=$(jq -r .checksum <<<"$pbuild") # the failed-rebuild step below asserts the rolled-back row keeps exactly this
-  code=$(artifact_get "$PERSIST_BUILD" secret.enc "$ART_TMP/secret-g2.enc")
-  [[ "$code" == 200 ]] ||
-    fail "GET /builds/$PERSIST_BUILD/secret.enc answered HTTP $code after the rebuild"
+  tar -xzOf "$ART_G2" secret.enc >"$ART_TMP/secret-g2.enc" ||
+    fail "could not read secret.enc out of the rebuilt bundle for build $PERSIST_BUILD"
   if (( ${ART_OPENSSL:-0} )); then
     dec=$(openssl aes-256-cbc -d -k unguessable -pbkdf2 -in "$ART_TMP/secret-g2.enc" 2>/dev/null || true)
     [[ "$dec" == "$PERSIST_FLAG" ]] ||
       fail "secret.enc from the rebuilt bundle decrypts to '$dec', not to build $PERSIST_BUILD's flag '$PERSIST_FLAG'"
   fi
-  ok "build $PERSIST_BUILD serves a new bundle at the same URL after the rebuild: generation 2 inside time.txt, the same two members, and a secret.enc that still decrypts to the build's flag"
+  ok "build $PERSIST_BUILD published a new bundle at the same path after the rebuild: generation 2 inside time.txt, the same two members, and a secret.enc that still decrypts to the build's flag"
 else
   deselect "artifacts after the rebuild: the promoted bundle is generation 2"
 fi
@@ -5161,23 +5231,24 @@ if (( FULL )); then
   [[ "$(jq -r .flag <<<"$pbuild")" == "$PERSIST_FLAG" ]] ||
     fail "build $PERSIST_BUILD's flag changed although its rebuild failed"
   [[ "$(jq -r .has_artifacts <<<"$pbuild")" == true ]] ||
-    fail "build $PERSIST_BUILD reports has_artifacts=false after a failed rebuild: the platform would stop offering a download cork is still able to serve"
+    fail "build $PERSIST_BUILD reports has_artifacts=false after a failed rebuild: the platform would stop offering a download the build still publishes"
 
-  # The assertion this step exists for: the download still works, and it is the
-  # old archive, byte for byte. Not merely "a 200" -- a staged archive promoted
-  # by a failure would answer 200 too, with three members and a time.txt from a
-  # build cork has rolled back.
+  # The assertion this step exists for: the published bundle is still there,
+  # and it is the old archive, byte for byte. Not merely "a file" -- a staged
+  # archive promoted by a failure would be a file too, with three members and
+  # a time.txt from a build cork has rolled back.
   ART_FAIL="$ART_TMP/persist-after-fail.tar.gz"
-  out=$(cmgrd-cli artifacts "$PERSIST_BUILD" "$ART_FAIL" 2>&1) ||
-    fail "cmgrd-cli artifacts $PERSIST_BUILD failed after a failed rebuild: the previous archive was removed or truncated, so every player download of this challenge is now an error ($out)"
+  src=$(artifact_file "$PERSIST_BUILD") ||
+    fail "build $PERSIST_BUILD has no bundle under $ART_ROOT after a failed rebuild: the previous archive was removed, so the artifact server would take this challenge's downloads away"
+  cp "$src" "$ART_FAIL" || fail "could not copy $src"
   members=$(art_members "$ART_FAIL") ||
-    fail "the archive served after the failed rebuild is not a readable gzip tar"
+    fail "the bundle published after the failed rebuild is not a readable gzip tar"
   [[ "$members" == "secret.enc time.txt" ]] ||
-    fail "the archive served for build $PERSIST_BUILD after the failed rebuild holds '$members': the staged generation-4 archive (the one publishing e2e-extra.txt) was promoted although validateBuild rejected the build; the failure path must remove the staged file, not rename it (cmgr/docker.go:826-829)"
+    fail "the bundle for build $PERSIST_BUILD after the failed rebuild holds '$members': the staged generation-4 archive (the one publishing e2e-extra.txt) was promoted although validateBuild rejected the build; the failure path must remove the staged file, not rename it (cmgr/docker.go:826-829)"
   gen=$(tar -xzOf "$ART_FAIL" time.txt) ||
-    fail "could not read time.txt out of the archive served after the failed rebuild"
+    fail "could not read time.txt out of the bundle published after the failed rebuild"
   [[ "$gen" == "e2e-generation-2" ]] ||
-    fail "the archive served for build $PERSIST_BUILD carries '$gen' in time.txt after the failed rebuild, expected the generation-2 archive that is still the installed one"
+    fail "the bundle for build $PERSIST_BUILD carries '$gen' in time.txt after the failed rebuild, expected the generation-2 archive that is still the installed one"
   same_bytes "$ART_G2" "$ART_FAIL" ||
     fail "the archive served for build $PERSIST_BUILD is not byte for byte the one it served before the failed rebuild: something wrote to <id>.tar.gz on a path that may only ever touch the staged copy"
 
@@ -5259,7 +5330,7 @@ if (( FULL )); then
   # two challenges rebuilt and why it does not assert that only one was.
   set_generation "$persist_gen_before" persistent
   rm -rf "$ART_TMP"
-  ok "the rebuild was refused for publishing an unreferenced artifact; the build row kept its checksum, flag and has_artifacts; cork went on serving the generation-2 archive byte for byte; instance $PERSIST_INST kept serving at $ppub:$pport; a dry run named $CH_PERSISTENT Stale; the builder is back to the tags it held and the registry holds exactly the tags it held"
+  ok "the rebuild was refused for publishing an unreferenced artifact; the build row kept its checksum, flag and has_artifacts; the generation-2 bundle is still the published one, byte for byte; instance $PERSIST_INST kept serving at $ppub:$pport; a dry run named $CH_PERSISTENT Stale; the builder is back to the tags it held and the registry holds exactly the tags it held"
 else
   deselect "a failed rebuild keeps serving the previous archive"
 fi
@@ -5803,8 +5874,6 @@ if (( FULL )); then
   # stated is 0, which is what these builds were made under.
   [[ "$(api GET /pins | jq -r '.pins | length')" == 0 ]] ||
     fail "the fleet already pins base images: the multi-host hand-over below states pin fingerprint 0 and would be refused"
-  [[ "$(jq -r .has_artifacts <<<"$MULTI_META")" == false ]] ||
-    fail "$CH_MULTI now publishes artifacts: the hand-over below sends no archive part and would be refused for the wrong reason"
   MH=$(mktemp -d)
   CMGR_BUILD_PLANE=external \
   CMGR_REGISTRY="$E2E_REGISTRY" \
@@ -5815,7 +5884,7 @@ if (( FULL )); then
   retry 30 "the multi-host hand-over cmgrd to answer on :4292" fresh_answers "$MH_CMGRD" 4292 "$MH/cmgrd.log" "the throwaway cmgrd taking the multi-host hand-over"
   mh_put() { # mh_put <json file>: PUT it, print the status, body in $MH/body
     curl -sS -o "$MH/body" -w '%{http_code}' --connect-timeout 5 --max-time 120 \
-      -X PUT -F "hand_over=<$1;type=application/json" \
+      -X PUT -H 'Content-Type: application/json' --data-binary "@$1" \
       "http://127.0.0.1:4292/challenges/$CH_MULTI"
   }
   api GET /state | jq --arg id "$CH_MULTI" \
