@@ -149,10 +149,15 @@ func TestSetDirectoriesExternalIgnoresChallengeDir(t *testing.T) {
 			if m.chalDir != "" {
 				t.Fatalf("an external build plane resolved a challenge directory: %q", m.chalDir)
 			}
-			// The artifacts directory is still this daemon's: it serves the
-			// bundles, whoever built them.
-			if info, err := os.Stat(artifacts); err != nil || !info.IsDir() {
-				t.Fatalf("artifacts directory was not created: %v", err)
+			// Nor an artifacts directory. Bundles are written where the
+			// build happens and stay there; a daemon that builds nothing
+			// never has one, and making the directory would suggest
+			// otherwise to whoever went looking.
+			if _, err := os.Stat(artifacts); !os.IsNotExist(err) {
+				t.Fatalf("an external build plane created an artifacts directory: %v", err)
+			}
+			if !strings.Contains(logged.String(), ARTIFACT_DIR_ENV+" is set but ignored") {
+				t.Fatalf("no note that %s is ignored; log: %s", ARTIFACT_DIR_ENV, logged.String())
 			}
 			if noted := strings.Contains(logged.String(), DIR_ENV+" is set but ignored"); noted != tc.wantNote {
 				t.Fatalf("ignored-setting note logged = %v, want %v; log: %s", noted, tc.wantNote, logged.String())
@@ -474,8 +479,13 @@ func TestDestroyImagesExternalIsRegistryOnly(t *testing.T) {
 	if err := m.finalizeBuild(build); err != nil {
 		t.Fatalf("finalizeBuild: %s", err)
 	}
-	archive := filepath.Join(m.artifactsDir, build.getArtifactsFilename())
-	if err := os.WriteFile(archive, []byte("gz"), 0o644); err != nil {
+	// A file where the bundle of a locally built build would be. Nothing on
+	// an external plane put it there and nothing here may take it away:
+	// HasArtifacts says what the build published on the plane that made it,
+	// not what is on this disk, so a destroy that went looking would be
+	// deleting a stranger's file by build id.
+	stray := filepath.Join(m.artifactsDir, build.getArtifactsFilename())
+	if err := os.WriteFile(stray, []byte("gz"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -485,8 +495,8 @@ func TestDestroyImagesExternalIsRegistryOnly(t *testing.T) {
 	if _, err := m.lookupBuildMetadata(id); err == nil {
 		t.Error("the destroyed build kept its row")
 	}
-	if _, err := os.Stat(archive); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the destroyed build's archive is still there: %v", err)
+	if _, err := os.Stat(stray); err != nil {
+		t.Errorf("a destroy on an external build plane removed a file in the artifacts directory: %v", err)
 	}
 	// An orchestrator retires what it destroys, and this daemon is one: the
 	// registry is the only place its images live.

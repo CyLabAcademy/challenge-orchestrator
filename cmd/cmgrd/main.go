@@ -1,8 +1,6 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -21,8 +19,6 @@ import (
 type state struct {
 	mgr *cmgr.Manager
 }
-
-var artifact_dir string
 
 func main() {
 	var iface string
@@ -45,10 +41,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	artifact_dir, _ = os.LookupEnv(cmgr.ARTIFACT_DIR_ENV)
-	if artifact_dir == "" {
-		artifact_dir = "."
-	}
 	// CMGR_LOGGING, which this daemon documented and did not read: it is
 	// the only way to raise an orchestrator's logging, since there is no
 	// flag for it. A level that does not parse is complained about and not
@@ -104,10 +96,14 @@ Relevant environment variables:
 
   CMGR_DIR - directory containing all challenges (defaults to '.')
 
-  CMGR_ARTIFACT_DIR - directory for storing artifact bundles (defaults to '.')
+  CMGR_ARTIFACT_DIR - directory a build's artifact bundle is written to
+      (defaults to '.'). Local build plane only: cork does not serve
+      artifacts and a hand-over carries none, so on CMGR_BUILD_PLANE=external
+      this is read by nothing and saying so is all it gets.
 
   CMGR_MAX_ARTIFACT_FILES - maximum number of entries permitted in a
-      challenge's artifact archive (defaults to 10000)
+      challenge's artifact archive (defaults to 10000); local build plane
+      only, as the two below are
 
   CMGR_MAX_ARTIFACT_BYTES - maximum total uncompressed size of a challenge's
       artifact archive (defaults to '5g')
@@ -502,8 +498,11 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 	path := strings.Split(r.URL.Path, "/")
 	pathLen := len(path)
 
+	// GET /builds/{id}/{artifact} was cmgr's artifact download, and cork does
+	// not serve artifacts: a bundle stays on the build plane that made it and
+	// reaches players from there. A path below a build is nothing here.
 	if pathLen == 4 {
-		s.artifactsHandler(w, r)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
@@ -592,70 +591,6 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(respCode)
 	w.Write(body)
-}
-
-func (s state) artifactsHandler(w http.ResponseWriter, r *http.Request) {
-	path := strings.Split(r.URL.Path, "/")
-	pathLen := len(path)
-	if pathLen < 4 || path[pathLen-3] != "builds" {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	buildInt, err := strconv.Atoi(path[pathLen-2])
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	build := cmgr.BuildId(buildInt)
-	meta, err := s.mgr.GetBuildMetadata(build)
-	_, ok := err.(*cmgr.UnknownIdentifierError)
-	if ok || (err != nil && !meta.HasArtifacts) {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	f, err := os.Open(fmt.Sprintf("%s/%d.tar.gz", artifact_dir, build))
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	defer f.Close()
-
-	if path[pathLen-1] == "artifacts.tar.gz" {
-		io.Copy(w, f)
-		return
-	}
-	srcGz, err := gzip.NewReader(f)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	defer srcGz.Close()
-	srcTar := tar.NewReader(srcGz)
-
-	var h *tar.Header
-	for h, err = srcTar.Next(); err == nil; h, err = srcTar.Next() {
-		if h.Name == path[pathLen-1] {
-			io.Copy(w, srcTar)
-			return
-		}
-	}
-
-	if err == io.EOF {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	w.WriteHeader(http.StatusInternalServerError)
-	w.Write([]byte(err.Error()))
 }
 
 func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {

@@ -49,11 +49,16 @@ type UnknownIdentifierError struct {
 }
 
 type Manager struct {
-	cli                  *client.Client
-	ctx                  context.Context
-	log                  *logger
-	chalDir              string
-	artifactsDir         string
+	cli          *client.Client
+	ctx          context.Context
+	log          *logger
+	chalDir      string
+	artifactsDir string
+	// artifactNamespaces maps a schema's name to the directory under
+	// artifactsDir its builds' bundles go in, which a build plane fills in
+	// from the destinations its schemas name (SetArtifactNamespaces). Empty
+	// everywhere else, and a schema that is not in it keeps artifactsDir.
+	artifactNamespaces   map[string]string
 	db                   *sqlx.DB
 	dbPath               string
 	challengeDockerfiles map[string][]byte

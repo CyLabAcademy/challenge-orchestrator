@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/CyLabAcademy/challenge-orchestrator/cmgr/dockerfiles"
@@ -39,14 +38,15 @@ func NewManager(logLevel LogLevel, options ...ManagerOption) *Manager {
 
 	mgr.log.infof("version: %s", Version())
 
-	if err := mgr.initPolicy(); err != nil {
-		mgr.log.error(err)
+	// Before the policy, the directories, the pins and docker: on an
+	// external build plane each of those skips what only a local one reads,
+	// and each says so, which it cannot do before this has run.
+	if err := mgr.initBuildPlane(); err != nil {
 		return nil
 	}
 
-	// Before the directories, the pins and docker: on an external build
-	// plane each of those skips what only a local one reads.
-	if err := mgr.initBuildPlane(); err != nil {
+	if err := mgr.initPolicy(); err != nil {
+		mgr.log.error(err)
 		return nil
 	}
 
@@ -887,14 +887,6 @@ func (m *Manager) GetChallengeMetadata(challenge ChallengeId) (*ChallengeMetadat
 
 func (m *Manager) GetBuildMetadata(build BuildId) (*BuildMetadata, error) {
 	return m.lookupBuildMetadata(build)
-}
-
-// BuildArtifactsPath is where this daemon keeps a build's artifact bundle,
-// the file GET /builds/<id>/artifacts.tar.gz serves. A build plane reads it
-// back from here to put it in the hand-over.
-func (m *Manager) BuildArtifactsPath(build BuildId) string {
-	meta := BuildMetadata{Id: build}
-	return filepath.Join(m.artifactsDir, meta.getArtifactsFilename())
 }
 
 func (m *Manager) GetInstanceMetadata(instance InstanceId) (*InstanceMetadata, error) {

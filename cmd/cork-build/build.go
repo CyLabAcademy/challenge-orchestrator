@@ -55,6 +55,21 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 		return RUNTIME_ERROR
 	}
 
+	// Where each schema's artifact bundles go: a directory per destination
+	// under CMGR_ARTIFACT_DIR, so one build plane's artifacts stay sorted for
+	// the orchestrators they belong to and an artifact server can watch one
+	// per destination. Before the scan below, because that scan rebuilds
+	// every build of a challenge whose source has moved -- builds of any
+	// schema on this plane, not only the ones named here -- and those bundles
+	// belong in their own destinations' directories too.
+	namespaces := map[string]string{}
+	for _, schema := range schemas {
+		namespaces[schema.Name] = schema.Destination
+	}
+	if err := mgr.SetArtifactNamespaces(namespaces); err != nil {
+		return runtimeError(err)
+	}
+
 	// The tree first, as an operator runs 'update' before 'update-schema':
 	// a converge refuses to build a challenge whose source has moved since
 	// it was last recorded, and this is what records it. Its errors are

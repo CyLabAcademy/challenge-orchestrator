@@ -88,8 +88,6 @@ func main() {
 		exitCode = pinListCommand(c, cmdArgs)
 	case "pin-refresh":
 		exitCode = pinRefreshCommand(c, cmdArgs)
-	case "artifacts":
-		exitCode = artifactsCommand(c, cmdArgs)
 	case "version":
 		exitCode = versionCommand(c, cmdArgs)
 	case "help":
@@ -179,8 +177,6 @@ Base image pins:
       tag is consulted, and it rebuilds nothing by itself
 
 Other:
-  artifacts <build> [<output file>]
-      download the build's artifacts tarball (default: <build>.tar.gz)
   version
       print client and server versions
 

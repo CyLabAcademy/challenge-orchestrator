@@ -1104,6 +1104,9 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 	var lookups map[string]string
 	var files []string
 	var stagedArtifactsPath string
+	// Resolved once and used for both the staging file and the promotion, so
+	// the rename below cannot cross directories.
+	var artifactsDir string
 	var flag string
 	for hdr, err = cTar.Next(); err == nil; hdr, err = cTar.Next() {
 		m.log.debugf("found in tar: %s", hdr.Name)
@@ -1137,7 +1140,8 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 			// build row is rolled back, not removed) and deleting it would turn
 			// every player download into a 500. The dot-prefixed name can never
 			// collide with a served "<id>.tar.gz" path.
-			stagedArtifactsPath = filepath.Join(m.artifactsDir, "."+bMeta.getArtifactsFilename()+".staged")
+			artifactsDir = m.artifactDirForBuild(bMeta)
+			stagedArtifactsPath = filepath.Join(artifactsDir, "."+bMeta.getArtifactsFilename()+".staged")
 			files, err = m.cacheArtifacts(cTar, stagedArtifactsPath)
 			if err != nil {
 				m.log.errorf("could not cache artifacts: %s", err)
@@ -1179,13 +1183,19 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		// Promote the validated archive into place; rename is atomic, so
 		// concurrent downloads see either the old or the new archive, never a
 		// partial one. The directory sync persists the swap across a crash.
-		finalArtifactsPath := filepath.Join(m.artifactsDir, bMeta.getArtifactsFilename())
+		finalArtifactsPath := filepath.Join(artifactsDir, bMeta.getArtifactsFilename())
 		err = os.Rename(stagedArtifactsPath, finalArtifactsPath)
 		if err != nil {
 			m.log.errorf("could not promote artifact archive: %s", err)
-		} else if directory, dirErr := os.Open(m.artifactsDir); dirErr == nil {
-			_ = directory.Sync()
-			_ = directory.Close()
+		} else {
+			if directory, dirErr := os.Open(artifactsDir); dirErr == nil {
+				_ = directory.Sync()
+				_ = directory.Close()
+			}
+			// Only once this generation is in place: a copy under the
+			// schema's previous namespace is what an artifact server would
+			// otherwise go on publishing at the old prefix.
+			m.pruneStrayArtifactBundles(artifactsDir, bMeta.getArtifactsFilename())
 		}
 	}
 	if err != nil {
@@ -1746,9 +1756,13 @@ func (m *Manager) destroyImages(build BuildId, retire bool) error {
 		return err
 	}
 
-	if bMeta.HasArtifacts {
+	// Only where the build was made. HasArtifacts is delivered by a hand-over
+	// and says what the build published, not what is on this disk: an
+	// orchestrator on an external build plane never receives the bundle, and
+	// looking for one would warn about a file that was never meant to be here.
+	if bMeta.HasArtifacts && !m.externalBuildPlane {
 		artifactsFilename := bMeta.getArtifactsFilename()
-		err := os.Remove(filepath.Join(m.artifactsDir, artifactsFilename))
+		err := m.removeArtifactBundle(bMeta.Schema, artifactsFilename)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				m.log.warnf("skipped removing artifacts file (not found): %s", artifactsFilename)
