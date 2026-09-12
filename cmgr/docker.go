@@ -1192,10 +1192,13 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 				_ = directory.Sync()
 				_ = directory.Close()
 			}
-			// Only once this generation is in place: a copy under the
-			// schema's previous namespace is what an artifact server would
-			// otherwise go on publishing at the old prefix.
-			m.pruneStrayArtifactBundles(artifactsDir, bMeta.getArtifactsFilename())
+			// Only once this generation is in place: a copy left in the
+			// artifact directory itself, from before this schema was given
+			// a destination, is what an artifact server would otherwise go
+			// on publishing at the prefix it used to use.
+			if artifactsDir != m.artifactsDir {
+				m.pruneStrayArtifactBundle(bMeta.getArtifactsFilename())
+			}
 		}
 	}
 	if err != nil {

@@ -81,6 +81,20 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 	for _, err := range updates.Errors {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", err)
 	}
+	// One class of error is not a challenge that did not parse: two
+	// challenges sharing an id abort the directory walk itself, and the
+	// inventory comes back empty. Every recorded challenge is then classified
+	// as removed, nothing is re-recorded or rebuilt, and the converge below
+	// finds every build row already complete -- so the previously recorded
+	// generation is handed over and converged, and the command exits 0. The
+	// signature is errors alongside nothing present, which a tree where some
+	// challenges failed to parse never shows: those leave the rest present.
+	present := len(updates.Added) + len(updates.Updated) + len(updates.Refreshed) +
+		len(updates.Stale) + len(updates.Unmodified)
+	if len(updates.Errors) > 0 && present == 0 {
+		return runtimeError(fmt.Errorf(
+			"the challenge directory could not be scanned, so nothing here describes what is in it: fix the errors above and run again (building now would hand over the generation already on record)"))
+	}
 	fmt.Printf("  %d added, %d updated, %d refreshed, %d stale, %d unmodified, %d removed\n",
 		len(updates.Added), len(updates.Updated), len(updates.Refreshed),
 		len(updates.Stale), len(updates.Unmodified), len(updates.Removed))

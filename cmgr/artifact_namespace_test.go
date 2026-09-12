@@ -146,11 +146,12 @@ func TestArtifactNamespaceChangeMovesTheBundle(t *testing.T) {
 	if got := m.artifactDirForBuild(build); got != moved {
 		t.Fatalf("a rebuild after the destination was added goes to %s, want %s", got, moved)
 	}
-	// As the promotion does, once the new generation is in place.
+	// As executeBuild does: promote, then prune the copy left in the
+	// artifact directory itself.
 	if err := os.WriteFile(filepath.Join(moved, "7.tar.gz"), []byte("gz2"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	m.pruneStrayArtifactBundles(moved, "7.tar.gz")
+	m.pruneStrayArtifactBundle("7.tar.gz")
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Errorf("the copy in the directory the schema moved out of survived: %v", err)
 	}
@@ -200,7 +201,7 @@ func TestPruneStrayArtifactBundlesLeavesOthersAlone(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m.pruneStrayArtifactBundles(filepath.Join(base, "library"), "7.tar.gz")
+	m.pruneStrayArtifactBundle("7.tar.gz")
 	if _, err := os.Stat(filepath.Join(base, "7.tar.gz")); !os.IsNotExist(err) {
 		t.Errorf("the stray copy of build 7 survived: %v", err)
 	}
@@ -317,7 +318,8 @@ func TestArtifactSearchIgnoresDirectoriesCorkDidNotMake(t *testing.T) {
 	if where, ok := m.findArtifactBundle("7.tar.gz"); ok {
 		t.Errorf("a file in an unmarked subdirectory was taken for a bundle: %s", where)
 	}
-	m.pruneStrayArtifactBundles(filepath.Join(base, "library"), "7.tar.gz")
+	// As executeBuild does: nothing is found, so nothing is pruned.
+	m.pruneStrayArtifactBundle("7.tar.gz")
 	if _, err := os.Stat(theirs); err != nil {
 		t.Errorf("a challenge's own file was swept as a stray bundle: %v", err)
 	}
@@ -354,5 +356,44 @@ func TestExternalPlaneNotesTheArtifactSettings(t *testing.T) {
 	// The one that is not set is not complained about.
 	if strings.Contains(logged.String(), maxArtifactFilesEnv+" is set but ignored") {
 		t.Errorf("%s was noted although it is unset; log: %s", maxArtifactFilesEnv, logged.String())
+	}
+}
+
+// Another destination's bundle of the same name is left alone. A filename is
+// "<build id>.tar.gz" and a build id is unique only within one plane's
+// database; rebuild that database, as BUILDER.md says a plane may, and its
+// ids start at 1 again while every destination's directory still holds
+// bundles 1..N. A promote that swept every namespace by filename would then
+// delete a different orchestrator's live bundles, and the artifact server
+// would carry that deletion into the bucket.
+func TestAPromoteLeavesAnotherDestinationsBundleAlone(t *testing.T) {
+	m, base := namespaceManager(t)
+	if err := m.SetArtifactNamespaces(map[string]string{"spring": "event", "year": "library"}); err != nil {
+		t.Fatal(err)
+	}
+	// The library destination is serving build 1, from an earlier life of the
+	// build plane's database.
+	live := filepath.Join(base, "library", "1.tar.gz")
+	if err := os.WriteFile(live, []byte("library's own"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh plane database draws id 1 again, for a different challenge,
+	// bound to the other destination.
+	build := bundleOf("spring", 1)
+	into := m.artifactDirForBuild(build)
+	if want := filepath.Join(base, "event"); into != want {
+		t.Fatalf("the new build goes to %s, want %s", into, want)
+	}
+	if err := os.WriteFile(filepath.Join(into, "1.tar.gz"), []byte("event's own"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// As executeBuild does after promoting into a namespace.
+	m.pruneStrayArtifactBundle("1.tar.gz")
+
+	if got, err := os.ReadFile(live); err != nil {
+		t.Errorf("the library destination's live bundle was deleted by a build for another destination: %v", err)
+	} else if string(got) != "library's own" {
+		t.Errorf("the library destination's bundle is now %q", got)
 	}
 }

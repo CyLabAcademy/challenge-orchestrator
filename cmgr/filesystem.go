@@ -216,25 +216,36 @@ func (m *Manager) artifactDirs() []string {
 	return append(dirs, m.artifactsDir)
 }
 
-// pruneStrayArtifactBundles removes copies of a bundle outside the directory
-// it was just promoted into. There is one only after a schema's namespace
-// changed -- a destination added to a schema that had none, or moved -- and
-// leaving it would have an artifact server go on publishing an older
-// generation of the same build under the prefix the schema used to use.
-// Best-effort: a stray that cannot be removed costs disk and a stale URL,
-// and failing a build that has already validated and published would cost
-// more.
-func (m *Manager) pruneStrayArtifactBundles(keep, filename string) {
-	for _, dir := range m.artifactDirs() {
-		if dir == keep {
-			continue
-		}
-		stray := filepath.Join(dir, filename)
-		if err := os.Remove(stray); err == nil {
-			m.log.infof("removed %s, left by this build's previous artifact directory", stray)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			m.log.warnf("could not remove the stray artifact bundle %s: %s", stray, err)
-		}
+// pruneStrayArtifactBundle removes a copy of this build's bundle left in the
+// artifact directory itself, once the new generation is in place under a
+// namespace. There is one only after a schema was given a destination it did
+// not have, and leaving it would have an artifact server go on publishing an
+// older generation of the same build at the prefix the schema used to use.
+//
+// Deliberately the artifact directory itself and nowhere else. A filename is
+// "<build id>.tar.gz" and a build id is unique only within one plane's
+// database: rebuild that database, as BUILDER.md says a plane may, and its
+// ids start at 1 again while every destination's directory still holds
+// bundles 1..N. A name is therefore not evidence of whose file it is, so
+// another destination's directory is never swept -- doing so would delete an
+// orchestrator's live bundles on every promote and the artifact server would
+// carry that into the bucket. The artifact directory itself is the one place
+// a copy can only be this build's own: it is where the schema's bundles were
+// written before it was given a destination, which is the case this exists
+// for. A destination that CHANGES goes through migrate-schema, which drops
+// the rows and removes the bundles outright.
+//
+// Best-effort: a stray that cannot be removed costs disk and a stale URL, and
+// failing a build that has already validated and published would cost more.
+func (m *Manager) pruneStrayArtifactBundle(filename string) {
+	if m.artifactsDir == "" {
+		return
+	}
+	stray := filepath.Join(m.artifactsDir, filename)
+	if err := os.Remove(stray); err == nil {
+		m.log.infof("removed %s, left by this build's previous artifact directory", stray)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		m.log.warnf("could not remove the stray artifact bundle %s: %s", stray, err)
 	}
 }
 
