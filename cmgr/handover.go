@@ -298,7 +298,7 @@ func (m *Manager) requireInRegistry(challenge *ChallengeMetadata) error {
 			imageName := m.instanceImageName(challenge.Id, build, image)
 			present, err := m.registryTagPresent(imageName)
 			if err != nil {
-				return fmt.Errorf("could not ask the registry for %s: %w", imageName, err)
+				return fmt.Errorf("could not ask the registry for %s: %w; %s", imageName, err, registryRecovery)
 			}
 			if !present {
 				missing = append(missing, imageName)

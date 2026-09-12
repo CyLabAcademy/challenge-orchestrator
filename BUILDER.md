@@ -318,6 +318,47 @@ the identity is unchanged and nothing is stale: `--prune-old` on the next
 rebuild of the challenge, or `remove-schema` and `add-schema`, whose fresh
 rows build and push what the registry then lacks.
 
+## When the registry is down
+
+**Re-run the command. There is nothing else to do.**
+
+That is worth stating plainly because the instinct after an outage is to go
+looking for drift to reconcile, and there is none to find. The reason is
+structural: cork can leave a tag that no row names, but never a row naming a
+tag that is not there. A row is written only once the push has succeeded, and
+every hand-over re-asks the registry before recording anything. The
+divergence only ever runs one way, towards garbage.
+
+So what each failure leaves behind:
+
+| | while the registry is down | left behind |
+|---|---|---|
+| resolving identities, and the check before a push | the build fails before anything is built | nothing |
+| the push itself | local images removed; the tags it had pushed are deleted, and those deletes fail too | tags no row names |
+| retiring a tag on destroy or prune | best-effort, warned about, the operation still succeeds | tags no row names |
+| a hand-over's registry check | refused, 500, nothing recorded | nothing |
+| a worker's pull before a launch | 503 with Retry-After | nothing |
+
+Every operation is idempotent, because identity is content-addressed and the
+registry is write-once: a build that failed recorded nothing, a hand-over
+that was refused recorded nothing, and a removal that leaked tags had already
+dropped its rows. Reads are retried a few times over about a second
+(`registryAttempts`) so a dropped connection is not an outage; a registry
+that is really down fails the operation while you are still watching, and
+says so with what to re-run.
+
+The one thing to know about the leaked tags: **they are adopted, not
+rebuilt.** Build the same identity again and cork resolves it against the
+registry, finds the tag, and pulls and re-extracts rather than building —
+which is why a post-outage rebuild is fast. That is safe by construction:
+`validateBuild` runs *before* `publishImages`, so nothing reaches the
+registry without having validated, and the only failure after a push is the
+artifact promotion, which adoption redoes anyway.
+
+What the leak actually costs is registry disk. Nothing here sweeps tags no
+row names (see "Limitations"), so a long outage with a lot of churn is a
+reason to run zot's garbage collection afterwards — hygiene, not repair.
+
 ## Why pinning exists
 
 BuildKit re-resolves a mutable tag against the registry on essentially every

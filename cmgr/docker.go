@@ -815,7 +815,7 @@ func (m *Manager) publishImages(cMeta *ChallengeMetadata, bMeta *BuildMetadata, 
 func (m *Manager) pushImageIfAbsent(imageName string) (pushed bool, err error) {
 	present, err := m.registryTagExists(imageName)
 	if err != nil {
-		err = fmt.Errorf("could not check the registry for %s before pushing: %w", imageName, err)
+		err = fmt.Errorf("could not check the registry for %s before pushing: %w; %s", imageName, err, registryRecovery)
 		m.log.error(err)
 		return false, err
 	}
@@ -935,7 +935,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 			imageName := m.instanceImageName(cMeta.Id, bMeta, Image{Host: host.Name})
 			inRegistry, err := m.registryTagExists(imageName)
 			if err != nil {
-				err = fmt.Errorf("could not check the registry for %s: %w", imageName, err)
+				err = fmt.Errorf("could not check the registry for %s: %w; %s", imageName, err, registryRecovery)
 				m.log.error(err)
 				return err
 			}
@@ -1241,7 +1241,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		if unreferenced {
 			for _, imageName := range pushed {
 				if derr := m.registryDeleteTag(imageName); derr != nil {
-					m.log.warnf("could not remove %s, pushed by a build that then failed: %s", imageName, derr)
+					m.log.warnf("could not remove %s, pushed by a build that then failed: %s; %s", imageName, derr, registryLeak)
 				}
 			}
 		}
@@ -1730,7 +1730,7 @@ func (m *Manager) pruneReplacedImages(replaced []replacedImages) {
 			// accumulates one immutable tag per rebuild forever. Best-effort —
 			// a leaked registry tag is recoverable, a failed update is not.
 			if err := m.retireRegistryTag(tag); err != nil {
-				m.log.warnf("could not prune replaced registry tag %s: %s", tag, err)
+				m.log.warnf("could not prune replaced registry tag %s: %s; %s", tag, err, registryLeak)
 			}
 		}
 	}
@@ -1813,7 +1813,7 @@ func (m *Manager) destroyImages(build BuildId, retire bool) error {
 			// Best-effort registry untag, mirroring pruneReplacedImages.
 			if retire && image.Host != "builder" {
 				if err := m.retireRegistryTag(imageName); err != nil {
-					m.log.warnf("could not remove registry tag %s: %s", imageName, err)
+					m.log.warnf("could not remove registry tag %s: %s; %s", imageName, err, registryLeak)
 				}
 			}
 		}
@@ -1837,7 +1837,7 @@ func (m *Manager) destroyImages(build BuildId, retire bool) error {
 				}
 				if retire && image.Host != "builder" {
 					if err := m.retireRegistryTag(imageName); err != nil {
-						m.log.warnf("could not remove rollback-generation registry tag %s: %s", imageName, err)
+						m.log.warnf("could not remove rollback-generation registry tag %s: %s; %s", imageName, err, registryLeak)
 					}
 				}
 			}

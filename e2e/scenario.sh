@@ -5705,11 +5705,18 @@ if (( FULL )); then
       fail "destroying build $fo_build with the registry down answered HTTP $code: the registry untag is best effort by contract (cmgr/registry.go:57-70) and must never fail the operation around it"
     PROBE_BUILD="" # cork no longer has the row; only the leaked tag is left
     # 20s rather than the ~10 the contract would allow: what must be caught is
-    # the 30s registryRequestTimeout being waited out (or retried into a hang),
-    # and a name lookup that has to be refused by an upstream resolver can
-    # cost seconds of its own on a box with no working DNS.
+    # the 30s registryRequestTimeout being waited out, and a name lookup that
+    # has to be refused by an upstream resolver can cost seconds of its own on
+    # a box with no working DNS.
+    #
+    # A tag delete is also the one registry call that is never retried, and
+    # this is what holds that line. The reads retry (registryTagPresent,
+    # registryTagExists) because a question that goes unanswered refuses a
+    # hand-over or fails a build; a delete that goes unanswered leaks a tag,
+    # which is recoverable, and retrying it would spend the backoff on every
+    # image of every build while an operator waits for a teardown.
     (( took < 20 )) ||
-      fail "the destroy took ${took}s with the registry down: a registry call that cannot even connect must not be waited out (registryRequestTimeout is 30s) or retried"
+      fail "the destroy took ${took}s with the registry down: a registry call that cannot even connect must not be waited out (registryRequestTimeout is 30s), and a tag delete must not be retried (cmgr/registry.go registryDeleteTag)"
     [[ "$(api_status GET "/builds/$fo_build")" == 404 ]] ||
       fail "build $fo_build is still known to cmgrd after a 204 destroy"
     if has_line "$E2E_REGISTRY/$CH_FLAGONLY:$fo_tag" builder_tags; then
