@@ -325,6 +325,20 @@ paths:
       tags: [schemas]
       produces: ["application/json"]
       summary: "Deletes a schema and all of its associated builds and instances"
+      parameters:
+        - name: "retire"
+          in: "query"
+          required: false
+          type: "boolean"
+          default: true
+          description: >
+            Whether the builds' images are also removed from the challenge
+            registry. The default destroys them, which is what removing a
+            schema means. `false` releases the schema without them: an
+            external build plane sends it when a schema is moving to another
+            orchestrator, which resolves the same content-addressed tags and
+            would otherwise be left with nothing to pull. Ignored when no
+            registry is configured.
       responses:
         "404":
           description: "Invalid path string"
@@ -577,6 +591,16 @@ definitions:
         type: string
       flag_format:
         type: string
+      destination:
+        type: string
+        description: >
+          The orchestrator this schema is served by, as a short name a build
+          plane resolves against its own configured destinations
+          (`CORK_DESTINATIONS`; see BUILDER.md). Deployment topology, not
+          part of a build's identity: nothing hashes a schema, so setting or
+          changing it changes no build that already exists. A daemon is told
+          what it serves rather than choosing, so this is accepted and
+          ignored here.
       challenges:
         type: object
         additionalProperties:
