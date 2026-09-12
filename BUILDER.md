@@ -11,10 +11,10 @@ the daemon through `PUT /challenges/<id>` (issue #18): the challenge as scanned
 there and its builds as left there, with the images already in the registry,
 verified before anything is recorded (every build's content checksum
 recomputed from the inputs the payload names, every image tag looked up in the
-registry). It is JSON and nothing else -- artifact bundles stay on the build
+registry). It is JSON and nothing else — artifact bundles stay on the build
 plane, and `has_artifacts` records that a build published one rather than
-carrying it. A
-build whose row already serves the generation handed over is not built over
+carrying it. A build whose row already serves the generation handed over is
+not built over
 again: handing the same thing over twice leaves the images and the
 flag as they are, and converges only what runs them, since the `instance_count`
 the hand-over carries is the schema's and may have moved. `update`, manual
@@ -266,6 +266,31 @@ Three things then sit on top:
 | Inline cache | pushed images carry BuildKit cache metadata; a rebuild imports from the generation it displaces | `executeBuild` and `cacheRefsFor`, `cmgr/docker.go` |
 | Purge after push | the builder's local copy of a build's images is dropped once they are in the registry | `cmgr/purge.go` |
 | Write-once publish | a build is pushed only once it has validated, and a tag already in the registry is never pushed over | `publishImages` and `registryTagExists`, `cmgr/docker.go`, `cmgr/registry.go` |
+
+## Where artifact bundles go
+
+A build's `artifacts.tar.gz` is extracted on the plane that built it and
+stays there. It is written to `CMGR_ARTIFACT_DIR`, in a subdirectory named
+for the schema's `destination:` — exactly that name, with nothing prepended,
+so the directory an operator sees is the destination they wrote in
+`CORK_DESTINATIONS`. A schema with no destination (a single-host deployment,
+or a `--server` run) keeps the artifact directory itself.
+
+That layout is what lets one build plane serve several orchestrators: an
+artifact server watches one directory per destination and publishes each
+under that destination's own prefix, so a challenge's files land where its
+own event's players look for them, and retiring an event is deleting one
+prefix. Nothing about this reaches an orchestrator — a hand-over carries no
+bytes, an orchestrator ignores `CMGR_ARTIFACT_DIR`, and cork serves no
+artifacts at all.
+
+A bundle is removed when its build is destroyed, and it is *searched for*
+rather than computed: `remove-schema` takes a name and never learns a
+destination, and `migrate-schema` reads the destination a schema is moving
+*to*, not the one its bundles were written under. Build ids are unique to a
+plane, so at most one file can answer to the name (`removeArtifactBundle`,
+`cmgr/filesystem.go`). A migration therefore moves a bundle into the new
+destination's directory and takes the old one out.
 
 The publish order is registry, then artifact archive, then build row: each
 store is written only once the one before it holds the generation, so nothing

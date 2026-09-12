@@ -56,9 +56,19 @@ that sent them.
 
 Two payloads take two different routes, and it is worth keeping them
 straight. **Images** go through the registry, and the workers pull them.
-**Artifact archives** travel inside the hand-over request and are served to
-players by the orchestrator itself (`GET /builds/<id>/artifacts.tar.gz`) —
-they never enter the registry and never reach a worker.
+**Artifact archives** — the files a challenge gives its players — never move
+at all: they are written on the build plane that built them, in a directory
+per destination under `CMGR_ARTIFACT_DIR`, and an artifact server running
+beside the build plane publishes them (picoCTF's uploads to S3 behind
+CloudFront; a single box can serve them over HTTP). They never enter the
+registry, never reach a worker, and never reach an orchestrator: a hand-over
+is JSON, and all it says about them is `has_artifacts`, so the platform knows
+to offer the download.
+
+Cork itself serves no artifacts. cmgr had `GET /builds/<id>/artifacts.tar.gz`
+and a per-file path under it; both are gone, along with `cmgrd-cli artifacts`.
+An orchestrator on an external build plane ignores `CMGR_ARTIFACT_DIR`
+entirely and says so at startup.
 
 The counts are not arbitrary:
 
@@ -293,8 +303,6 @@ Base image pins:
       tag is consulted, and it rebuilds nothing by itself
 
 Other:
-  artifacts <build> [<output file>]
-      download the build's artifacts tarball (default: <build>.tar.gz)
   version
       print client and server versions
 
@@ -339,7 +347,7 @@ it; on an external build plane they are refused for that reason.
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
 | CMGR_DB                  | SQLite DB Path                                                                                                                     | ./cmgr.db                                                                |
 | CMGR_DIR                 | Challenge root directory                                                                                                           | .                                                                        |
-| CMGR_ARTIFACT_DIR        | Artifact output dir                                                                                                                | .                                                                        |
+| CMGR_ARTIFACT_DIR        | Where a build's artifact bundle is written. Build plane only — `cork-build` writes a subdirectory per destination under it, and that is what an artifact server publishes from. An orchestrator (`CMGR_BUILD_PLANE=external`) holds no bundles, ignores this, and says so at startup | .                                                                        |
 | CMGR_INTERFACE           | The interface where the challenge ports on the workers are exposed on                                                              | 0.0.0.0                                                                  |
 | CMGR_PORTS               | Range for challenge ports. Must be in format like 1024-65535                                                                       | unset (docker decides)                                                   |
 | CMGR_ENABLE_DISK_QUOTAS  | Enable disk quotas                                                                                                                 | unset (off)                                                              |
@@ -446,10 +454,15 @@ currently uses the following variables:
 
 - *CMGR\_DIR*: directory containing all challenges (defaults to '.')
 
-- *CMGR\_ARTIFACT\_DIR*: directory for storing artifact bundles (defaults to '.')
+- *CMGR\_ARTIFACT\_DIR*: directory a build's artifact bundle is written to
+  (defaults to '.'). Read only where building happens: `cork-build`, or a
+  `cmgrd` on a local build plane. An orchestrator on an external build plane
+  takes no bundles, so it neither reads this nor creates the directory, and
+  logs that it is ignoring it.
 
 - *CMGR\_MAX\_ARTIFACT\_FILES*: maximum number of entries permitted in a
-  challenge's artifact archive (defaults to 10000)
+  challenge's artifact archive (defaults to 10000); build plane only, as the
+  two below are
 
 - *CMGR\_MAX\_ARTIFACT\_BYTES*: maximum total uncompressed size of a
   challenge's artifact archive (defaults to '5g')
