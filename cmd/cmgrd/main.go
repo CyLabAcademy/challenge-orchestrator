@@ -49,7 +49,19 @@ func main() {
 	if artifact_dir == "" {
 		artifact_dir = "."
 	}
-	mgr := cmgr.NewManager(cmgr.INFO)
+	// CMGR_LOGGING, which this daemon documented and did not read: it is
+	// the only way to raise an orchestrator's logging, since there is no
+	// flag for it. A level that does not parse is complained about and not
+	// fatal -- a typo here is no reason to refuse to serve.
+	logLevel, logLevelErr := cmgr.LogLevelFromEnv(cmgr.INFO)
+	if logLevelErr != nil {
+		// Before the manager, not after: a start that then fails would
+		// otherwise never say why its logging was not what the unit file
+		// asked for, and this is the one complaint that explains the rest
+		// of the output.
+		log.Printf("warning: %s", logLevelErr)
+	}
+	mgr := cmgr.NewManager(logLevel)
 	if mgr == nil {
 		log.Fatal("failed to initialize cmgr library")
 	}

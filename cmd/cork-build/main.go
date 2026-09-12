@@ -116,7 +116,12 @@ func main() {
 		}
 	}
 
-	logLevel := cmgr.INFO
+	// CMGR_LOGGING sets the level, as it does for the daemon; --verbose is
+	// the flag form and wins, being the more deliberate of the two.
+	logLevel, logLevelErr := cmgr.LogLevelFromEnv(cmgr.INFO)
+	if logLevelErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", logLevelErr)
+	}
 	if *verbose {
 		logLevel = cmgr.DEBUG
 	}
@@ -320,6 +325,9 @@ Environment, all as cmgrd reads them (this is cmgrd's build path):
 
   CMGR_PURGE_AFTER_PUSH - drop this host's copy of an image once it is in
       the registry, which is what a builder wants: nothing runs here
+
+  CMGR_LOGGING - debug, info, warn, error or disabled (defaults to info).
+      --verbose is the flag form of the same setting and wins over it
 
   DOCKER_HOST and the rest of docker's own variables - the daemon that
       builds. See https://docs.docker.com/engine/reference/commandline/cli/
