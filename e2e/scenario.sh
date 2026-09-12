@@ -1592,8 +1592,11 @@ EOF
   # never made. Asserting the file alone would pass for the wrong reason.
   [[ ! -e "$CB_ARTIFACTS" ]] ||
     fail "the cork-build daemon created $CB_ARTIFACTS: an orchestrator takes no artifacts and makes no directory for them"
-  cb_bundle=$(ls "$CB_BUILD_ARTIFACTS"/*.tar.gz 2>/dev/null | head -1) ||
-    fail "cork-build published no bundle under $CB_BUILD_ARTIFACTS for the challenges it built"
+  # Named for the id the orchestrator reports for that build, which is the id
+  # the platform has and the id an artifact server publishes under.
+  cb_bundle="$CB_BUILD_ARTIFACTS/$cb_build.tar.gz"
+  [[ -e "$cb_bundle" ]] ||
+    fail "cork-build published no $cb_build.tar.gz under $CB_BUILD_ARTIFACTS (it holds: $(ls "$CB_BUILD_ARTIFACTS" 2>/dev/null | tr '\n' ' ')): the orchestrator reports build $cb_build and the bundle must answer to that id, or every download link for it 404s"
   [[ "$(art_members "$cb_bundle")" == "BinEx101 BinEx101.c" ]] ||
     fail "the bundle cork-build left at $cb_bundle holds $(art_members "$cb_bundle"), expected 'BinEx101 BinEx101.c'"
 
@@ -1776,8 +1779,16 @@ EOF
   # event's players look. The directory is named for the destination exactly,
   # with nothing prepended (cmgr.SetArtifactNamespace).
   RT_BUILD_ID=$(curl -sS --max-time 30 "$RT_A/schemas/routed" | jq -r '.[0].builds[0].id')
-  rt_bundle=$(ls "$RT/built/library"/*.tar.gz 2>/dev/null | head -1) ||
-    fail "cork-build published no bundle under $RT/built/library for a schema bound to 'library': an artifact server watching that destination would have nothing to upload"
+  # Named for the build id the ORCHESTRATOR reports, not merely present. An
+  # artifact server publishes a bundle under the id in its filename, and the
+  # platform has only the id cork reports to build a download link from, so
+  # the two numberings have to be the same one. Taking whatever tarball
+  # happens to be there ("ls | head -1") passed happily while the orchestrator
+  # renumbered every build it was handed and every {{url_for}} link pointed at
+  # a bundle that did not exist.
+  rt_bundle="$RT/built/library/$RT_BUILD_ID.tar.gz"
+  [[ -e "$rt_bundle" ]] ||
+    fail "cork-build published no $RT_BUILD_ID.tar.gz under $RT/built/library for a schema bound to 'library' (it holds: $(ls "$RT/built/library" 2>/dev/null | tr '\n' ' ')): an artifact server publishes by the id in the filename and the platform addresses the files by the id the orchestrator reports, so a mismatch 404s every download"
   [[ "$(art_members "$rt_bundle")" == "BinEx101 BinEx101.c" ]] ||
     fail "the bundle at $rt_bundle holds $(art_members "$rt_bundle"), expected this challenge's two files"
   [[ ! -e "$RT/built/$(basename "$rt_bundle")" ]] ||
@@ -1837,8 +1848,13 @@ EOF
   # and a migration reads the destination a schema is moving TO). A bundle
   # left in library/ would keep being uploaded under the old event's prefix
   # long after the challenge moved.
-  rt_bundle=$(ls "$RT/built/event"/*.tar.gz 2>/dev/null | head -1) ||
-    fail "the migration left no bundle under $RT/built/event: the event's artifact server would have nothing to upload for a schema it now serves"
+  # Named for the id the NEW orchestrator reports, for the same reason the
+  # first hand-over's is: the id in the filename is what gets published and
+  # the id cork reports is what the platform builds links from.
+  RT_MIGRATED_ID=$(curl -sS --max-time 30 "$RT_B/schemas/routed" | jq -r '.[0].builds[0].id')
+  rt_bundle="$RT/built/event/$RT_MIGRATED_ID.tar.gz"
+  [[ -e "$rt_bundle" ]] ||
+    fail "the migration left no $RT_MIGRATED_ID.tar.gz under $RT/built/event (it holds: $(ls "$RT/built/event" 2>/dev/null | tr '\n' ' ')): the event's artifact server would have nothing to upload for a schema it now serves, or would publish it under an id no download link names"
   [[ "$(art_members "$rt_bundle")" == "BinEx101 BinEx101.c" ]] ||
     fail "the migrated bundle at $rt_bundle holds $(art_members "$rt_bundle")"
   left=$(ls "$RT/built/library"/*.tar.gz 2>/dev/null || true)
