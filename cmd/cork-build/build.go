@@ -234,7 +234,17 @@ func assemble(schemas []*cmgr.Schema, built map[string][]*cmgr.ChallengeMetadata
 			payload, known := payloads[challenge.Id]
 			if !known {
 				challenge.Builds = nil
-				payload = &cmgr.HandOver{Challenge: challenge, PinFingerprint: fingerprint}
+				payload = &cmgr.HandOver{
+					Challenge:      challenge,
+					PinFingerprint: fingerprint,
+					// The text of any seccomp profile the challenge
+					// declares. It was read from the challenge directory,
+					// which the orchestrator does not have, and it is not
+					// in the challenge's own JSON -- so without it the
+					// orchestrator would record the declaration and launch
+					// every container under the default policy.
+					SeccompProfiles: cmgr.SeccompProfiles(challenge),
+				}
 				payloads[challenge.Id] = payload
 				order = append(order, challenge.Id)
 			}

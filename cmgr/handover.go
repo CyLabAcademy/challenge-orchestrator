@@ -64,6 +64,13 @@ type HandOver struct {
 	// daemon recomputes for every build, and one it does not otherwise have
 	// (the pins live on the build plane).
 	PinFingerprint uint32 `json:"pin_fingerprint"`
+	// SeccompProfiles is the text of every seccomp profile the challenge
+	// declares, keyed by the filename it declares it under. The resolved
+	// text is read from the challenge directory, which this daemon does not
+	// have, and it is not in the challenge's own JSON -- so without it a
+	// challenge that asked for a narrower syscall set would be recorded as
+	// having a profile and run under the embedded default instead.
+	SeccompProfiles map[string]string `json:"seccomp_profiles,omitempty"`
 }
 
 // HandOverChallenge records a challenge and the builds handed over with it,
@@ -86,6 +93,12 @@ func (m *Manager) HandOverChallenge(id ChallengeId, handOver *HandOver, options 
 		return nil, err
 	}
 	challenge := handOver.Challenge
+	// Before the registry and before the lock: a challenge whose declared
+	// seccomp policy did not arrive is refused outright rather than recorded
+	// and run under the default one.
+	if err := applySeccompProfiles(challenge, handOver.SeccompProfiles); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrHandOverInvalid, err)
+	}
 	if err := m.requireInRegistry(challenge); err != nil {
 		return nil, err
 	}

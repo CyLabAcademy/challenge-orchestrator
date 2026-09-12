@@ -258,3 +258,85 @@ func unmarshalSeccompOptions(data string) (*SeccompOptions, error) {
 	persisted.Options.effectiveProfile = persisted.EffectiveProfile
 	return persisted.Options, nil
 }
+
+// SeccompProfiles is the resolved text of every seccomp profile a challenge
+// declares, keyed by the filename it declares it under. It is how a profile
+// reaches a daemon that has no challenge directory to read it from.
+//
+// The text lives in the unexported effectiveProfile, filled in by resolve()
+// from the tree, so it cannot travel in the payload's own JSON -- which is
+// how a hand-over came to record that a challenge had a profile while every
+// container it launched ran under the embedded default instead. Returned
+// keyed by filename rather than by host because that is what the declaration
+// names, and a challenge that uses one profile on several hosts should send
+// it once.
+func SeccompProfiles(challenge *ChallengeMetadata) map[string]string {
+	if challenge == nil {
+		return nil
+	}
+	profiles := map[string]string{}
+	collect := func(opts *SeccompOptions) {
+		if opts == nil || opts.Profile == "" || opts.effectiveProfile == "" {
+			return
+		}
+		profiles[opts.Profile] = opts.effectiveProfile
+	}
+	collect(challenge.ChallengeOptions.Seccomp)
+	for _, override := range challenge.ChallengeOptions.Overrides {
+		collect(override.Seccomp)
+	}
+	if len(profiles) == 0 {
+		return nil
+	}
+	return profiles
+}
+
+// applySeccompProfiles fills in the resolved text for every profile a
+// challenge declares, from the texts delivered with it, and refuses anything
+// it cannot stand behind. A profile is applied only when the text hashes to
+// the declaration's own ProfileHash, so a payload cannot widen a policy by
+// sending a permissive profile under a strict one's name, and each is
+// validated exactly as the loader validates one read from a tree.
+//
+// A declaration with no text delivered is refused rather than run under the
+// default: a challenge whose author asked for a narrower syscall set and
+// silently got a wider one is the failure this exists to prevent.
+func applySeccompProfiles(challenge *ChallengeMetadata, profiles map[string]string) error {
+	if challenge == nil {
+		return nil
+	}
+	apply := func(where string, opts *SeccompOptions) error {
+		if opts == nil || opts.Profile == "" {
+			return nil
+		}
+		profile, ok := profiles[opts.Profile]
+		if !ok {
+			return fmt.Errorf("%s declares the seccomp profile '%s' and its text was not handed over, so it could only run under the default policy", where, opts.Profile)
+		}
+		if err := validateSeccompProfile(profile); err != nil {
+			return fmt.Errorf("the seccomp profile '%s' handed over for %s: %w", opts.Profile, where, err)
+		}
+		sum := fmt.Sprintf("%x", sha256.Sum256([]byte(profile)))
+		if opts.ProfileHash != "" && sum != opts.ProfileHash {
+			return fmt.Errorf("the seccomp profile '%s' handed over for %s hashes to %s, and the challenge declares %s", opts.Profile, where, sum, opts.ProfileHash)
+		}
+		opts.ProfileHash = sum
+		opts.effectiveProfile = profile
+		return nil
+	}
+
+	if err := apply(string(challenge.Id), challenge.ChallengeOptions.Seccomp); err != nil {
+		return err
+	}
+	// Overrides are values in a map, so each is taken, filled in and put back.
+	for host, override := range challenge.ChallengeOptions.Overrides {
+		if override.Seccomp == nil {
+			continue
+		}
+		if err := apply(fmt.Sprintf("host '%s' of %s", host, challenge.Id), override.Seccomp); err != nil {
+			return err
+		}
+		challenge.ChallengeOptions.Overrides[host] = override
+	}
+	return nil
+}
