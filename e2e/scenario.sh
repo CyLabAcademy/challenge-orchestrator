@@ -233,6 +233,8 @@ FRESH_CMGRD=""        # pid of the throwaway cmgrd of the fresh-box step
 HO_CMGRD=""           # pid of the throwaway cmgrd of the hand-over step
 CB_CMGRD=""           # pid of the throwaway cmgrd of the cork-build step
 MH_CMGRD=""           # pid of the throwaway cmgrd of the multi-host hand-over
+RT_A_CMGRD=""         # pids of the two orchestrators of the routing step
+RT_B_CMGRD=""
 EDITED_META=""        # a challenge metadata file a step edited under CMGR_DIR
 ORPHAN_TAG=""         # a content tag an update deliberately orphaned, which cork never reclaims
 STOPPED_REGISTRY=""   # outer container id of the registry this run stopped
@@ -295,6 +297,8 @@ cleanup() {
   if [[ -n "$HO_CMGRD" ]]; then kill "$HO_CMGRD" >/dev/null 2>&1 || true; fi
   if [[ -n "$CB_CMGRD" ]]; then kill "$CB_CMGRD" >/dev/null 2>&1 || true; fi
   if [[ -n "$MH_CMGRD" ]]; then kill "$MH_CMGRD" >/dev/null 2>&1 || true; fi
+  if [[ -n "$RT_A_CMGRD" ]]; then kill "$RT_A_CMGRD" >/dev/null 2>&1 || true; fi
+  if [[ -n "$RT_B_CMGRD" ]]; then kill "$RT_B_CMGRD" >/dev/null 2>&1 || true; fi
   # The stand-in holds the registry's own network alias, so it lets go first;
   # the probe build is destroyed last, so its registry untag has a registry to
   # talk to. t=1 because the stand-in's entrypoint is a pipeline and bash
@@ -1568,8 +1572,8 @@ EOF
     fail "the archive cork-build handed over holds $(art_members "$CB/served.tar.gz"), this fleet's holds $(art_members "$CB/fleet.tar.gz")"
 
   # And cork-build converged it in the same run, which is what the whole
-  # exchange is for and the half a hand-over does not do: it records builds,
-  # and only a converge decides what runs them.
+  # exchange is for and the half that used to be left to the operator: a
+  # hand-over records builds, and only a converge decides what runs them.
   grep -q "converged 'e2e-built' on" "$CB/build.log" ||
     fail "cork-build handed every build over and did not converge the schema: it would sit on the daemon as rows with nothing serving them ($(tail -c 800 "$CB/build.log"))"
   # Converging again must still succeed. It is a no-op here, and it is the
@@ -1577,12 +1581,14 @@ EOF
   # cmgrd-cli keeps update-schema at all.
   out=$(timeout 60 cmgrd-cli --server "$CB_SERVER" update-schema "$CB/schema.yaml" 2>&1) ||
     fail "update-schema on the cork-build daemon failed although cork-build handed it every build: $out"
+
   # And it says which of the settings it inherits mean nothing to it. This
   # run sets CMGR_PORTS, which is about publishing instances: a build plane
   # runs none, so it is inert here and named at startup rather than passed
   # over. The mirror of what the external daemon says about CMGR_DIR.
   grep -q "CMGR_PORTS is set but ignored" "$CB/build.log" ||
     fail "cork-build did not name CMGR_PORTS as ignored: a setting about serving instances is inert on a build plane and saying so is how a unit file grown from an orchestrator's gets noticed ($(tail -c 400 "$CB/build.log"))"
+  note "cork-build names the orchestrator settings it inherits and ignores"
 
   # A build plane will not hand over to a daemon that builds for itself:
   # this fleet's own cmgrd is one, and says so before anything is sent.
@@ -1603,6 +1609,201 @@ else
   deselect "cork-build, the build plane as a binary"
 fi
 
+
+# ------------------- 5a-ter. routing and migration between orchestrators
+
+if (( FULL )); then
+  step "routing: a schema goes to the orchestrator its destination names, and migrates to another without rebuilding a thing"
+  # The topology this fleet otherwise never has: one build plane, TWO
+  # orchestrators, one registry. Everything asserted here is cross-service by
+  # nature and cannot be reached from a unit test -- which schema landed
+  # where, that the other one did not get it, and that moving a schema leaves
+  # the images alone. The routing rules themselves (resolution, the default,
+  # exclusivity) are unit-tested in cmd/cork-build.
+  #
+  # No workers and no launches: a launch goes straight to an orchestrator and
+  # is covered many times over above. These daemons refuse one, which is
+  # correct and beside the point.
+  RT=$(mktemp -d)
+  for port in 4290 4291; do
+    CMGR_BUILD_PLANE=external \
+    CMGR_REGISTRY="$E2E_REGISTRY" \
+    CMGR_ARTIFACT_DIR="$RT/artifacts-$port" \
+    CMGR_DB="$RT/db-$port/cmgr.db" \
+      cmgrd --port "$port" >"$RT/cmgrd-$port.log" 2>&1 &
+    case $port in
+      4290) RT_A_CMGRD=$! ;;
+      4291) RT_B_CMGRD=$! ;;
+    esac
+  done
+  RT_A=http://127.0.0.1:4290   # "library"
+  RT_B=http://127.0.0.1:4291   # "event"
+  retry 30 "the library orchestrator on :4290" fresh_answers "$RT_A_CMGRD" 4290 "$RT/cmgrd-4290.log" "the library orchestrator"
+  retry 30 "the event orchestrator on :4291" fresh_answers "$RT_B_CMGRD" 4291 "$RT/cmgrd-4291.log" "the event orchestrator"
+
+  cat >"$RT/destinations.yaml" <<EOF
+library: $RT_A
+event: $RT_B
+EOF
+  # One challenge, and the schema that routes it. The flag format differs
+  # from the fleet's so this is content of its own: the exclusivity rule
+  # forbids two orchestrators sharing a tag, and the fleet's own cmgrd is
+  # already serving the fleet's.
+  MK_SEED_RT=$(api GET "/builds/$MK_BUILD" | jq -r .seed)
+  write_routed_schema() { # write_routed_schema <destination>
+    cat >"$RT/schema.yaml" <<EOF
+name: routed
+destination: $1
+flag_format: routed{%s}
+challenges:
+  $CH_MAKE:
+    seeds: [$MK_SEED_RT]
+    instance_count: -1
+EOF
+  }
+  rt_build() { # rt_build <command> [args...]; runs cork-build with the routing config
+    CMGR_DIR="$CHALLENGES" \
+    CMGR_DB="$RT/build.db" \
+    CMGR_ARTIFACT_DIR="$RT/built" \
+    CMGR_REGISTRY="$E2E_REGISTRY" \
+    CMGR_REGISTRY_CERT_DIR="$REGISTRY_CERT_DIR" \
+    CMGR_PURGE_AFTER_PUSH=true \
+    CMGR_PORTS=21010-21019 \
+    CORK_DESTINATIONS="$RT/destinations.yaml" \
+    DOCKER_HOST="tcp://${E2E_BUILDER#http://}" \
+      timeout 600 cork-build "$@"
+  }
+  rt_serves() { # rt_serves <base url> ; how many challenges of the schema it holds
+    # The count, not the status: GET /schemas/<name> is a query over the
+    # builds table, so an orchestrator that has never heard of this schema
+    # answers 200 with an empty list rather than 404.
+    curl -sS --fail-with-body --max-time 30 "$1/schemas/routed" | jq -r 'length'
+  }
+
+  # 0. A destination that is not configured is refused before the challenge
+  #    directory is even scanned, let alone built. Routing is decided from
+  #    the schema files alone, so a mistyped destination costs a second
+  #    rather than an event's worth of building followed by a refusal.
+  write_routed_schema libary   # a typo, and the whole point of the name
+  out=$(rt_build build "$RT/schema.yaml" 2>&1) && rc=0 || rc=$?
+  (( rc != 0 )) ||
+    fail "cork-build accepted a schema bound to 'libary', which is not a configured destination"
+  grep -q "libary" <<<"$out" ||
+    fail "the refusal does not name the destination that could not be resolved: $(tail -c 300 <<<"$out")"
+  grep -q "'library'" <<<"$out" ||
+    fail "the refusal does not list the destinations there are to choose from: $(tail -c 300 <<<"$out")"
+  if grep -q "scanning the challenge directory" <<<"$out"; then
+    fail "cork-build scanned the challenge directory before refusing a schema it cannot route: routing needs nothing but the schema files, so it is settled first"
+  fi
+  note "a schema naming a destination that is not configured is refused before the tree is scanned"
+
+  # 1. A schema goes where its destination names, and nowhere else.
+  write_routed_schema library
+  rt_build build "$RT/schema.yaml" >"$RT/build.log" 2>&1 ||
+    fail "cork-build build (destination library) failed: $(tail -c 800 "$RT/build.log")"
+  [[ "$(rt_serves "$RT_A")" == 1 ]] ||
+    fail "the library orchestrator does not serve the routed schema: $(rt_serves "$RT_A")"
+  [[ "$(rt_serves "$RT_B")" == 0 ]] ||
+    fail "the event orchestrator was given a schema bound to 'library': a destination that routes nothing is not routing"
+  RT_TAG=$(curl -sS --max-time 30 "$RT_A/schemas/routed" | jq -r '.[0].builds[0] | "s\(.seed)-\(.checksum | tostring)"')
+  RT_CHECK=$(curl -sS --max-time 30 "$RT_A/schemas/routed" | jq -r '.[0].builds[0].checksum')
+  note "routed to library as build checksum $RT_CHECK"
+  has_line "$(printf 's%d-%x-challenge' "$MK_SEED_RT" "$RT_CHECK")" registry_tags "$CH_MAKE" ||
+    fail "the routed build's image is not in the registry"
+
+  # 2. Migrating it moves the schema and rebuilds nothing. The identity of a
+  #    build does not depend on which orchestrator serves it, so the tag the
+  #    event orchestrator resolves is the one the library one was serving --
+  #    which is only true if the release did not retire it.
+  write_routed_schema event
+  t=$(date +%s)
+  rt_build migrate-schema "$RT/schema.yaml" >"$RT/migrate.log" 2>&1 ||
+    fail "cork-build migrate-schema failed: $(tail -c 800 "$RT/migrate.log")"
+  took=$(( $(date +%s) - t ))
+  [[ "$(rt_serves "$RT_B")" == 1 ]] ||
+    fail "the event orchestrator does not serve the migrated schema: $(tail -c 800 "$RT/migrate.log")"
+  [[ "$(rt_serves "$RT_A")" == 0 ]] ||
+    fail "the library orchestrator still serves the schema after it was migrated away"
+  RT_AFTER=$(curl -sS --max-time 30 "$RT_B/schemas/routed" | jq -r '.[0].builds[0].checksum')
+  [[ "$RT_AFTER" == "$RT_CHECK" ]] ||
+    fail "the migrated build has checksum $RT_AFTER and had $RT_CHECK: a migration must move the schema, not rebuild it"
+  has_line "$(printf 's%d-%x-challenge' "$MK_SEED_RT" "$RT_CHECK")" registry_tags "$CH_MAKE" ||
+    fail "the migration retired the image from the registry: the orchestrator taking the schema resolves that same content-addressed tag, and nothing can pull it now"
+  # The positive signal, and it has to be: cmgr reads the docker build stream
+  # to check it for errors and never logs it, so grepping for "Successfully
+  # built" would pass whether or not anything was built. What it does log is
+  # the adoption -- executeBuild resolves every image against the write-once
+  # registry before it builds anything and takes what is already there
+  # ("already in the registry; not built here", cmgr/docker.go).
+  grep -q "built here" "$RT/migrate.log" ||
+    fail "the migration did not adopt the images already in the registry, so it rebuilt them: nothing here then proves the release left them alone (see $RT/migrate.log)"
+  # And it finished the move rather than half of it. Handing the builds to
+  # the event orchestrator records them; only the converge decides what runs
+  # them, so without it a migrated schema is rows on a daemon serving nobody.
+  grep -q "converged 'routed' on event" "$RT/migrate.log" ||
+    fail "the migration handed the builds to the event orchestrator and did not converge the schema there: the event would hold every build and serve none of them (see $RT/migrate.log)"
+  note "migrated library -> event in ${took}s, image untouched at checksum $RT_CHECK"
+
+  # 3. Removing it is destructive on both sides: the orchestrator's builds
+  #    and the registry tag go, and so do the build plane's own rows -- or
+  #    the next build of the same schema would push nothing and be refused
+  #    for a tag nobody has.
+  #    By name, with no schema file in reach of it: the name carries no
+  #    destination, so the orchestrator holding it can only be found by
+  #    asking them -- which is the point, because a DELETE for a schema a
+  #    daemon has no rows for removes nothing and answers 204 (DeleteSchema
+  #    over no rows fails at nothing). Anything that guessed would report a
+  #    removal that removed nothing while the event went on running. Only a
+  #    real cmgrd answers that way, which is why this is here.
+  rt_build remove-schema routed >"$RT/remove.log" 2>&1 ||
+    fail "cork-build remove-schema failed: $(tail -c 800 "$RT/remove.log")"
+  grep -q "from event" "$RT/remove.log" ||
+    fail "remove-schema did not find the schema on the orchestrator serving it: $(tail -c 400 "$RT/remove.log")"
+  [[ "$(rt_serves "$RT_B")" == 0 ]] ||
+    fail "the event orchestrator still serves the schema after remove-schema"
+  if has_line "$(printf 's%d-%x-challenge' "$MK_SEED_RT" "$RT_CHECK")" registry_tags "$CH_MAKE"; then
+    fail "remove-schema left the image in the registry: a removal is destructive, and nothing is coming back for it"
+  fi
+  # The build plane's own rows: the proof is that building it again works,
+  # which it only can if this plane knows it has to push again.
+  write_routed_schema event
+  rt_build build "$RT/schema.yaml" >"$RT/rebuild.log" 2>&1 ||
+    fail "building the schema again after remove-schema failed -- the build plane kept rows for builds whose tags it had retired: $(tail -c 800 "$RT/rebuild.log")"
+  [[ "$(rt_serves "$RT_B")" == 1 ]] ||
+    fail "the schema did not come back after being removed and built again"
+  rt_build remove-schema routed >"$RT/remove2.log" 2>&1 ||
+    fail "removing the rebuilt schema failed: $(tail -c 400 "$RT/remove2.log")"
+
+  # Removing it once more is refused rather than reported as done. Nothing
+  # serves the name now and this plane has no rows for it either, so there
+  # is nothing by that name anywhere -- and every legitimate removal has one
+  # or the other. This is also what a caller that still passes a schema FILE
+  # looks like, since remove-schema took one until recently: without the
+  # refusal it would drop no rows, reach no orchestrator, and print that the
+  # schema was removed. Only real orchestrators answering "not serving" put
+  # it in that state, which is why it is here.
+  rt_build remove-schema routed >"$RT/remove3.log" 2>&1 && rc=0 || rc=$?
+  (( rc != 0 )) ||
+    fail "remove-schema reported success for a schema nothing anywhere has"
+  grep -q "there is no schema 'routed' to remove" "$RT/remove3.log" ||
+    fail "the refusal does not say there is nothing by that name: $(tail -c 300 "$RT/remove3.log")"
+  # And a file path is named as the mistake it is, rather than treated as a
+  # schema that happens not to exist.
+  rt_build remove-schema "$RT/schema.yaml" >"$RT/remove4.log" 2>&1 && rc=0 || rc=$?
+  (( rc != 0 )) ||
+    fail "remove-schema accepted a schema file where it takes a name"
+  grep -q "is a schema file" "$RT/remove4.log" ||
+    fail "remove-schema did not say the argument was a file: $(tail -c 300 "$RT/remove4.log")"
+  note "removing a schema that is nowhere, or naming a file instead of a schema, is refused rather than reported as done"
+
+  kill "$RT_A_CMGRD" "$RT_B_CMGRD" >/dev/null 2>&1 || true
+  wait "$RT_A_CMGRD" "$RT_B_CMGRD" 2>/dev/null || true
+  RT_A_CMGRD=""; RT_B_CMGRD=""
+  rm -rf "$RT"
+  ok "a schema went to the destination it names and not to the other orchestrator; migrating it moved the schema in ${took}s with the image untouched in the registry and nothing rebuilt; removing it by name alone found the orchestrator serving it and destroyed the builds, the tag and this plane's own rows; building it again brought it back"
+else
+  deselect "routing and migration between two orchestrators"
+fi
 # ------------------------------- 5b. purge after push
 
 step "purge after push: the builder keeps no copy of what it pushed, and keeps the layer cache that makes the next build cheap"
