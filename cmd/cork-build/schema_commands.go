@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -171,6 +172,119 @@ func migrateSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destinatio
 		return runtimeError(fmt.Errorf("schema '%s' was released from %s and this build plane could not drop its own rows for it: run `build` to converge it onto %s: %w", schema.Name, fromName, toName, err))
 	}
 	return buildCommand(mgr, nil, dests, args)
+}
+
+// addSchemaCommand and updateSchemaCommand are `build` for one schema, with
+// the guardrail each name has always carried: add refuses a schema this
+// plane has built before, update refuses one it has not.
+//
+// They do the same work because on a build plane there is only one piece of
+// work -- build what the schema names, push it, hand it to the destination,
+// converge it there -- and `build` is that work for any number of schemas,
+// indifferent to whether it has seen them. The difference is the refusal:
+// `add-schema` on a name already in use is almost always a second event
+// written against the first one's schema, and `update-schema` on a name
+// that is not is almost always a typo. `build` is the form that does not
+// ask, and is the one to use for a run of several schemas, since exclusivity
+// is only checked across the schemas of one run.
+func addSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args []string) int {
+	return deploySchema(mgr, servers, dests, args, "add-schema", false)
+}
+
+func updateSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args []string) int {
+	return deploySchema(mgr, servers, dests, args, "update-schema", true)
+}
+
+func deploySchema(mgr *cmgr.Manager, servers []string, dests *destinations, args []string, command string, wantKnown bool) int {
+	if len(args) != 1 {
+		return usageError("%s takes one schema file", command)
+	}
+	schema, err := loadSchema(args[0])
+	if err != nil {
+		return runtimeError(err)
+	}
+	// What this plane has built, which is what it means for a schema to
+	// exist here: the database keys builds by schema name and holds no
+	// schema table of its own (schemaExists, queryForSchemas).
+	known, err := mgr.ListSchemas()
+	if err != nil {
+		return runtimeError(fmt.Errorf("reading the schemas this build plane has built: %w", err))
+	}
+	if err := schemaGuard(schema.Name, known, wantKnown); err != nil {
+		return runtimeError(err)
+	}
+	return buildCommand(mgr, servers, dests, args)
+}
+
+// schemaGuard is the only thing that separates add-schema from
+// update-schema: whether the plane is expected to have built this schema
+// before. Both then do the same work.
+func schemaGuard(schemaName string, known []string, wantKnown bool) error {
+	built := slices.Contains(known, schemaName)
+	switch {
+	case wantKnown && !built:
+		// Worth naming the database: it is bookkeeping and may be thrown
+		// away, so a plane rebuilt since the schema was deployed has no row
+		// for a schema an orchestrator is serving right now. `build` is the
+		// way through that, and it re-derives rather than rebuilding.
+		return fmt.Errorf("this build plane has built nothing for schema '%s', so there is no definition to converge to: add-schema is the first one, and build does either -- and if this plane's database was rebuilt since, build re-derives what the registry already holds", schemaName)
+	case !wantKnown && built:
+		return fmt.Errorf("this build plane has already built schema '%s': update-schema converges it to a new definition, and build does either", schemaName)
+	}
+	return nil
+}
+
+// listSchemasCommand names the schemas this build plane has built. Not what
+// is being served: an orchestrator holds that, and holds only its own.
+func listSchemasCommand(mgr *cmgr.Manager, args []string) int {
+	if len(args) != 0 {
+		return usageError("list-schemas takes no arguments")
+	}
+	schemas, err := mgr.ListSchemas()
+	if err != nil {
+		return runtimeError(err)
+	}
+	for _, schema := range schemas {
+		fmt.Println(schema)
+	}
+	return NO_ERROR
+}
+
+// showSchemaCommand prints what this plane built for a schema, as json on
+// stdout so it stays pipeable, and says on stderr which destination is
+// serving it -- the question an operator actually has, and the one only a
+// build plane can answer, since it is the only thing that sees them all.
+//
+// Best-effort on that second half: a destination that cannot be reached is
+// reported and not fatal. This is a read, and refusing to describe what was
+// built because some other orchestrator is down would be the wrong trade.
+func showSchemaCommand(mgr *cmgr.Manager, dests *destinations, args []string) int {
+	if len(args) != 1 {
+		return usageError("show-schema takes one schema name")
+	}
+	name := args[0]
+	if err := validSchemaName(name); err != nil {
+		return usageError("schema name: %s", err)
+	}
+	state, err := mgr.GetSchemaState(name)
+	if err != nil {
+		return runtimeError(err)
+	}
+	data, err := json.MarshalIndent(state, "", "    ")
+	if err != nil {
+		return runtimeError(err)
+	}
+	fmt.Println(string(data))
+
+	switch where, address, err := whereSchemaLives(name, dests); {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "note: could not work out which orchestrator serves '%s': %s\n", name, err)
+	case address == "":
+		fmt.Fprintf(os.Stderr, "note: no configured destination is serving '%s'\n", name)
+	default:
+		fmt.Fprintf(os.Stderr, "note: served by %s (%s)\n", where, address)
+	}
+	return NO_ERROR
 }
 
 // destinationsCommand says what routing this build plane has.

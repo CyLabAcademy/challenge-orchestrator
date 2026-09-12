@@ -1582,13 +1582,42 @@ EOF
   out=$(timeout 60 cmgrd-cli --server "$CB_SERVER" update-schema "$CB/schema.yaml" 2>&1) ||
     fail "update-schema on the cork-build daemon failed although cork-build handed it every build: $out"
 
+  # The commands cmgr's own CLI had, now on the host that still has a tree.
+  # What they wrap is tested in the cmgr package; what is worth proving here
+  # is that they are wired to a real manager and answer from this tree and
+  # this database rather than erroring out on a build plane.
+  cb() { # cb <args...>; cork-build against the same tree and database
+    CMGR_DIR="$CHALLENGES" CMGR_DB="$CB/build.db" CMGR_ARTIFACT_DIR="$CB/built" \
+    CMGR_REGISTRY="$E2E_REGISTRY" CMGR_REGISTRY_CERT_DIR="$REGISTRY_CERT_DIR" \
+    CMGR_PORTS=21000-21009 DOCKER_HOST="tcp://${E2E_BUILDER#http://}" \
+      timeout 120 cork-build "$@"
+  }
+  out=$(cb list) || fail "cork-build list failed: $out"
+  grep -qx "$CH_MAKE" <<<"$out" ||
+    fail "cork-build list does not name $CH_MAKE, which it built from this tree: $out"
+  out=$(cb list-schemas) || fail "cork-build list-schemas failed: $out"
+  grep -qx e2e-built <<<"$out" ||
+    fail "cork-build list-schemas does not name the schema it just built: $out"
+  # Nothing has touched the tree since the build, so a scan must find it
+  # exactly as recorded. This is also the check that keeps the step honest:
+  # a drifting tree would mean the build above built something else.
+  out=$(cb update --dry-run) || fail "cork-build update --dry-run failed: $out"
+  if grep -qE "^(Added|Updated|Refreshed|Removed):" <<<"$out"; then
+    fail "cork-build update --dry-run reports drift on the tree it has just built from: $out"
+  fi
+  out=$(cb dockerfile remote-make) || fail "cork-build dockerfile failed: $out"
+  grep -q "^FROM " <<<"$out" ||
+    fail "cork-build dockerfile remote-make printed no Dockerfile: $out"
+  out=$(cb dockerfile not-a-challenge-type 2>&1) && rc=0 || rc=$?
+  (( rc != 0 )) ||
+    fail "cork-build dockerfile accepted a challenge type nothing builds for: $out"
   # And it says which of the settings it inherits mean nothing to it. This
   # run sets CMGR_PORTS, which is about publishing instances: a build plane
   # runs none, so it is inert here and named at startup rather than passed
   # over. The mirror of what the external daemon says about CMGR_DIR.
   grep -q "CMGR_PORTS is set but ignored" "$CB/build.log" ||
     fail "cork-build did not name CMGR_PORTS as ignored: a setting about serving instances is inert on a build plane and saying so is how a unit file grown from an orchestrator's gets noticed ($(tail -c 400 "$CB/build.log"))"
-  note "cork-build names the orchestrator settings it inherits and ignores"
+  note "cork-build answers list, list-schemas, update --dry-run and dockerfile from this tree, and names the orchestrator settings it ignores"
 
   # A build plane will not hand over to a daemon that builds for itself:
   # this fleet's own cmgrd is one, and says so before anything is sent.
@@ -1710,6 +1739,17 @@ EOF
   note "routed to library as build checksum $RT_CHECK"
   has_line "$(printf 's%d-%x-challenge' "$MK_SEED_RT" "$RT_CHECK")" registry_tags "$CH_MAKE" ||
     fail "the routed build's image is not in the registry"
+
+  # show-schema answers from this plane's own database and says on stderr
+  # which orchestrator is serving the schema -- which only a build plane can
+  # answer, being the one thing that sees them all. The note is on stderr so
+  # the json on stdout stays pipeable.
+  out=$(rt_build show-schema routed 2>"$RT/show.err") ||
+    fail "cork-build show-schema failed: $(tail -c 400 "$RT/show.err")"
+  jq -e 'length == 1' <<<"$out" >/dev/null ||
+    fail "show-schema printed $(jq -r 'length' <<<"$out") challenge(s), want the one this plane built"
+  grep -q "served by library" "$RT/show.err" ||
+    fail "show-schema did not name the orchestrator serving the schema: $(cat "$RT/show.err")"
 
   # 2. Migrating it moves the schema and rebuilds nothing. The identity of a
   #    build does not depend on which orchestrator serves it, so the tag the

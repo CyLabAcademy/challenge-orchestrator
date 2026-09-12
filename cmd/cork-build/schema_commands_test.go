@@ -277,6 +277,60 @@ func TestConvergeOn(t *testing.T) {
 	}
 }
 
+// add-schema and update-schema do the same work; the only thing that
+// separates them is whether this plane is expected to have built the schema
+// before. add on a name already in use is usually a second event written
+// against the first one's schema; update on a name that is not is usually a
+// typo. build asks neither question.
+func TestSchemaGuard(t *testing.T) {
+	known := []string{"year-round", "spring"}
+
+	if err := schemaGuard("autumn", known, false); err != nil {
+		t.Errorf("add-schema for a schema this plane has not built: %s", err)
+	}
+	if err := schemaGuard("spring", known, true); err != nil {
+		t.Errorf("update-schema for a schema this plane has built: %s", err)
+	}
+
+	err := schemaGuard("spring", known, false)
+	if err == nil {
+		t.Fatal("add-schema was allowed for a schema this plane has already built")
+	}
+	if !strings.Contains(err.Error(), "update-schema") {
+		t.Errorf("the refusal does not name the command that does want an existing schema: %s", err)
+	}
+	err = schemaGuard("autumn", known, true)
+	if err == nil {
+		t.Fatal("update-schema was allowed for a schema this plane has never built")
+	}
+	if !strings.Contains(err.Error(), "add-schema") {
+		t.Errorf("the refusal does not name the command that creates one: %s", err)
+	}
+}
+
+// remove-schema took a schema file until recently and takes a name now, so
+// a caller that has not been updated is the likeliest way to reach it wrong.
+// Named as the mistake it is, and before the name is checked at all: a path
+// contains a slash, and being told a slash cannot address a schema over HTTP
+// is true and no help. No manager is needed to get that far, which is what
+// passing none proves.
+func TestRemoveSchemaRejectsASchemaFile(t *testing.T) {
+	for _, arg := range []string{"spring.yaml", "spring.yml", "spring.json", "/etc/cork/schemas/spring.yaml"} {
+		if code := removeSchemaCommand(nil, nil, nil, []string{arg}); code != USAGE_ERROR {
+			t.Errorf("remove-schema %q answered %d, want a usage error naming it as a file", arg, code)
+		}
+	}
+	// A name is not a file just for having a dot in it: this one gets past
+	// the check and is stopped further on, for having nowhere to ask.
+	none, err := loadDestinations("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := removeSchemaCommand(nil, nil, none, []string{"spring.2026"}); code == USAGE_ERROR {
+		t.Error("a schema name with a dot in it was refused as a file")
+	}
+}
+
 // A migration has to find where the schema is now, and the schema files are
 // the record of where it is going -- so the orchestrators are asked. Exactly
 // one may have it.

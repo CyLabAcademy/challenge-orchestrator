@@ -98,9 +98,11 @@ func main() {
 		fmt.Printf("Version: %s\n", buildVersion())
 		os.Exit(NO_ERROR)
 	}
-	if *help || flag.NArg() == 0 {
+	// Before the manager, which wants a docker daemon and a challenge
+	// directory: asking what the commands are is not a reason to need either.
+	if *help || flag.NArg() == 0 || flag.Arg(0) == "help" {
 		printUsage()
-		if *help {
+		if *help || flag.Arg(0) == "help" {
 			os.Exit(NO_ERROR)
 		}
 		os.Exit(USAGE_ERROR)
@@ -146,13 +148,40 @@ func main() {
 	}
 
 	exitCode := NO_ERROR
+	args := flag.Args()[1:]
 	switch flag.Arg(0) {
+	// Deploying: what a schema names, onto the orchestrator it names.
 	case "build":
-		exitCode = buildCommand(mgr, servers, dests, flag.Args()[1:])
+		exitCode = buildCommand(mgr, servers, dests, args)
+	case "add-schema":
+		exitCode = addSchemaCommand(mgr, servers, dests, args)
+	case "update-schema":
+		exitCode = updateSchemaCommand(mgr, servers, dests, args)
 	case "remove-schema":
-		exitCode = removeSchemaCommand(mgr, servers, dests, flag.Args()[1:])
+		exitCode = removeSchemaCommand(mgr, servers, dests, args)
 	case "migrate-schema":
-		exitCode = migrateSchemaCommand(mgr, servers, dests, flag.Args()[1:])
+		exitCode = migrateSchemaCommand(mgr, servers, dests, args)
+	// Reading what this plane holds.
+	case "list-schemas":
+		exitCode = listSchemasCommand(mgr, args)
+	case "show-schema":
+		exitCode = showSchemaCommand(mgr, dests, args)
+	case "list":
+		exitCode = listCommand(mgr, args)
+	case "search":
+		exitCode = searchCommand(mgr, args)
+	case "info":
+		exitCode = infoCommand(mgr, args)
+	case "system-dump":
+		exitCode = systemDumpCommand(mgr, args)
+	// The tree itself.
+	case "update":
+		exitCode = updateCommand(mgr, args)
+	case "dockerfile":
+		exitCode = dockerfileCommand(mgr, args)
+	case "convert-to-custom":
+		exitCode = convertToCustomCommand(mgr, args)
+	// This plane's own configuration.
 	case "destinations":
 		exitCode = destinationsCommand(dests)
 	case "pins":
@@ -174,7 +203,12 @@ cork's build plane: it builds what the schema files name and hands the
 finished builds to an orchestrator running with CMGR_BUILD_PLANE=external,
 which builds nothing itself.
 
-Commands:
+This is where the challenge tree lives and where every schema operation
+happens, so it is where cmgr's build and schema commands live too. What an
+orchestrator HOLDS -- instances, workers, what is running right now -- is
+asked of that daemon instead, with cmgrd-cli.
+
+Deploying:
   build <schema file> [<schema file> ...]
       scan the challenge directory, build and push every build the schemas
       name, and hand each challenge over to the orchestrator its schema is
@@ -188,6 +222,12 @@ Commands:
       Build the schemas that share a challenge in one run: one
       content-addressed tag cannot be served by two orchestrators, and that
       is checked across the schemas of a run.
+  add-schema <schema file>
+  update-schema <schema file>
+      build, exactly as above, for one schema, with the guardrail each name
+      carries: add refuses a schema this plane has built before, update
+      refuses one it has not. Use build for a run of several, or when you
+      do not care which of the two it is.
   remove-schema <schema name>
       take the schema out of service: the orchestrator serving it drops its
       builds and retires their images from the registry, and this build
@@ -195,13 +235,45 @@ Commands:
       later build of the same schema builds and pushes it again. A name and
       not a file, since nothing else about the schema survives this: which
       orchestrator has it is found by asking them, and --server names one
-      directly.
+      directly. To clear a plane entirely:
+          cork-build list-schemas | xargs -rn1 cork-build remove-schema
   migrate-schema <schema file>
       move the schema to the destination its file now names. Its images stay
       in the registry and are adopted by the orchestrator taking it: a
       build's identity does not depend on which orchestrator serves it, so a
       migration rebuilds nothing and takes seconds, and the orchestrator
       taking it is converged, so the move finishes rather than half of it.
+
+Reading what this plane holds:
+  list-schemas
+      name every schema this build plane has built.
+  show-schema <schema name>
+      print what it built for one, as json, and say on stderr which
+      destination is serving it.
+  list [--verbose]
+      list the challenges the directory holds, as recorded.
+  search [--verbose] [<tag> ...]
+      list the challenges carrying every tag given.
+  info [--verbose] [<path>]
+      describe the challenges under a path. Refuses to describe a tree that
+      has drifted from the record: run update first.
+  system-dump [--summary|--json] [<challenge> ...]
+      print this plane's builds. Its own bookkeeping, not what is serving.
+
+The challenge tree:
+  update [--dry-run] [--verbose] [--prune-old] [<path>]
+      re-scan the directory, record what it finds and rebuild the builds
+      whose source has moved. It stops at this host: an orchestrator hears
+      of a rebuild only through a hand-over, so run build afterwards on the
+      schemas that name what changed. --dry-run reports and changes nothing.
+  dockerfile [--output <file>] <challenge type>
+      print the built-in Dockerfile a challenge type builds from.
+  convert-to-custom <challenge directory>
+      write that Dockerfile into the challenge and declare it 'custom', so
+      the tree carries what the type implied and can diverge from it. This
+      changes the challenge's source, and so the identity of its builds.
+
+This plane's own configuration:
   destinations
       list the destination names configured and the orchestrators they
       stand for.
@@ -251,6 +323,12 @@ Environment, all as cmgrd reads them (this is cmgrd's build path):
 
   DOCKER_HOST and the rest of docker's own variables - the daemon that
       builds. See https://docs.docker.com/engine/reference/commandline/cli/
+
+The settings about serving are read by the same library and mean nothing
+here, since nothing runs on a build plane: CMGR_CONCURRENT_LAUNCHES,
+CMGR_PORTS, CMGR_INTERFACE, CMGR_ENABLE_DISK_QUOTAS, CMGR_PRUNE_AGE and the
+six CMGR_WORKER_* tunables. Each is named in the log at startup if it is set,
+because a unit file grown from an orchestrator's is how they get here.
 
 Exit status is non-zero if anything failed to build or to be handed over.
 `, os.Args[0])
