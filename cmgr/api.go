@@ -569,7 +569,7 @@ func (m *Manager) Destroy(build BuildId) error {
 		return errors.New("locked build: change the schema definition to destroy this build")
 	}
 
-	return m.destroyImages(build)
+	return m.destroyImages(build, true)
 }
 
 // Obtains a list of challenges with minimal version information filled into
@@ -685,8 +685,9 @@ func (m *Manager) convergeSchema(schema *Schema) []error {
 		state = append(state, builds)
 	}
 
-	// Release obsolete builds
-	err = m.cleanupSchemaResources(schema.Name)
+	// Release obsolete builds. Spent, not moving: a converge drops what this
+	// schema has stopped naming, and nothing else is about to serve it.
+	err = m.cleanupSchemaResources(schema.Name, true)
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -781,7 +782,13 @@ func (m *Manager) convergeBuildInstances(buildMeta *BuildMetadata, cMeta *Challe
 
 // Tears down all instances and builds belonging to the schema.  Serialized
 // with rebuilds and other schema operations; see CreateSchema.
-func (m *Manager) DeleteSchema(name string) error {
+// DeleteSchema takes a schema off this daemon. retire says what becomes of
+// the registry tags its builds carry: true removes them, which is what a
+// removal means; false leaves them, which is what a migration to another
+// orchestrator means -- the content is changing hands, not ending, and the
+// tag is content-addressed so the orchestrator taking it resolves the same
+// one.
+func (m *Manager) DeleteSchema(name string, retire bool) error {
 	m.updateMu.Lock()
 	defer m.updateMu.Unlock()
 
@@ -790,10 +797,14 @@ func (m *Manager) DeleteSchema(name string) error {
 		return err
 	}
 
-	return m.cleanupSchemaResources(name)
+	return m.cleanupSchemaResources(name, retire)
 }
 
-func (m *Manager) cleanupSchemaResources(name string) error {
+// cleanupSchemaResources stops what a schema runs and takes its builds
+// down. retire says whether those builds' registry tags are spent: true for
+// a removal, false for a migration, whose content is about to be served by
+// another orchestrator (see destroyImages).
+func (m *Manager) cleanupSchemaResources(name string, retire bool) error {
 	instances, err := m.removedSchemaInstances(name)
 	if err != nil {
 		return err
@@ -815,7 +826,7 @@ func (m *Manager) cleanupSchemaResources(name string) error {
 		return err
 	}
 	for _, id := range builds {
-		err = m.destroyImages(id)
+		err = m.destroyImages(id, retire)
 		if err != nil {
 			return err
 		}

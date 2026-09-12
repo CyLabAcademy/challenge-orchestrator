@@ -748,7 +748,13 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case "DELETE":
-		err = s.mgr.DeleteSchema(schema)
+		// ?retire=false releases the schema without taking its images out
+		// of the challenge registry: the build plane sends it when a schema
+		// is moving to another orchestrator, whose hand-over resolves the
+		// same content-addressed tags. Absent or anything else destroys,
+		// which is what a removal is.
+		retire := r.URL.Query().Get("retire") != "false"
+		err = s.mgr.DeleteSchema(schema, retire)
 		respCode = http.StatusNoContent
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)

@@ -1726,7 +1726,15 @@ func (m *Manager) pruneReplacedImages(replaced []replacedImages) {
 	}
 }
 
-func (m *Manager) destroyImages(build BuildId) error {
+// destroyImages removes a build: its images here, its rows, its archive,
+// and -- when retire is true -- the tags in the challenge registry.
+//
+// retire is false for exactly one caller, a schema being migrated to another
+// orchestrator. The content is not spent then, it is changing hands: the tag
+// is content-addressed, so the orchestrator taking the schema resolves the
+// same one, and retiring it here would delete what that orchestrator is
+// about to serve. Everything else destroys, and destroying retires.
+func (m *Manager) destroyImages(build BuildId, retire bool) error {
 	m.log.debugf("destroying build %d", build)
 	bMeta, err := m.lookupBuildMetadata(build)
 	if err != nil {
@@ -1789,7 +1797,7 @@ func (m *Manager) destroyImages(build BuildId) error {
 				}
 			}
 			// Best-effort registry untag, mirroring pruneReplacedImages.
-			if image.Host != "builder" {
+			if retire && image.Host != "builder" {
 				if err := m.retireRegistryTag(imageName); err != nil {
 					m.log.warnf("could not remove registry tag %s: %s", imageName, err)
 				}
@@ -1813,7 +1821,7 @@ func (m *Manager) destroyImages(build BuildId) error {
 				if err := m.removeLocalImage(imageName, iro); err != nil && !errdefs.IsNotFound(err) {
 					m.log.warnf("could not remove rollback-generation image %s: %s", imageName, err)
 				}
-				if image.Host != "builder" {
+				if retire && image.Host != "builder" {
 					if err := m.retireRegistryTag(imageName); err != nil {
 						m.log.warnf("could not remove rollback-generation registry tag %s: %s", imageName, err)
 					}

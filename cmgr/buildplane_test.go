@@ -479,7 +479,7 @@ func TestDestroyImagesExternalIsRegistryOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := m.destroyImages(id); err != nil {
+	if err := m.destroyImages(id, true); err != nil {
 		t.Fatalf("destroyImages: %s", err)
 	}
 	if _, err := m.lookupBuildMetadata(id); err == nil {
@@ -750,5 +750,65 @@ func TestBuildPlaneRequiresRegistry(t *testing.T) {
 	err = orchestrator.initDocker()
 	if err == nil || strings.Contains(err.Error(), REGISTRY_ENV) {
 		t.Fatalf("a local orchestrator was refused for having no registry: %v", err)
+	}
+}
+
+// A schema removed is a schema whose builds are spent, and their tags go
+// with them. A schema migrated is not: the content is changing hands, the
+// tag is content-addressed so the orchestrator taking the schema resolves
+// the same one, and retiring it here would delete what that orchestrator is
+// about to serve. Same teardown either way -- rows, archives, instances --
+// with the registry the one difference.
+func TestDeleteSchemaRetiresOnlyWhenRemoving(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		retire      bool
+		wantDeletes bool
+	}{
+		{"removed", true, true},
+		{"migrated", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := setupExternalTestManager(t)
+			host, seen := startFakeRegistry(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+			})
+			m.challengeRegistry = host
+			m.artifactsDir = t.TempDir()
+
+			challenge := testChallenge("test/moves", 0)
+			if errs := m.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
+				t.Fatalf("addChallenges: %v", errs)
+			}
+			id := insertTestBuild(t, m, "event", string(challenge.Id), "flag{%s}", 1, 0x1111)
+			build := &BuildMetadata{
+				Id: id, Flag: "flag{x}", Checksum: 0x1111,
+				Images: []Image{{Host: "challenge", Ports: []string{"1337/tcp"}}},
+			}
+			if err := m.finalizeBuild(build); err != nil {
+				t.Fatalf("finalizeBuild: %s", err)
+			}
+
+			if err := m.DeleteSchema("event", tc.retire); err != nil {
+				t.Fatalf("DeleteSchema(retire=%v): %s", tc.retire, err)
+			}
+			// The build is gone from this daemon either way: it serves the
+			// schema no longer, whichever reason it stopped.
+			if _, err := m.lookupBuildMetadata(id); err == nil {
+				t.Error("the build kept its row")
+			}
+			deletes := 0
+			for _, r := range *seen {
+				if r.Method == http.MethodDelete {
+					deletes++
+				}
+			}
+			switch {
+			case tc.wantDeletes && deletes == 0:
+				t.Errorf("a removal left the tag in the registry: %d request(s), no delete", len(*seen))
+			case !tc.wantDeletes && deletes > 0:
+				t.Errorf("a migration deleted %d tag(s) the orchestrator taking this schema is about to serve", deletes)
+			}
+		})
 	}
 }
