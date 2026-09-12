@@ -135,10 +135,20 @@ func main() {
 		os.Exit(RUNTIME_ERROR)
 	}
 
+	// Where the destination names schemas use point: deployment topology,
+	// written by the same ansible that stands the orchestrators up, so a
+	// rebuilt build plane gets its routing back the way it gets everything
+	// else. Read before the command runs: a build routes by it.
+	dests, err := loadDestinations(os.Getenv(DESTINATIONS_ENV))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(RUNTIME_ERROR)
+	}
+
 	exitCode := NO_ERROR
 	switch flag.Arg(0) {
 	case "build":
-		exitCode = buildCommand(mgr, servers, flag.Args()[1:])
+		exitCode = buildCommand(mgr, servers, dests, flag.Args()[1:])
 	case "pins":
 		exitCode = pinsCommand(mgr)
 	case "version":
@@ -161,14 +171,17 @@ which builds nothing itself.
 Commands:
   build <schema file> [<schema file> ...]
       scan the challenge directory, build and push every build the schemas
-      name, and hand each challenge over to every --server given. The
-      schemas are read here, not by the orchestrator: their flag format and
-      seeds decide what is built, and their instance_count travels with the
+      name, and hand each challenge over to the orchestrator its schema is
+      for. The schemas are read here, not by the orchestrator: their flag
+      format and seeds decide what is built, their destination decides which
+      orchestrator serves them, and their instance_count travels with the
       hand-over. Each schema is then converged on the orchestrator that took
       it, once every challenge of it has arrived, so this is the whole deploy
-      rather than its first half: a hand-over records builds, and only a
-      converge decides what runs them. With no --server the builds are made
-      and pushed and nothing is handed over.
+      rather than its first half. --server overrides the destinations and
+      sends everything to the address given.
+      Build the schemas that share a challenge in one run: one
+      content-addressed tag cannot be served by two orchestrators, and that
+      is checked across the schemas of a run.
   pins
       re-resolve every base image the challenge directory names to the
       digest the registry serves now, and write CMGR_BASE_PINS. Nothing is
@@ -185,6 +198,13 @@ Options:
 
 Environment, all as cmgrd reads them (this is cmgrd's build path):
   CMGR_DIR - the challenge directory to build from
+
+  CORK_DESTINATIONS - a yaml file mapping the destination names schemas use
+      to the orchestrators they stand for ("library: https://host:4200").
+      A schema naming no destination means the only one configured, and is
+      refused once there is more than one -- so a single-orchestrator
+      deployment need say nothing, and an event cannot land on the wrong
+      orchestrator because a line was forgotten.
 
   CMGR_REGISTRY - required. The registry built images are pushed to, and
       the one the orchestrator's workers pull from; both must name the same

@@ -15,7 +15,7 @@ import (
 // buildCommand is the whole of what this binary is for: read the schema
 // files, record the challenge directory, build and push what the schemas
 // name, and hand each challenge over.
-func buildCommand(mgr *cmgr.Manager, servers []string, args []string) int {
+func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args []string) int {
 	if len(args) == 0 {
 		return usageError("build takes the schema files to build, and none were given")
 	}
@@ -33,6 +33,25 @@ func buildCommand(mgr *cmgr.Manager, servers []string, args []string) int {
 		schemas = append(schemas, schema)
 	}
 	if refused {
+		return RUNTIME_ERROR
+	}
+
+	// Where each schema goes, and whether that is allowed, decided from the
+	// files alone and so before anything is built. Both refusals are about
+	// what the schemas say rather than what building them produces -- a
+	// destination that is not configured, and one tag two orchestrators
+	// would both serve -- and an event's worth of building is a long way to
+	// go to be told a destination was mistyped.
+	routes, err := routeSchemas(schemas, servers, dests)
+	if err != nil {
+		return runtimeError(err)
+	}
+	// One content-addressed tag cannot be served by two orchestrators, and
+	// this is the only process that can see both (see exclusivityConflicts).
+	if conflicts := exclusivityConflicts(routes); len(conflicts) > 0 {
+		for _, conflict := range conflicts {
+			fmt.Fprintf(os.Stderr, "error: %s\n", conflict)
+		}
 		return RUNTIME_ERROR
 	}
 
@@ -74,16 +93,28 @@ func buildCommand(mgr *cmgr.Manager, servers []string, args []string) int {
 	// The pins are an input to every build's content identity and the one
 	// input the orchestrator cannot derive for itself: they live here.
 	fingerprint := mgr.BasePinFingerprint()
-	payloads, order := assemble(schemas, built, fingerprint)
-
-	// Every build must be what a hand-over would say it is. The
-	// orchestrator asks exactly this of what reaches it and refuses what
-	// fails, so asking here turns a refusal over a checksum or a
-	// generation into the answer (see identityMismatches).
 	identity := func(build *cmgr.BuildMetadata, challengeType string) uint32 {
 		return mgr.ContentChecksum(build.SourceChecksum, build.Format, fingerprint, challengeType)
 	}
-	if mismatched := identityMismatches(payloads, order, identity); len(mismatched) > 0 {
+
+	// Assembled and checked for every destination before any of them is
+	// handed anything: every build must be what a hand-over would say it
+	// is, which is what the orchestrator recomputes and refuses on (see
+	// identityMismatches). A run that would be refused at the third
+	// orchestrator should not already have written to the first two.
+	type outbound struct {
+		route    route
+		payloads map[cmgr.ChallengeId]*cmgr.HandOver
+		order    []cmgr.ChallengeId
+	}
+	sending := make([]outbound, 0, len(routes))
+	mismatched := []string{}
+	for _, r := range routes {
+		payloads, order := assemble(r.schemas, built, fingerprint)
+		mismatched = append(mismatched, identityMismatches(payloads, order, identity)...)
+		sending = append(sending, outbound{r, payloads, order})
+	}
+	if len(mismatched) > 0 {
 		for _, complaint := range mismatched {
 			fmt.Fprintf(os.Stderr, "error: %s\n", complaint)
 		}
@@ -91,28 +122,22 @@ func buildCommand(mgr *cmgr.Manager, servers []string, args []string) int {
 		return RUNTIME_ERROR
 	}
 
-	fmt.Printf("built %d challenge(s)\n", len(order))
-	for _, id := range order {
-		payload := payloads[id]
-		fmt.Printf("  %s: %d build(s), source generation %x\n",
-			id, len(payload.Challenge.Builds), payload.Challenge.SourceChecksum)
-	}
-
-	if len(servers) == 0 {
-		fmt.Println("no --server given: built and pushed, nothing handed over")
-		return NO_ERROR
-	}
 	failed := false
-	for _, server := range servers {
-		if err := checkServer(server); err != nil {
+	for _, out := range sending {
+		fmt.Printf("handing %d challenge(s) to %s (%s)\n", len(out.order), out.route.name, out.route.address)
+		for _, id := range out.order {
+			payload := out.payloads[id]
+			fmt.Printf("  %s: %d build(s), source generation %x\n",
+				id, len(payload.Challenge.Builds), payload.Challenge.SourceChecksum)
+		}
+		if err := checkServer(out.route.address); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			failed = true
 			continue
 		}
-		fmt.Printf("handing over to %s\n", server)
 		delivered := true
-		for _, id := range order {
-			if err := handOver(server, id, payloads[id]); err != nil {
+		for _, id := range out.order {
+			if err := handOver(out.route.address, id, out.payloads[id]); err != nil {
 				fmt.Fprintf(os.Stderr, "error: %s\n", err)
 				failed = true
 				delivered = false
@@ -122,20 +147,19 @@ func buildCommand(mgr *cmgr.Manager, servers []string, args []string) int {
 			// A converge would be refused for the builds that did not
 			// arrive (requireHandedOver), and saying that is more use than
 			// the refusal it would collect.
-			fmt.Fprintf(os.Stderr, "error: not converging %s: a challenge did not reach it, and a converge names every build that has not been handed over\n", server)
+			fmt.Fprintf(os.Stderr, "error: not converging %s: a challenge did not reach it, and a converge names every build that has not been handed over\n", out.route.name)
 			continue
 		}
 		// Handing the builds over records them; this is what puts them in
-		// service. Both halves happen here, so a deploy is one command: the
-		// instance counts travel with the hand-over, and only a converge
-		// acts on them.
-		for _, schema := range schemas {
-			if err := convergeOn(server, schema); err != nil {
+		// service. Both halves happen here so that `build` is the whole
+		// deploy and the destination is the only thing an operator names.
+		for _, schema := range out.route.schemas {
+			if err := convergeOn(out.route.address, schema); err != nil {
 				fmt.Fprintf(os.Stderr, "error: %s\n", err)
 				failed = true
 				continue
 			}
-			fmt.Printf("  converged '%s' on %s\n", schema.Name, server)
+			fmt.Printf("  converged '%s' on %s\n", schema.Name, out.route.name)
 		}
 	}
 	if failed {

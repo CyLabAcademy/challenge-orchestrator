@@ -343,6 +343,18 @@ type Schema struct {
 	Name       string                             `json:"name"        yaml:"name"`
 	FlagFormat string                             `json:"flag_format" yaml:"flag_format"`
 	Challenges map[ChallengeId]BuildSpecification `json:"challenges"  yaml:"challenges"`
+	// Destination names the orchestrator this schema is served by, as a
+	// short name a build plane resolves against its configured
+	// destinations rather than an address (see cork-build). A field and
+	// not a header comment: a schema may be json, which has no comments,
+	// and where an event is served is part of what the schema is.
+	//
+	// Nothing here hashes a schema -- a build's identity is its source,
+	// flag format, base pins and template (contentChecksum) -- so this
+	// changes no build that already exists. It is meaningless to a daemon,
+	// which is told what it serves rather than choosing; an orchestrator
+	// ignores it.
+	Destination string `json:"destination,omitempty" yaml:"destination,omitempty"`
 }
 type BuildSpecification struct {
 	Seeds         []int `json:"seeds"          yaml:"seeds"`
