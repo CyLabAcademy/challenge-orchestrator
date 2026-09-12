@@ -2,6 +2,7 @@ package cmgr
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -396,4 +397,178 @@ func TestAPromoteLeavesAnotherDestinationsBundleAlone(t *testing.T) {
 	} else if string(got) != "library's own" {
 		t.Errorf("the library destination's bundle is now %q", got)
 	}
+}
+
+// A schema given a destination it did not have has its existing bundles
+// moved. Nothing rebuilds them: a destination is not part of a build's
+// identity, so the converge finds every build complete and executeBuild
+// never runs -- which left the files at the old prefix while the new
+// directory sat empty and every message said the deploy worked.
+func TestRelocateArtifactBundlesMovesThemIn(t *testing.T) {
+	m := setupTestManager(t)
+	m.log = captureLog(&bytes.Buffer{})
+	base := t.TempDir()
+	m.artifactsDir = base
+	seedBuildRows(t, m, "spring", 4, 5)
+	// Built before the schema had a destination, so in the artifact
+	// directory itself.
+	for _, id := range []int{4, 5} {
+		if err := os.WriteFile(filepath.Join(base, fmt.Sprintf("%d.tar.gz", id)), []byte("gz"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.SetArtifactNamespaces(map[string]string{"spring": "library"}); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := m.RelocateArtifactBundles("spring")
+	if err != nil {
+		t.Fatalf("RelocateArtifactBundles: %s", err)
+	}
+	if moved != 2 {
+		t.Errorf("moved %d bundles, want 2", moved)
+	}
+	for _, id := range []int{4, 5} {
+		name := fmt.Sprintf("%d.tar.gz", id)
+		if _, err := os.Stat(filepath.Join(base, "library", name)); err != nil {
+			t.Errorf("%s was not moved into the destination's directory: %v", name, err)
+		}
+		if _, err := os.Stat(filepath.Join(base, name)); !os.IsNotExist(err) {
+			t.Errorf("%s is still in the artifact directory: %v", name, err)
+		}
+	}
+}
+
+// And it never reaches into another destination's directory. A bundle is
+// named "<build id>.tar.gz" and an id is unique only within one plane's
+// database, so a file of that name under another destination is not evidence
+// of anything: moving it would take a live challenge's downloads away from
+// the orchestrator serving them.
+func TestRelocateArtifactBundlesLeavesOtherDestinationsAlone(t *testing.T) {
+	m := setupTestManager(t)
+	m.log = captureLog(&bytes.Buffer{})
+	base := t.TempDir()
+	m.artifactsDir = base
+	seedBuildRows(t, m, "spring", 1)
+	if err := m.SetArtifactNamespaces(map[string]string{"spring": "event", "year": "library"}); err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(base, "library", "1.tar.gz")
+	if err := os.WriteFile(live, []byte("library's own"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := m.RelocateArtifactBundles("spring")
+	if err != nil {
+		t.Fatalf("RelocateArtifactBundles: %s", err)
+	}
+	if moved != 0 {
+		t.Errorf("moved %d bundles, want none: nothing of this schema's was in the artifact directory", moved)
+	}
+	if got, err := os.ReadFile(live); err != nil || string(got) != "library's own" {
+		t.Errorf("another destination's bundle was moved: %v %q", err, got)
+	}
+}
+
+// seedBuildRows puts build rows on record under the given ids, which is what
+// RelocateArtifactBundles reads to know which bundles are a schema's.
+func seedBuildRows(t *testing.T, m *Manager, schema string, ids ...int) {
+	t.Helper()
+	for _, id := range ids {
+		_, err := m.db.Exec(
+			`INSERT INTO challenges (id, name, namespace, challengetype, description, details, sourcechecksum, metadatachecksum, path, solvescript, templatable, maxusers, points)
+			 VALUES (?, 'x', '', 'custom', '', '', 0, 0, '', 0, 0, 0, 0) ON CONFLICT DO NOTHING;`,
+			"test/"+schema)
+		if err != nil {
+			t.Fatalf("seeding a challenge: %s", err)
+		}
+		_, err = m.db.Exec(
+			`INSERT INTO builds (id, flag, seed, format, checksum, hasartifacts, challenge, schema, instancecount)
+			 VALUES (?, 'flag{x}', ?, 'flag{%s}', 1, 1, ?, ?, 0);`,
+			id, id, "test/"+schema, schema)
+		if err != nil {
+			t.Fatalf("seeding build %d: %s", id, err)
+		}
+	}
+}
+
+// The bundle arrives at its destination without a served name ever being
+// renamed out of the directory it left.
+//
+// What publishes these bundles watches the artifact directory and each
+// namespace under it, and a rename between two watched directories arrives
+// as one event naming the source path -- a path that no longer exists. A
+// watcher that decides what a path is from the path alone then opens a file
+// that is gone. This asserts the shape that avoids it: the destination file
+// appears by a rename from a dot-prefixed name WITHIN the destination
+// directory, and the source is unlinked rather than renamed away.
+func TestRelocateDoesNotRenameAServedNameAcross(t *testing.T) {
+	m := setupTestManager(t)
+	m.log = captureLog(&bytes.Buffer{})
+	base := t.TempDir()
+	m.artifactsDir = base
+	seedBuildRows(t, m, "spring", 4)
+	if err := m.SetArtifactNamespaces(map[string]string{"spring": "library"}); err != nil {
+		t.Fatal(err)
+	}
+	from := filepath.Join(base, "4.tar.gz")
+	if err := os.WriteFile(from, []byte("the bundle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A hard link to the source. os.Rename moves the directory entry, so a
+	// renamed file keeps its inode and the link count stays 2; a copy makes
+	// a new inode, so the destination is not the same file the link names.
+	witness := filepath.Join(base, "witness.keep")
+	if err := os.Link(from, witness); err != nil {
+		t.Skipf("hard links unavailable here: %s", err)
+	}
+
+	moved, err := m.RelocateArtifactBundles("spring")
+	if err != nil {
+		t.Fatalf("RelocateArtifactBundles: %s", err)
+	}
+	if moved != 1 {
+		t.Fatalf("moved %d bundles, want 1", moved)
+	}
+
+	to := filepath.Join(base, "library", "4.tar.gz")
+	got, err := os.ReadFile(to)
+	if err != nil {
+		t.Fatalf("the bundle is not at its destination: %s", err)
+	}
+	if string(got) != "the bundle" {
+		t.Errorf("the relocated bundle holds %q", got)
+	}
+	if _, err := os.Stat(from); !os.IsNotExist(err) {
+		t.Errorf("the source bundle survived the move: %v", err)
+	}
+	if !os.SameFile(mustStat(t, witness), mustStat(t, witness)) {
+		t.Fatal("sanity: a file is not itself")
+	}
+	// The destination must NOT be the source's inode: if it were, the move
+	// was a cross-directory rename and a watcher would have been handed the
+	// vanished source path.
+	if os.SameFile(mustStat(t, witness), mustStat(t, to)) {
+		t.Error("the bundle was renamed across directories rather than copied: a watcher on the artifact directory is handed the source path, which no longer exists")
+	}
+	// And nothing staged is left behind under a name anything would serve.
+	entries, err := os.ReadDir(filepath.Join(base, "library"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".relocating") {
+			t.Errorf("a staging file was left at %s", entry.Name())
+		}
+	}
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %s", path, err)
+	}
+	return info
 }

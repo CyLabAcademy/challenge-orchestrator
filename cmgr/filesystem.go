@@ -608,3 +608,112 @@ func (m *Manager) createBuildContext(cm *ChallengeMetadata, dockerfile []byte) (
 
 	return tmpFile.Name(), nil
 }
+
+// RelocateArtifactBundles moves a schema's existing bundles into the
+// directory its destination now names, and reports how many it moved.
+//
+// It exists because giving a schema a destination changes nothing a build is
+// made of. Identity is source, flag format, pins and template; a schema is
+// never hashed. So adding `destination:` to a schema whose builds are all
+// complete leaves generateBuilds short-circuiting on buildsComplete,
+// executeBuild never runs, no bundle is promoted, and the files stay where
+// they were -- while SetArtifactNamespaces has already made the new directory
+// and every message says the deploy succeeded. The artifact server goes on
+// publishing the old prefix and the new one stays empty.
+//
+// Only out of the artifact directory itself, and for that the same reason the
+// prune has: a bundle is named "<build id>.tar.gz" and an id is unique only
+// within one plane's database, so a file of that name under ANOTHER
+// destination is not evidence of anything and is left alone. The artifact
+// directory itself is where a schema's bundles were written before it had a
+// destination, which is the case this exists for. A destination that changes
+// from one name to another goes through migrate-schema, which drops the rows
+// and rebuilds.
+func (m *Manager) RelocateArtifactBundles(schema string) (int, error) {
+	if m.artifactsDir == "" {
+		return 0, nil
+	}
+	into := m.artifactDirFor(schema)
+	if into == m.artifactsDir {
+		return 0, nil
+	}
+	builds, err := m.getSchemaBuilds(schema)
+	if err != nil {
+		return 0, fmt.Errorf("reading the builds of schema '%s' to move their artifact bundles: %w", schema, err)
+	}
+	moved := 0
+	for _, id := range builds {
+		filename := (&BuildMetadata{Id: id}).getArtifactsFilename()
+		from := filepath.Join(m.artifactsDir, filename)
+		if _, err := os.Stat(from); err != nil {
+			continue
+		}
+		to := filepath.Join(into, filename)
+		if err := m.copyArtifactBundle(from, to); err != nil {
+			return moved, fmt.Errorf("moving the artifact bundle of build %d into '%s': %w", id, into, err)
+		}
+		// Only once the copy is in place, and as a removal rather than as
+		// the other half of a rename: see copyArtifactBundle.
+		if err := os.Remove(from); err != nil {
+			return moved, fmt.Errorf("removing the artifact bundle of build %d from '%s' after copying it into '%s': %w", id, m.artifactsDir, into, err)
+		}
+		m.log.infof("moved %s to %s, where schema '%s' now publishes", from, to, schema)
+		moved++
+	}
+	return moved, nil
+}
+
+// copyArtifactBundle puts a bundle at its new path, staged and then renamed
+// within the destination directory so that nothing ever observes a partial
+// file under a served name.
+//
+// Deliberately a copy followed by a remove rather than one os.Rename across
+// the two directories, which is what this did first and is a mistake worth
+// recording. What publishes these bundles watches the artifact directory and
+// each namespace under it, and a rename between two watched directories is
+// delivered as a single event naming the SOURCE path first -- a path that no
+// longer exists. A watcher that decides what a path is from the path alone
+// then opens a file that is gone. Copy-then-remove gives it the two events it
+// can act on instead: a new file appearing under the destination, and a plain
+// removal of the old one, which is also what tells it to drop the object it
+// published at the old prefix.
+//
+// The staged name is dot-prefixed for the same reason executeBuild's is: it
+// cannot collide with a served "<id>.tar.gz" and a watcher ignores it.
+func (m *Manager) copyArtifactBundle(from, to string) error {
+	staged := filepath.Join(filepath.Dir(to), "."+filepath.Base(to)+".relocating")
+	source, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	destination, err := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		destination.Close()
+		os.Remove(staged)
+		return err
+	}
+	// Durable before it is visible: a crash between the rename and the
+	// removal must not leave both copies unreadable.
+	if err := destination.Sync(); err != nil {
+		destination.Close()
+		os.Remove(staged)
+		return err
+	}
+	if err := destination.Close(); err != nil {
+		os.Remove(staged)
+		return err
+	}
+	if err := os.Rename(staged, to); err != nil {
+		os.Remove(staged)
+		return err
+	}
+	if directory, err := os.Open(filepath.Dir(to)); err == nil {
+		_ = directory.Sync()
+		_ = directory.Close()
+	}
+	return nil
+}

@@ -108,6 +108,19 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 			}
 			return RUNTIME_ERROR
 		}
+		// Bundles that were written before this schema had a destination.
+		// Nothing above moves them: a destination is not part of a build's
+		// identity, so a schema given one rebuilds nothing, executeBuild
+		// never runs and no bundle is promoted -- leaving the files at the
+		// prefix the schema used to publish under while the new directory
+		// sits empty and every message here says the deploy worked.
+		moved, err := mgr.RelocateArtifactBundles(schema.Name)
+		if err != nil {
+			return runtimeError(err)
+		}
+		if moved > 0 {
+			fmt.Printf("  moved %d artifact bundle(s) into '%s'\n", moved, schema.Destination)
+		}
 	}
 
 	// What each schema built, read back from this plane's own database.
