@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -221,5 +222,60 @@ func TestAssemble(t *testing.T) {
 	only := payloads["test/only"]
 	if len(only.Challenge.Builds) != 1 || only.Challenge.Builds[0].InstanceCount != cmgr.DYNAMIC_INSTANCES {
 		t.Errorf("'test/only' carries %+v", only.Challenge.Builds)
+	}
+}
+
+// The scan that aborted is told from the scan that merely found a bad
+// challenge. Getting this backwards either way is a real failure: treating
+// every error as fatal stops a build over one unparseable challenge in a
+// corpus, and treating none as fatal redeploys the previous generation and
+// reports success.
+func TestScanDidNotHappen(t *testing.T) {
+	chal := []*cmgr.ChallengeMetadata{{Id: "a/one"}}
+	for _, tc := range []struct {
+		name    string
+		updates *cmgr.ChallengeUpdates
+		want    bool
+	}{
+		{
+			// The duplicate-id abort: the walk stopped, so every row looks
+			// removed and nothing at all is present.
+			name:    "errors and nothing present",
+			updates: &cmgr.ChallengeUpdates{Errors: []error{errors.New("found multiple challenges with id 'a/one'")}, Removed: chal},
+			want:    true,
+		},
+		{
+			// One challenge would not parse and the rest of the tree was
+			// recorded. This must NOT stop a build.
+			name:    "errors with the rest of the tree present",
+			updates: &cmgr.ChallengeUpdates{Errors: []error{errors.New("challenge file missing name")}, Unmodified: chal},
+			want:    false,
+		},
+		{
+			name:    "a challenge that failed and one that was added",
+			updates: &cmgr.ChallengeUpdates{Errors: []error{errors.New("bad")}, Added: chal},
+			want:    false,
+		},
+		{
+			name:    "a clean scan of an empty tree",
+			updates: &cmgr.ChallengeUpdates{},
+			want:    false,
+		},
+		{
+			name:    "a clean scan that removed a challenge",
+			updates: &cmgr.ChallengeUpdates{Removed: chal},
+			want:    false,
+		},
+		{
+			name:    "errors alongside a stale build",
+			updates: &cmgr.ChallengeUpdates{Errors: []error{errors.New("bad")}, Stale: chal},
+			want:    false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := scanDidNotHappen(tc.updates); got != tc.want {
+				t.Errorf("scanDidNotHappen = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }

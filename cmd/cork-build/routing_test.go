@@ -139,3 +139,145 @@ func TestExclusivityConflicts(t *testing.T) {
 		t.Errorf("different seeds were treated as the same content: %v", got)
 	}
 }
+
+// A schema already served by one orchestrator and routed to another is
+// refused, and the refusal names migrate-schema. This is the state one
+// content-addressed tag served by two orchestrators, which is what an
+// operator produces by editing `destination:` and running the command every
+// other schema edit takes.
+func TestMisroutedSchemaIsRefused(t *testing.T) {
+	library, _ := orchestratorServing(t, "spring")
+	event, _ := orchestratorServing(t)
+	dests := &destinations{byName: map[string]string{"library": library, "event": event}}
+
+	routes := []route{{name: "event", address: event, schemas: []*cmgr.Schema{{Name: "spring"}}}}
+	problems := misroutedSchemas(routes, dests)
+	if len(problems) != 1 {
+		t.Fatalf("a schema served by library and routed to event gave %d problem(s): %v", len(problems), problems)
+	}
+	for _, want := range []string{"spring", "library", "event", "migrate-schema"} {
+		if !strings.Contains(problems[0], want) {
+			t.Errorf("the refusal does not name %q: %s", want, problems[0])
+		}
+	}
+}
+
+// The schema going back to the destination already serving it is the
+// ordinary re-deploy, and a schema nobody serves is the first one. Neither
+// is refused: a guard that stopped these would break every routine build.
+func TestRoutedWhereItAlreadyLivesIsFine(t *testing.T) {
+	library, _ := orchestratorServing(t, "spring")
+	event, _ := orchestratorServing(t)
+	dests := &destinations{byName: map[string]string{"library": library, "event": event}}
+
+	for _, tc := range []struct {
+		name   string
+		routes []route
+	}{
+		{"re-deploy to the same destination", []route{{name: "library", address: library, schemas: []*cmgr.Schema{{Name: "spring"}}}}},
+		{"a schema nobody serves yet", []route{{name: "event", address: event, schemas: []*cmgr.Schema{{Name: "autumn"}}}}},
+	} {
+		if problems := misroutedSchemas(tc.routes, dests); len(problems) != 0 {
+			t.Errorf("%s was refused: %v", tc.name, problems)
+		}
+	}
+}
+
+// With one destination configured there is nowhere else a schema could be
+// served from, so nothing is asked at all. That keeps a single-destination
+// plane -- the classroom deployment -- from being unable to build because
+// some orchestrator is unreachable, and costs it no requests.
+func TestOneDestinationAsksNothing(t *testing.T) {
+	only, seen := orchestratorServing(t, "spring")
+	dests := &destinations{byName: map[string]string{"library": only}, defName: "library"}
+	routes := []route{{name: "event", address: only, schemas: []*cmgr.Schema{{Name: "spring"}}}}
+	if problems := misroutedSchemas(routes, dests); len(problems) != 0 {
+		t.Errorf("a single-destination plane was refused: %v", problems)
+	}
+	if len(*seen) != 0 {
+		t.Errorf("a single-destination plane made %d request(s), want none", len(*seen))
+	}
+}
+
+// --server is the deliberate override of routing and is never checked: it is
+// also what an operator has left when a destination cannot be reached.
+func TestServerRouteIsNotChecked(t *testing.T) {
+	library, seen := orchestratorServing(t, "spring")
+	other, _ := orchestratorServing(t)
+	dests := &destinations{byName: map[string]string{"library": library, "event": other}}
+	routes := []route{{name: serverRouteName, address: other, schemas: []*cmgr.Schema{{Name: "spring"}}}}
+	if problems := misroutedSchemas(routes, dests); len(problems) != 0 {
+		t.Errorf("--server was refused: %v", problems)
+	}
+	if len(*seen) != 0 {
+		t.Errorf("--server asked %d question(s), want none", len(*seen))
+	}
+}
+
+// An unrelated destination being unreachable does not stop a deploy to a
+// healthy one. This is the year-round case: a library orchestrator keeps
+// being deployed to while last season's event host is switched off, and the
+// guard must not make every configured destination a hard dependency of
+// every build. A schema already served where it is going cannot be made
+// wrong by any other orchestrator, so no other is asked.
+func TestAnUnreachableNeighbourDoesNotBlockARedeploy(t *testing.T) {
+	library, seen := orchestratorServing(t, "library-2026")
+	dests := &destinations{byName: map[string]string{
+		"library": library,
+		"event":   closedAddress(t),
+	}}
+	routes := []route{{name: "library", address: library, schemas: []*cmgr.Schema{{Name: "library-2026"}}}}
+
+	if problems := misroutedSchemas(routes, dests); len(problems) != 0 {
+		t.Fatalf("an ordinary re-deploy was refused because an unrelated destination was down: %v", problems)
+	}
+	if len(*seen) != 1 {
+		t.Errorf("the routed destination was asked %d times, want exactly 1", len(*seen))
+	}
+}
+
+// But a schema its own destination does NOT serve still has to be checked
+// against the others, and an unreachable one there is a refusal rather than
+// a guess -- the state this guard exists to prevent cannot be ruled out.
+func TestAnUnreachableNeighbourStillRefusesAnUnknownSchema(t *testing.T) {
+	event, _ := orchestratorServing(t)
+	dests := &destinations{byName: map[string]string{
+		"event":   event,
+		"library": closedAddress(t),
+	}}
+	routes := []route{{name: "event", address: event, schemas: []*cmgr.Schema{{Name: "spring"}}}}
+
+	problems := misroutedSchemas(routes, dests)
+	if len(problems) != 1 {
+		t.Fatalf("got %d problem(s), want 1: %v", len(problems), problems)
+	}
+	if !strings.Contains(problems[0], "--server") {
+		t.Errorf("the refusal does not name the operator's way through: %s", problems[0])
+	}
+}
+
+// A destination that cannot be reached is asked once for the whole run, not
+// once per schema. Five schemas against a blackholing host would otherwise
+// cost five timeouts before any work started.
+func TestAnUnreachableNeighbourIsAskedOncePerRun(t *testing.T) {
+	event, _ := orchestratorServing(t)
+	dests := &destinations{byName: map[string]string{
+		"event":   event,
+		"library": closedAddress(t),
+	}}
+	routes := []route{{name: "event", address: event, schemas: []*cmgr.Schema{
+		{Name: "one"}, {Name: "two"}, {Name: "three"},
+	}}}
+
+	problems := misroutedSchemas(routes, dests)
+	if len(problems) != 3 {
+		t.Errorf("got %d problem(s), want one per schema: %v", len(problems), problems)
+	}
+	// Each schema is reported, but the dead host answered for only the first:
+	// the rest reuse the recorded failure.
+	for _, p := range problems {
+		if !strings.Contains(p, "already served elsewhere") {
+			t.Errorf("unexpected problem text: %s", p)
+		}
+	}
+}

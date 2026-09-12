@@ -54,6 +54,16 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 		}
 		return RUNTIME_ERROR
 	}
+	// And the same rule against what is already deployed rather than against
+	// the other schemas of this run: a schema whose destination was edited is
+	// about to be served by two orchestrators, which is what migrate-schema
+	// exists to do safely.
+	if misrouted := misroutedSchemas(routes, dests); len(misrouted) > 0 {
+		for _, problem := range misrouted {
+			fmt.Fprintf(os.Stderr, "error: %s\n", problem)
+		}
+		return RUNTIME_ERROR
+	}
 
 	// Where each schema's artifact bundles go: a directory per destination
 	// under CMGR_ARTIFACT_DIR, so one build plane's artifacts stay sorted for
@@ -81,17 +91,7 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 	for _, err := range updates.Errors {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", err)
 	}
-	// One class of error is not a challenge that did not parse: two
-	// challenges sharing an id abort the directory walk itself, and the
-	// inventory comes back empty. Every recorded challenge is then classified
-	// as removed, nothing is re-recorded or rebuilt, and the converge below
-	// finds every build row already complete -- so the previously recorded
-	// generation is handed over and converged, and the command exits 0. The
-	// signature is errors alongside nothing present, which a tree where some
-	// challenges failed to parse never shows: those leave the rest present.
-	present := len(updates.Added) + len(updates.Updated) + len(updates.Refreshed) +
-		len(updates.Stale) + len(updates.Unmodified)
-	if len(updates.Errors) > 0 && present == 0 {
+	if scanDidNotHappen(updates) {
 		return runtimeError(fmt.Errorf(
 			"the challenge directory could not be scanned, so nothing here describes what is in it: fix the errors above and run again (building now would hand over the generation already on record)"))
 	}
@@ -361,4 +361,30 @@ func identityMismatches(payloads map[cmgr.ChallengeId]*cmgr.HandOver, order []cm
 		}
 	}
 	return complaints
+}
+
+// scanDidNotHappen reports that the scan did not cover the tree, as opposed
+// to covering it and finding challenges that would not parse.
+//
+// The distinction matters because only one of the two is safe to warn about
+// and carry on from. A challenge that does not parse is skipped and the rest
+// of the tree is recorded; no schema can name it without the converge failing
+// on it too. But two challenges sharing an id abort the directory walk itself
+// (findChallenges is the one WalkFunc path returning a non-nil error), and
+// the inventory comes back empty. Every recorded challenge is then classified
+// as removed, the removals are suppressed because there are errors, nothing
+// is re-recorded or rebuilt, and the converge that follows finds every build
+// row already complete -- so the generation already on record is handed over
+// and converged, and the command exits 0 having deployed nothing new.
+//
+// Errors alongside nothing present is that signature, and only that: a scan
+// that really covered the tree leaves whatever it did parse in one of the
+// present buckets, and a tree with no challenges at all reports no errors.
+func scanDidNotHappen(updates *cmgr.ChallengeUpdates) bool {
+	if len(updates.Errors) == 0 {
+		return false
+	}
+	present := len(updates.Added) + len(updates.Updated) + len(updates.Refreshed) +
+		len(updates.Stale) + len(updates.Unmodified)
+	return present == 0
 }
