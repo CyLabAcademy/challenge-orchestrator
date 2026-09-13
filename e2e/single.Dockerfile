@@ -7,9 +7,9 @@
 # cork talking to it over the local socket -- and the only honest way to test
 # that claim is to build the machine it describes.
 #
-# So dockerd and cmgrd live here together, and the scenario runs here too
+# So dockerd and corkd live here together, and the scenario runs here too
 # (run-single.sh execs it). That makes localhost mean what it means on a real
-# one-box install: cmgrd reaches docker at /var/run/docker.sock with no
+# one-box install: corkd reaches docker at /var/run/docker.sock with no
 # DOCKER_HOST, instances publish on this host, and the operator's commands run
 # beside them, the way an instructor's would over ssh.
 #

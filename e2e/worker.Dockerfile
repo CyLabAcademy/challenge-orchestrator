@@ -6,7 +6,7 @@
 ARG DIND_VERSION=29.6.0
 
 # oci-interceptor is docker's `default-runtime` on a real cork worker, so every
-# container cmgrd creates goes through it. A fleet without it exercises a
+# container corkd creates goes through it. A fleet without it exercises a
 # different runtime chain than the one production runs -- and the chain is
 # where the interesting failures have been: a wrapper that spawns the runtime
 # instead of exec'ing it stays between containerd's shim and runc, and a
