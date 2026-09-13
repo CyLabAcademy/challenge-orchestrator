@@ -6023,6 +6023,72 @@ if (( FULL )); then
   assert_gone "$MULTI_INST" "$MULTI_WORKER" "$minst"
   MULTI_INST=""
 
+step "seccomp: a challenge's own policy reaches the container, through the runtime a worker really runs"
+  # The only challenge here that declares a seccomp profile, and the only
+  # assertion in this scenario that a challenge option reaches the kernel
+  # rather than reaching the Docker API.
+  #
+  # It is its own oracle. The challenge needs the READ_IMPLIES_EXEC
+  # personality; cork's embedded policy denies that bit and the profile the
+  # challenge ships widens it. Applied, the heap becomes executable and the
+  # service hands out the flag. Not applied, it degrades rather than dying --
+  # it serves "heap executable: no" and its solver prints "the seccomp profile
+  # is not applied" -- so this fails legibly instead of passing quietly, and
+  # nothing here has to parse a policy to know which happened.
+  #
+  # Worth having because the profile's path is long and every leg of it has
+  # been wrong at least once: the loader resolves the file, the resolved TEXT
+  # (not the filename) has to survive to the daemon that launches, cork puts
+  # it in HostConfig.SecurityOpt, and on a worker that spec is then rewritten
+  # by oci-interceptor, which is this fleet's default runtime as it is
+  # production's. A hand-over dropping the text was a real defect: the row
+  # said the challenge had a profile while every container ran under the
+  # default.
+  CH_SECCOMP=cmgr/examples/executable-heap
+  SEC_BUILD=$(jq -r --arg id "$CH_SECCOMP" '.[] | select(.id == $id) | .builds[0].id' <<<"$(api GET "/schemas/$MULTI_SCHEMA")")
+  [[ "$SEC_BUILD" =~ ^[0-9]+$ ]] ||
+    fail "$CH_SECCOMP has no build in schema $MULTI_SCHEMA: $(api GET "/schemas/$MULTI_SCHEMA" | jq -c '[.[].id]')"
+  sec_meta=$(api GET "/builds/$SEC_BUILD")
+  # The challenge declares it, so the daemon that built it recorded it. A
+  # profile hash on the row is what makes the launch assertion below mean
+  # "the declared one" rather than "some policy".
+  sec_profile=$(api GET "/challenges/$CH_SECCOMP" | jq -r '[.challenge_options.overrides // {} | .[] | .seccomp?.profile // empty] + [.challenge_options.seccomp?.profile // empty] | map(select(. != "")) | first // ""')
+  [[ -n "$sec_profile" ]] ||
+    fail "$CH_SECCOMP records no seccomp profile on this daemon, so a launch could not carry one: $(api GET "/challenges/$CH_SECCOMP" | jq -c '.challenge_options')"
+
+  sec_inst=$(launch "$SEC_BUILD" seccomp-check whatever) ||
+    fail "launching build $SEC_BUILD of $CH_SECCOMP failed"
+  SEC_INST=$(jq -r .id <<<"$sec_inst")
+  MULTI_INST=$SEC_INST   # so a run that dies below still stops it
+  SEC_WORKER=$(jq -r .worker <<<"$sec_inst")
+  assert_on_worker "$SEC_WORKER" "$sec_inst"
+
+  # What the worker's daemon was actually told, read from the worker rather
+  # than from cork: the container carries a seccomp policy inline, and it is
+  # not the empty "unconfined" that a dropped profile would leave.
+  sec_cid=$(jq -r '.containers[0]' <<<"$sec_inst")
+  sec_hc=$(worker_api "$SEC_WORKER" "/containers/$sec_cid/json")
+  sec_opt=$(jq -r '[.HostConfig.SecurityOpt // [] | .[] | select(startswith("seccomp:"))] | first // ""' <<<"$sec_hc")
+  [[ -n "$sec_opt" ]] ||
+    fail "instance $SEC_INST of $CH_SECCOMP runs with no seccomp SecurityOpt on $SEC_WORKER, although the challenge declares the profile '$sec_profile': $(jq -c '.HostConfig.SecurityOpt' <<<"$sec_hc")"
+  [[ "$sec_opt" != "seccomp:unconfined" ]] ||
+    fail "instance $SEC_INST of $CH_SECCOMP runs unconfined on $SEC_WORKER although it declares '$sec_profile'"
+  # And through the runtime production runs, which is what rewrites the spec
+  # this policy travels in (worker/daemon.json sets it as default-runtime).
+  sec_runtime=$(jq -r '.HostConfig.Runtime // ""' <<<"$sec_hc")
+  [[ "$sec_runtime" == oci-interceptor ]] ||
+    fail "instance $SEC_INST ran under runtime '$sec_runtime' on $SEC_WORKER, not the oci-interceptor this fleet makes the default: the policy assertion below would not be about production's runtime chain"
+
+  # The assertion that matters: the challenge itself says whether its policy
+  # arrived, and answers with the flag only if it did.
+  solve_instance "$sec_inst" "$SEC_BUILD" execstack "$CH_SECCOMP"
+
+  [[ "$(api_status DELETE "/instances/$SEC_INST")" == 204 ]] || fail "stopping instance $SEC_INST failed"
+  assert_gone "$SEC_INST" "$SEC_WORKER" "$sec_inst"
+  MULTI_INST=""
+  ok "$CH_SECCOMP declared the profile '$sec_profile', instance $SEC_INST ran on $SEC_WORKER under oci-interceptor carrying a seccomp policy, and its own solver got build $SEC_BUILD's flag -- which it only serves when that profile was applied"
+
+step "removing the second schema takes its builds and its images and leaves the first schema whole"
   cmgrd-cli remove-schema "$MULTI_SCHEMA" || fail "remove-schema $MULTI_SCHEMA failed"
   MULTI_SCHEMA_ADDED=""
   if has_line "$MULTI_SCHEMA" cmgrd-cli list-schemas; then fail "schema $MULTI_SCHEMA is still listed after remove-schema"; fi

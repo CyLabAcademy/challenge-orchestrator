@@ -18,3 +18,16 @@ challenges:
   cmgr/examples/aptitude-and-privileges:
     seeds: [11]
     instance_count: -1
+  # The seccomp shape, and the only challenge here that declares a policy of
+  # its own. It needs the READ_IMPLIES_EXEC personality, which cork's embedded
+  # policy denies and its own profile widens, and its solver prints "heap is
+  # not executable; the seccomp profile is not applied" when the profile did
+  # not arrive -- so solving it is the assertion that a declared profile
+  # reached the container, with nothing here having to read a policy by hand.
+  #
+  # In full mode for the same reason as the challenge above: it installs
+  # gcc-multilib and builds 32-bit, which is a cost regular mode should not
+  # pay for a launch regular mode does not make.
+  cmgr/examples/executable-heap:
+    seeds: [13]
+    instance_count: -1
