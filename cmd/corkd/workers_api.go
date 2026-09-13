@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 type WorkerAddRequest struct {
@@ -96,7 +96,7 @@ func (s state) workerHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		code := http.StatusInternalServerError
-		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+		if _, ok := err.(*cork.UnknownIdentifierError); ok {
 			code = http.StatusNotFound
 		}
 		w.WriteHeader(code)

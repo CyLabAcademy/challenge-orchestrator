@@ -285,12 +285,12 @@ Three things then sit on top:
 
 | Piece | What it is | Where |
 |---|---|---|
-| Base image pinning | rewrites `FROM name:tag` to `FROM name@sha256:…` **in the build context tar**, never on disk | `cmgr/basepins.go` |
-| Pin fingerprint | the pin map's checksum is folded into a build's content identity | `contentChecksum`, `cmgr/docker.go` |
-| Type template | the built-in Dockerfile of a `flag-only`, `remote-make` or `static-make` challenge is folded into the identity too, so a cork release that changes one changes the identity of future builds (never a rebuild by itself; custom challenges carry their Dockerfile in their source) | `templateChecksum`, `cmgr/docker.go` |
-| Inline cache | pushed images carry BuildKit cache metadata; a rebuild imports from the generation it displaces | `executeBuild` and `cacheRefsFor`, `cmgr/docker.go` |
-| Purge after push | the builder's local copy of a build's images is dropped once they are in the registry | `cmgr/purge.go` |
-| Write-once publish | a build is pushed only once it has validated, and a tag already in the registry is never pushed over | `publishImages` and `registryTagExists`, `cmgr/docker.go`, `cmgr/registry.go` |
+| Base image pinning | rewrites `FROM name:tag` to `FROM name@sha256:…` **in the build context tar**, never on disk | `cork/basepins.go` |
+| Pin fingerprint | the pin map's checksum is folded into a build's content identity | `contentChecksum`, `cork/docker.go` |
+| Type template | the built-in Dockerfile of a `flag-only`, `remote-make` or `static-make` challenge is folded into the identity too, so a cork release that changes one changes the identity of future builds (never a rebuild by itself; custom challenges carry their Dockerfile in their source) | `templateChecksum`, `cork/docker.go` |
+| Inline cache | pushed images carry BuildKit cache metadata; a rebuild imports from the generation it displaces | `executeBuild` and `cacheRefsFor`, `cork/docker.go` |
+| Purge after push | the builder's local copy of a build's images is dropped once they are in the registry | `cork/purge.go` |
+| Write-once publish | a build is pushed only once it has validated, and a tag already in the registry is never pushed over | `publishImages` and `registryTagExists`, `cork/docker.go`, `cork/registry.go` |
 
 ## Where artifact bundles go
 
@@ -314,7 +314,7 @@ rather than computed: `remove-schema` takes a name and never learns a
 destination, and `migrate-schema` reads the destination a schema is moving
 *to*, not the one its bundles were written under. Within one plane's database
 a build id is drawn once, so at most one file answers to the name
-(`removeArtifactBundle`, `cmgr/filesystem.go`). A migration therefore moves a
+(`removeArtifactBundle`, `cork/filesystem.go`). A migration therefore moves a
 bundle into the new destination's directory and takes the old one out.
 
 That uniqueness is a property of one database, not of the directory. A plane
@@ -614,7 +614,7 @@ Nothing else needs the local copy:
 - the retention paths only ever *remove* images and already tolerate absence.
 
 **Without a registry this is refused, not merely defaulted off.** Single-host
-cmgr never pushes and `ensureImages` does not pull, so the builder's copy is the
+cork never pushes and `ensureImages` does not pull, so the builder's copy is the
 only one there is; purging would break every launch.
 
 Turning it off is how you measure. An unpurged pass over the real corpus is the
@@ -640,7 +640,7 @@ number in this document currently rests on.
    to publish cache metadata, and `CacheFrom` entries would be read as registry
    references — a bare `challenge:tag` normalizes to `docker.io/library` and
    would send a Hub lookup per image per build. Both are switched off in that
-   mode, leaving single-host cmgr as it was.
+   mode, leaving single-host cork as it was.
 
 ## Measured
 

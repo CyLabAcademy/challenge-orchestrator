@@ -8,18 +8,18 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 	"go.yaml.in/yaml/v3"
 )
 
 // buildCommand is the whole of what this binary is for: read the schema
 // files, record the challenge directory, build and push what the schemas
 // name, and hand each challenge over.
-func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args []string) int {
+func buildCommand(mgr *cork.Manager, servers []string, dests *destinations, args []string) int {
 	if len(args) == 0 {
 		return usageError("build takes the schema files to build, and none were given")
 	}
-	schemas := make([]*cmgr.Schema, 0, len(args))
+	schemas := make([]*cork.Schema, 0, len(args))
 	refused := false
 	for _, path := range args {
 		schema, err := loadSchema(path)
@@ -124,7 +124,7 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 	}
 
 	// What each schema built, read back from this plane's own database.
-	built := map[string][]*cmgr.ChallengeMetadata{}
+	built := map[string][]*cork.ChallengeMetadata{}
 	for _, schema := range schemas {
 		state, err := mgr.GetSchemaState(schema.Name)
 		if err != nil {
@@ -135,7 +135,7 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 	// The pins are an input to every build's content identity and the one
 	// input the orchestrator cannot derive for itself: they live here.
 	fingerprint := mgr.BasePinFingerprint()
-	identity := func(build *cmgr.BuildMetadata, challengeType string) uint32 {
+	identity := func(build *cork.BuildMetadata, challengeType string) uint32 {
 		return mgr.ContentChecksum(build.SourceChecksum, build.Format, fingerprint, challengeType)
 	}
 
@@ -146,8 +146,8 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 	// orchestrator should not already have written to the first two.
 	type outbound struct {
 		route    route
-		payloads map[cmgr.ChallengeId]*cmgr.HandOver
-		order    []cmgr.ChallengeId
+		payloads map[cork.ChallengeId]*cork.HandOver
+		order    []cork.ChallengeId
 	}
 	sending := make([]outbound, 0, len(routes))
 	mismatched := []string{}
@@ -160,7 +160,7 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 		for _, complaint := range mismatched {
 			fmt.Fprintf(os.Stderr, "error: %s\n", complaint)
 		}
-		fmt.Fprintf(os.Stderr, "error: the orchestrator recomputes what a hand-over states and refuses what disagrees, so none of this would be recorded. Build these again -- from a database that does not hold them (%s) where it is the pins that moved -- and hand the result over.\n", cmgr.DB_ENV)
+		fmt.Fprintf(os.Stderr, "error: the orchestrator recomputes what a hand-over states and refuses what disagrees, so none of this would be recorded. Build these again -- from a database that does not hold them (%s) where it is the pins that moved -- and hand the result over.\n", cork.DB_ENV)
 		return RUNTIME_ERROR
 	}
 
@@ -216,16 +216,16 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 // daemon to build on, not the workers an event is served from. What the
 // schema really asks for reaches the orchestrator in the hand-over, which
 // is where the instances belong (see assemble).
-func forBuilding(schema *cmgr.Schema) *cmgr.Schema {
-	building := &cmgr.Schema{
+func forBuilding(schema *cork.Schema) *cork.Schema {
+	building := &cork.Schema{
 		Name:       schema.Name,
 		FlagFormat: schema.FlagFormat,
-		Challenges: make(map[cmgr.ChallengeId]cmgr.BuildSpecification, len(schema.Challenges)),
+		Challenges: make(map[cork.ChallengeId]cork.BuildSpecification, len(schema.Challenges)),
 	}
 	for id, spec := range schema.Challenges {
-		building.Challenges[id] = cmgr.BuildSpecification{
+		building.Challenges[id] = cork.BuildSpecification{
 			Seeds:         spec.Seeds,
-			InstanceCount: cmgr.DYNAMIC_INSTANCES,
+			InstanceCount: cork.DYNAMIC_INSTANCES,
 		}
 	}
 	return building
@@ -237,9 +237,9 @@ func forBuilding(schema *cmgr.Schema) *cmgr.Schema {
 // named it rather than the on-demand one it was converged with. A challenge
 // two schemas name arrives once, with the builds of both. `built` is what
 // each schema left in this plane's database, by schema name.
-func assemble(schemas []*cmgr.Schema, built map[string][]*cmgr.ChallengeMetadata, fingerprint uint32) (map[cmgr.ChallengeId]*cmgr.HandOver, []cmgr.ChallengeId) {
-	payloads := map[cmgr.ChallengeId]*cmgr.HandOver{}
-	order := []cmgr.ChallengeId{}
+func assemble(schemas []*cork.Schema, built map[string][]*cork.ChallengeMetadata, fingerprint uint32) (map[cork.ChallengeId]*cork.HandOver, []cork.ChallengeId) {
+	payloads := map[cork.ChallengeId]*cork.HandOver{}
+	order := []cork.ChallengeId{}
 
 	for _, schema := range schemas {
 		for _, challenge := range built[schema.Name] {
@@ -247,7 +247,7 @@ func assemble(schemas []*cmgr.Schema, built map[string][]*cmgr.ChallengeMetadata
 			payload, known := payloads[challenge.Id]
 			if !known {
 				challenge.Builds = nil
-				payload = &cmgr.HandOver{
+				payload = &cork.HandOver{
 					Challenge:      challenge,
 					PinFingerprint: fingerprint,
 					// The text of any seccomp profile the challenge
@@ -256,7 +256,7 @@ func assemble(schemas []*cmgr.Schema, built map[string][]*cmgr.ChallengeMetadata
 					// in the challenge's own JSON -- so without it the
 					// orchestrator would record the declaration and launch
 					// every container under the default policy.
-					SeccompProfiles: cmgr.SeccompProfiles(challenge),
+					SeccompProfiles: cork.SeccompProfiles(challenge),
 				}
 				payloads[challenge.Id] = payload
 				order = append(order, challenge.Id)
@@ -278,7 +278,7 @@ func assemble(schemas []*cmgr.Schema, built map[string][]*cmgr.ChallengeMetadata
 // orchestrator because the pins belong with the builds they go into: an
 // orchestrator on an external build plane answers 409 to the pin endpoints,
 // having no tree to read the bases from and nothing to build with them.
-func pinsCommand(mgr *cmgr.Manager) int {
+func pinsCommand(mgr *cork.Manager) int {
 	pins, err := mgr.RefreshBasePins()
 	for _, pin := range pins {
 		fmt.Printf("%-30s %-71s used by %d\n", pin.Ref, pin.Digest, pin.InUse)
@@ -305,12 +305,12 @@ func pinsCommand(mgr *cmgr.Manager) int {
 // loadSchema reads a schema file, as cork reads one for the
 // orchestrator: the same yaml or json, and here it is what decides what is
 // built.
-func loadSchema(path string) (*cmgr.Schema, error) {
+func loadSchema(path string) (*cork.Schema, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	schema := new(cmgr.Schema)
+	schema := new(cork.Schema)
 	switch filepath.Ext(path) {
 	case ".json":
 		err = json.Unmarshal(data, schema)
@@ -363,7 +363,7 @@ func loadSchema(path string) (*cmgr.Schema, error) {
 // refresh rebuilds nothing by design (see BUILDER.md), so a build carried
 // over in a kept database from before a refresh still carries the identity
 // it was made under.
-func identityMismatches(payloads map[cmgr.ChallengeId]*cmgr.HandOver, order []cmgr.ChallengeId, identity func(build *cmgr.BuildMetadata, challengeType string) uint32) []string {
+func identityMismatches(payloads map[cork.ChallengeId]*cork.HandOver, order []cork.ChallengeId, identity func(build *cork.BuildMetadata, challengeType string) uint32) []string {
 	complaints := []string{}
 	for _, id := range order {
 		challenge := payloads[id].Challenge
@@ -403,7 +403,7 @@ func identityMismatches(payloads map[cmgr.ChallengeId]*cmgr.HandOver, order []cm
 // Errors alongside nothing present is that signature, and only that: a scan
 // that really covered the tree leaves whatever it did parse in one of the
 // present buckets, and a tree with no challenges at all reports no errors.
-func scanDidNotHappen(updates *cmgr.ChallengeUpdates) bool {
+func scanDidNotHappen(updates *cork.ChallengeUpdates) bool {
 	if len(updates.Errors) == 0 {
 		return false
 	}

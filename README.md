@@ -279,7 +279,7 @@ Workers:
       register a worker, or bring a down one back once it is rebooted or
       repaired (its instances come back with it: their containers restart on
       their own); the optional public address is what players are given for
-      its instances; containers and networks cmgr created on it for instances
+      its instances; containers and networks cork created on it for instances
       it no longer records are removed first (as for every worker at corkd
       start). A daemon that stays unreachable while that runs is marked down
       and takes nothing until another worker-add; one that answers but leaves
@@ -379,7 +379,7 @@ Every setting also answers to its pre-rename `CMGR_` name (`CMGR_DB` for `CORK_D
 | CORK_DESTINATIONS        | `cork-build` only. A yaml file mapping the destination names schemas use to the orchestrators they stand for (`library: https://host:4200`). A schema naming no destination means the only one configured, and is refused once there is more than one. Two names for one address are refused when the file is read. See [BUILDER.md](BUILDER.md) | unset |
 | CORK_SERVER             | `cork` only, and the only setting it reads: the orchestrator to send requests to. `--server` overrides it, and `CMGRD_SERVER`, its name before the rename, is read when this one is unset                     | http://127.0.0.1:4200                                                    |
 
-Everything above is read by the shared `cmgr` library, so `corkd` and
+Everything above is read by the shared `cork` library, so `corkd` and
 `cork-build` accept the same surface — but each ignores the other's half, and
 says so at startup rather than silently. A build plane runs nothing, so
 `CORK_CONCURRENT_LAUNCHES`, `CORK_PORTS`, `CORK_INTERFACE`,
@@ -396,7 +396,7 @@ from the other role's is the usual way it happens.
 - The cork API has zero authentication or security. It relies completely on upstream gates to prevent flooding and abuse
 - The telemetry server provides neither authenticity nor secrecy. It's literally just a value that says whether the server is overloaded or not though.
 - If a launch fails, it is not retried on a different worker. Expectation is that the user will get frustrated and retry. This is expected behavior
-- The binaries, the settings and the release asset carry the cork name since the rename; internally (the Go package, the database file name, image tags, the log prefix, and the `CMGR_` variables a challenge container sees) cork still uses the cmgr name
+- The cmgr name survives in four places, each a contract rather than a spelling: the `CMGR_` variables a challenge container sees; the docker labels and object names (`cmgr.managed`, `cmgr-<id>`) that docker-reaper and the reconciler match on; image tags; and `CN=cmgr`, the orchestrator's client-certificate identity, which is deployed and would have to be reissued
 - There is no health check for zot, cork assumes that it is up at all times
 - CORK_INTERFACE is pointless, it controls the interface to bind to for ALL WORKERS, which is meaningless
 - If a schema doesn't declare a flag format, it defaults to `%!(EXTRA string=...)`
@@ -624,9 +624,9 @@ the CLI as they do in production. (TODO: surface these as CLI flags if needed.)
 
 If you're interested in contributing, modifying, or extending **cmgr**, the
 core functionality of the project is implemented in a single Go library under
-the `cmgr` directory.
+the `cork` directory.
 Additionally, the _SQLite3_ database is intended to function as a read-only
-API and its schema can be found [here](cmgr/database.go).
+API and its schema can be found [here](cork/database.go).
 
 In order to work on the back-end, you will need to have _Go_ installed and
 _cgo_ enabled for at least the initial build where the _sqlite3_ driver is

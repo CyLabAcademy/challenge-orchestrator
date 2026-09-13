@@ -5,8 +5,8 @@ import (
 	"os"
 )
 
-// BasePin mirrors cmgr.BasePin. The CLI deliberately imports no cmgr package,
-// so this is a copy; cmgr/basepins.go is the source of truth.
+// BasePin mirrors cork.BasePin. The CLI deliberately imports no cork package,
+// so this is a copy; cork/basepins.go is the source of truth.
 type BasePin struct {
 	Ref    string `json:"ref"`
 	Digest string `json:"digest"`

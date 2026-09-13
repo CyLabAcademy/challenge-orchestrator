@@ -46,7 +46,7 @@
 set -euo pipefail
 
 REGISTRY="${1:-10.12.34.121}"                              # zot's address (IP or DNS name)
-WORKER_NAME="${WORKER_SERVERNAME:-academy-docker-worker}"  # must match WORKER_SERVERNAME in cmgr/workers.go
+WORKER_NAME="${WORKER_SERVERNAME:-academy-docker-worker}"  # must match WORKER_SERVERNAME in cork/workers.go
 DAYS="${DAYS:-3650}"                                       # cert validity (~10 years; private CA)
 OUT="${OUT:-./docker-certs}"
 

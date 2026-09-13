@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
-// pinsHandler serves the base image pins (see cmgr/basepins.go). GET reports
+// pinsHandler serves the base image pins (see cork/basepins.go). GET reports
 // the current pins and how many challenge Dockerfiles use each. POST
 // re-resolves every base reference the challenge directory names to the digest
 // the registry serves right now and persists the result; that is the only
@@ -20,7 +20,7 @@ import (
 // working order. See BUILDER.md.
 func (s state) pinsHandler(w http.ResponseWriter, r *http.Request) {
 	var (
-		pins []cmgr.BasePin
+		pins []cork.BasePin
 		err  error
 	)
 	switch r.Method {
@@ -46,7 +46,7 @@ func (s state) pinsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, mErr := json.Marshal(struct {
-		Pins  []cmgr.BasePin `json:"pins"`
+		Pins  []cork.BasePin `json:"pins"`
 		Error string         `json:"error,omitempty"`
 	}{Pins: pins, Error: errString(err)})
 	if mErr != nil {

@@ -84,7 +84,7 @@ version=$(api GET /version)
   fail "DOCKER_HOST is set to '$DOCKER_HOST': this box is meant to prove cork reaches docker at its local socket"
 box /_ping >/dev/null || fail "the docker daemon is not answering on $DOCKER_SOCK"
 # No workers, and none coming: this is what makes every launch below take the
-# local-daemon path (selectWorker returns "", cmgr/api.go).
+# local-daemon path (selectWorker returns "", cork/api.go).
 workers=$(api GET /workers)
 [[ "$(jq -r 'length' <<<"$workers")" == 0 ]] ||
   fail "corkd came up with workers registered: $workers"
@@ -141,7 +141,7 @@ PERSIST=$(api GET /state | jq -r --argjson b "$BUILD" '.[].builds[]? | select(.i
 pmeta=$(api GET "/instances/$PERSIST")
 # The whole point of this fleet. On the multi-host one this field always names
 # a worker; here it must be empty, which is the branch instanceClient takes to
-# hand back m.cli (cmgr/workers.go) instead of a worker's client.
+# hand back m.cli (cork/workers.go) instead of a worker's client.
 worker=$(jq -r '.worker // ""' <<<"$pmeta")
 [[ -z "$worker" ]] ||
   fail "instance $PERSIST was placed on worker '$worker', although none is registered: this deployment has only the local daemon"

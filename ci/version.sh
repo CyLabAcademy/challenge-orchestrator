@@ -31,8 +31,8 @@
 # With --ldflags it prints the whole -X stamp instead of the bare string. The
 # package path appears twice per build path and there are three of them, so
 # every build carried six copies of a name that is about to change: the daemon
-# reads cmgr.version, the CLI its own main.version, and the CLI deliberately
-# imports no cmgr package, so the two variables cannot be collapsed into one.
+# reads cork.version, the CLI its own main.version, and the CLI deliberately
+# imports no cork package, so the two variables cannot be collapsed into one.
 # Naming them here means a package rename edits this file, plus
 # e2e/cork.Dockerfile, which builds inside a container with no git and so
 # constructs its own stamp from the CORK_VERSION build arg. Two, not six.
@@ -48,7 +48,7 @@ version=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)
 case "${1:-}" in
   --ldflags)
     [ $# -eq 1 ] || { echo "usage: version.sh [--ldflags]" >&2; exit 2; }
-    printf -- '-X github.com/CyLabAcademy/challenge-orchestrator/cmgr.version=%s -X main.version=%s' "$version" "$version"
+    printf -- '-X github.com/CyLabAcademy/challenge-orchestrator/cork.version=%s -X main.version=%s' "$version" "$version"
     ;;
   '')
     printf '%s\n' "$version"

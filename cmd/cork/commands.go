@@ -14,7 +14,7 @@ import (
 )
 
 // Local mirrors of the corkd API types (the CLI deliberately does not import
-// the cmgr library — it talks JSON only).
+// the cork library — it talks JSON only).
 
 type Schema struct {
 	Name       string                        `json:"name"        yaml:"name"`

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 // removeSchemaCommand takes a schema out of service for good: the
@@ -26,7 +26,7 @@ import (
 // generateBuilds considers done -- it would push nothing, and the hand-over
 // would then be refused for a tag the orchestrator had just retired. A
 // removal that only reached one side would brick the schema on the next add.
-func removeSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args []string) int {
+func removeSchemaCommand(mgr *cork.Manager, servers []string, dests *destinations, args []string) int {
 	if len(args) != 1 {
 		return usageError("remove-schema takes one schema name (list-schemas names them)")
 	}
@@ -112,7 +112,7 @@ func removeSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destination
 // orchestrators serving one content-addressed tag is the state the
 // exclusivity rule exists to prevent, and a failure after the release leaves
 // the schema served nowhere, which re-running fixes.
-func migrateSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args []string) int {
+func migrateSchemaCommand(mgr *cork.Manager, servers []string, dests *destinations, args []string) int {
 	if len(servers) > 0 {
 		return usageError("migrate-schema moves a schema between destinations, so it cannot be given --server")
 	}
@@ -187,15 +187,15 @@ func migrateSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destinatio
 // that is not is almost always a typo. `build` is the form that does not
 // ask, and is the one to use for a run of several schemas, since exclusivity
 // is only checked across the schemas of one run.
-func addSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args []string) int {
+func addSchemaCommand(mgr *cork.Manager, servers []string, dests *destinations, args []string) int {
 	return deploySchema(mgr, servers, dests, args, "add-schema", false)
 }
 
-func updateSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args []string) int {
+func updateSchemaCommand(mgr *cork.Manager, servers []string, dests *destinations, args []string) int {
 	return deploySchema(mgr, servers, dests, args, "update-schema", true)
 }
 
-func deploySchema(mgr *cmgr.Manager, servers []string, dests *destinations, args []string, command string, wantKnown bool) int {
+func deploySchema(mgr *cork.Manager, servers []string, dests *destinations, args []string, command string, wantKnown bool) int {
 	if len(args) != 1 {
 		return usageError("%s takes one schema file", command)
 	}
@@ -237,7 +237,7 @@ func schemaGuard(schemaName string, known []string, wantKnown bool) error {
 
 // listSchemasCommand names the schemas this build plane has built. Not what
 // is being served: an orchestrator holds that, and holds only its own.
-func listSchemasCommand(mgr *cmgr.Manager, args []string) int {
+func listSchemasCommand(mgr *cork.Manager, args []string) int {
 	if len(args) != 0 {
 		return usageError("list-schemas takes no arguments")
 	}
@@ -259,7 +259,7 @@ func listSchemasCommand(mgr *cmgr.Manager, args []string) int {
 // Best-effort on that second half: a destination that cannot be reached is
 // reported and not fatal. This is a read, and refusing to describe what was
 // built because some other orchestrator is down would be the wrong trade.
-func showSchemaCommand(mgr *cmgr.Manager, dests *destinations, args []string) int {
+func showSchemaCommand(mgr *cork.Manager, dests *destinations, args []string) int {
 	if len(args) != 1 {
 		return usageError("show-schema takes one schema name")
 	}

@@ -13,11 +13,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 type state struct {
-	mgr *cmgr.Manager
+	mgr *cork.Manager
 }
 
 func main() {
@@ -32,7 +32,7 @@ func main() {
 	flag.Parse()
 
 	if version {
-		fmt.Printf("Version: %s\n", cmgr.Version())
+		fmt.Printf("Version: %s\n", cork.Version())
 		os.Exit(0)
 	}
 
@@ -45,7 +45,7 @@ func main() {
 	// the only way to raise an orchestrator's logging, since there is no
 	// flag for it. A level that does not parse is complained about and not
 	// fatal -- a typo here is no reason to refuse to serve.
-	logLevel, logLevelErr := cmgr.LogLevelFromEnv(cmgr.INFO)
+	logLevel, logLevelErr := cork.LogLevelFromEnv(cork.INFO)
 	if logLevelErr != nil {
 		// Before the manager, not after: a start that then fails would
 		// otherwise never say why its logging was not what the unit file
@@ -53,9 +53,9 @@ func main() {
 		// of the output.
 		log.Printf("warning: %s", logLevelErr)
 	}
-	mgr := cmgr.NewManager(logLevel)
+	mgr := cork.NewManager(logLevel)
 	if mgr == nil {
-		log.Fatal("failed to initialize cmgr library")
+		log.Fatal("failed to initialize cork library")
 	}
 
 	// corkd is the sole owner of the database and the docker/registry state:
@@ -121,7 +121,7 @@ Relevant environment variables:
       (defaults to 'info')
 
   CORK_PORTS - the range of ports that are dedicated for serving challenges;
-      cmgr will assume that it fully owns these ports and nothing else will
+      cork will assume that it fully owns these ports and nothing else will
       try to use them (i.e., not in ephemeral range or overlapping with a
       service running on the host); format is '1000-1000'
 
@@ -175,7 +175,7 @@ Relevant environment variables:
 
   CORK_REGISTRY - the docker registry holding built challenge images; when
       set, images are pulled from it before each instance start (must match
-      the value used by cmgr when building).
+      the value used by cork when building).
 
   CORK_BASE_PINS - path to a JSON map of base image reference to digest,
       defaulting to <CORK_DIR>/.base-pins.json; absent or empty disables
@@ -244,7 +244,7 @@ Workers:
   return success without touching docker.
 
   Whenever a worker is added, and for every worker at startup, the containers
-  and cmgr-<id> networks cmgr created on it for instances it no longer records
+  and cmgr-<id> networks cork created on it for instances it no longer records
   there (left behind by those stops, or by DELETE) are removed before it takes
   placements, so their host ports are free again. A daemon that cannot be
   reached at that point (still starting, say) is retried for as long as
@@ -294,11 +294,11 @@ Workers:
 }
 
 type ChallengeListElement struct {
-	Id               cmgr.ChallengeId  `json:"id"`
+	Id               cork.ChallengeId  `json:"id"`
 	SourceChecksum   uint32            `json:"source_checksum"`
 	MetadataChecksum uint32            `json:"metadata_checksum"`
 	SolveScript      bool              `json:"solve_script"`
-	DeliveryType     cmgr.DeliveryType `json:"delivery_type"`
+	DeliveryType     cork.DeliveryType `json:"delivery_type"`
 }
 
 func (s state) listHandler(w http.ResponseWriter, r *http.Request) {
@@ -309,7 +309,7 @@ func (s state) listHandler(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query()
 	tags, ok := query["tags"]
-	var challenges []*cmgr.ChallengeMetadata
+	var challenges []*cork.ChallengeMetadata
 	if !ok {
 		challenges = s.mgr.ListChallenges()
 	} else {
@@ -364,14 +364,14 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	challenge := cmgr.ChallengeId(chalStr[:len(chalStr)-1])
+	challenge := cork.ChallengeId(chalStr[:len(chalStr)-1])
 
 	var err error
 	respCode := http.StatusOK
 	var body []byte
 	switch r.Method {
 	case "GET":
-		var meta *cmgr.ChallengeMetadata
+		var meta *cork.ChallengeMetadata
 		meta, err = s.mgr.GetChallengeMetadata(challenge)
 		if err == nil {
 			body, err = json.Marshal(meta)
@@ -388,7 +388,7 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 			err = json.Unmarshal(data, &buildReq)
 		}
 
-		var builds []*cmgr.BuildMetadata
+		var builds []*cork.BuildMetadata
 		if err == nil {
 			if buildReq.FlagFormat == "" {
 				buildReq.FlagFormat = "flag{%s}"
@@ -412,10 +412,10 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		respCode = http.StatusInternalServerError
-		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+		if _, ok := err.(*cork.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
 		}
-		if errors.Is(err, cmgr.ErrChallengeHasBuilds) {
+		if errors.Is(err, cork.ErrChallengeHasBuilds) {
 			respCode = http.StatusConflict
 		}
 		body = []byte(err.Error())
@@ -431,7 +431,7 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 // writes had begun, with which the status is 500 rather than 200.
 type HandOverResponse struct {
 	UpdateResponse
-	Challenge *cmgr.ChallengeMetadata `json:"challenge,omitempty"`
+	Challenge *cork.ChallengeMetadata `json:"challenge,omitempty"`
 }
 
 // handOverJSONLimit bounds the body of a hand-over, which is one challenge's
@@ -440,31 +440,31 @@ type HandOverResponse struct {
 const handOverJSONLimit = 16 << 20
 
 // handOverHandler is PUT /challenges/{id}, the hand-over of a challenge and
-// its builds from an external build plane (cmgr.HandOverChallenge): a JSON
-// cmgr.HandOver body, and nothing else. Artifact bundles do not travel with
+// its builds from an external build plane (cork.HandOverChallenge): a JSON
+// cork.HandOver body, and nothing else. Artifact bundles do not travel with
 // it -- they stay on the build plane that made them, where what publishes
 // them to players reads them -- so a hand-over is metadata and image tags,
 // and its size is bounded by handOverJSONLimit alone. ?prune_old=true is
 // update's --prune-old.
-func (s state) handOverHandler(w http.ResponseWriter, r *http.Request, challenge cmgr.ChallengeId) {
+func (s state) handOverHandler(w http.ResponseWriter, r *http.Request, challenge cork.ChallengeId) {
 	refuse := func(code int, msg string) {
 		w.WriteHeader(code)
 		w.Write([]byte(msg))
 	}
-	var handOver cmgr.HandOver
+	var handOver cork.HandOver
 	if err := json.NewDecoder(io.LimitReader(r.Body, handOverJSONLimit)).Decode(&handOver); err != nil {
 		refuse(http.StatusBadRequest, "invalid hand-over JSON: "+err.Error())
 		return
 	}
-	options := cmgr.UpdateOptions{PruneOldImages: r.URL.Query().Get("prune_old") == "true"}
+	options := cork.UpdateOptions{PruneOldImages: r.URL.Query().Get("prune_old") == "true"}
 
 	updates, err := s.mgr.HandOverChallenge(challenge, &handOver, options)
 	if err != nil {
 		code := http.StatusInternalServerError
 		switch {
-		case errors.Is(err, cmgr.ErrHandOverInvalid):
+		case errors.Is(err, cork.ErrHandOverInvalid):
 			code = http.StatusBadRequest
-		case errors.Is(err, cmgr.ErrNotInRegistry), errors.Is(err, cmgr.ErrLocalBuildPlane):
+		case errors.Is(err, cork.ErrNotInRegistry), errors.Is(err, cork.ErrLocalBuildPlane):
 			code = http.StatusConflict
 		}
 		refuse(code, err.Error())
@@ -483,7 +483,7 @@ func (s state) handOverHandler(w http.ResponseWriter, r *http.Request, challenge
 	for i, updateErr := range updates.Errors {
 		resp.Errors[i] = updateErr.Error()
 	}
-	for _, bucket := range [][]*cmgr.ChallengeMetadata{updates.Added, updates.Updated, updates.Refreshed, updates.Stale, updates.Unmodified} {
+	for _, bucket := range [][]*cork.ChallengeMetadata{updates.Added, updates.Updated, updates.Refreshed, updates.Stale, updates.Unmodified} {
 		if len(bucket) > 0 {
 			resp.Challenge = bucket[0]
 		}
@@ -522,20 +522,20 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(err.Error()))
 	}
 
-	build := cmgr.BuildId(buildInt)
+	build := cork.BuildId(buildInt)
 
 	var body []byte
 	var respCode int
 	switch r.Method {
 	case "GET":
-		var meta *cmgr.BuildMetadata
+		var meta *cork.BuildMetadata
 		meta, err = s.mgr.GetBuildMetadata(build)
 		respCode = http.StatusOK
 		if err == nil {
 			body, err = json.Marshal(meta)
 		}
 	case "POST":
-		var instance cmgr.InstanceId
+		var instance cork.InstanceId
 		envVars := make(map[string]string)
 		if r.Body != nil {
 			var req InstanceStartRequest
@@ -561,7 +561,7 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 		instance, err = s.mgr.Start(build, envVars)
 		respCode = http.StatusCreated
 
-		var iMeta *cmgr.InstanceMetadata
+		var iMeta *cork.InstanceMetadata
 		if err == nil {
 			iMeta, err = s.mgr.GetInstanceMetadata(instance)
 		}
@@ -579,7 +579,7 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		respCode = http.StatusInternalServerError
-		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+		if _, ok := err.(*cork.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
 		}
 		// Every worker was skipped: overloaded somewhere means retryable,
@@ -587,9 +587,9 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 		// worker (no slot in time, the worker went down under it, or its
 		// image pull timed out) is retryable too, as is one that lost the
 		// race for the database's write lock: the retry is placed afresh.
-		if errors.Is(err, cmgr.ErrAllWorkersOverloaded) || errors.Is(err, cmgr.ErrWorkerBusy) ||
-			errors.Is(err, cmgr.ErrWorkerDown) || errors.Is(err, cmgr.ErrPullTimeout) ||
-			errors.Is(err, cmgr.ErrDatabaseBusy) {
+		if errors.Is(err, cork.ErrAllWorkersOverloaded) || errors.Is(err, cork.ErrWorkerBusy) ||
+			errors.Is(err, cork.ErrWorkerDown) || errors.Is(err, cork.ErrPullTimeout) ||
+			errors.Is(err, cork.ErrDatabaseBusy) {
 			respCode = http.StatusServiceUnavailable
 			w.Header().Set("Retry-After", "1")
 		}
@@ -615,13 +615,13 @@ func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	instance := cmgr.InstanceId(instInt)
+	instance := cork.InstanceId(instInt)
 
 	var body []byte
 	var respCode int
 	switch r.Method {
 	case "GET":
-		var meta *cmgr.InstanceMetadata
+		var meta *cork.InstanceMetadata
 		meta, err = s.mgr.GetInstanceMetadata(instance)
 		respCode = http.StatusOK
 		if err == nil {
@@ -632,7 +632,7 @@ func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {
 		// Idempotent delete: the instance may already be gone (pruned by the
 		// TTL sweep, or cleared when its worker died). Callers only need to
 		// know it no longer exists.
-		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+		if _, ok := err.(*cork.UnknownIdentifierError); ok {
 			err = nil
 		}
 		respCode = http.StatusNoContent
@@ -642,12 +642,12 @@ func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		respCode = http.StatusInternalServerError
-		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+		if _, ok := err.(*cork.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
 		}
 		// A stop that lost the race for the database's write lock is
 		// retryable, like a launch that did.
-		if errors.Is(err, cmgr.ErrDatabaseBusy) {
+		if errors.Is(err, cork.ErrDatabaseBusy) {
 			respCode = http.StatusServiceUnavailable
 			w.Header().Set("Retry-After", "1")
 		}
@@ -674,7 +674,7 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 	respCode := http.StatusOK
 	switch r.Method {
 	case "GET":
-		var meta []*cmgr.ChallengeMetadata
+		var meta []*cork.ChallengeMetadata
 		meta, err = s.mgr.GetSchemaState(schema)
 		if err == nil {
 			body, err = json.Marshal(meta)
@@ -684,7 +684,7 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 		data, err = ioutil.ReadAll(r.Body)
 		respCode = http.StatusNoContent
 
-		var schemaDef *cmgr.Schema
+		var schemaDef *cork.Schema
 		if err == nil {
 			err = json.Unmarshal(data, &schemaDef)
 		}
@@ -717,7 +717,7 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		respCode = http.StatusInternalServerError
-		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+		if _, ok := err.(*cork.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
 		}
 		if errStatus != 0 {
@@ -741,17 +741,17 @@ type UpdateRequest struct {
 
 // ChallengeUpdates with ids instead of full metadata and marshalable errors.
 type UpdateResponse struct {
-	Added      []cmgr.ChallengeId `json:"added"`
-	Refreshed  []cmgr.ChallengeId `json:"refreshed"`
-	Updated    []cmgr.ChallengeId `json:"updated"`
-	Stale      []cmgr.ChallengeId `json:"stale"`
-	Removed    []cmgr.ChallengeId `json:"removed"`
-	Unmodified []cmgr.ChallengeId `json:"unmodified"`
+	Added      []cork.ChallengeId `json:"added"`
+	Refreshed  []cork.ChallengeId `json:"refreshed"`
+	Updated    []cork.ChallengeId `json:"updated"`
+	Stale      []cork.ChallengeId `json:"stale"`
+	Removed    []cork.ChallengeId `json:"removed"`
+	Unmodified []cork.ChallengeId `json:"unmodified"`
 	Errors     []string           `json:"errors"`
 }
 
-func challengeIds(metas []*cmgr.ChallengeMetadata) []cmgr.ChallengeId {
-	ids := make([]cmgr.ChallengeId, len(metas))
+func challengeIds(metas []*cork.ChallengeMetadata) []cork.ChallengeId {
+	ids := make([]cork.ChallengeId, len(metas))
 	for i, meta := range metas {
 		ids[i] = meta.Id
 	}
@@ -779,7 +779,7 @@ func (s state) updateHandler(w http.ResponseWriter, r *http.Request) {
 
 	path := req.Path
 	if path == "" {
-		path = cmgr.Getenv(cmgr.DIR_ENV)
+		path = cork.Getenv(cork.DIR_ENV)
 		if path == "" {
 			path = "."
 		}
@@ -787,11 +787,11 @@ func (s state) updateHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Synchronous: changed challenges are rebuilt (images + registry pushes)
 	// before this returns, so large deploys need a generous client timeout.
-	var updates *cmgr.ChallengeUpdates
+	var updates *cork.ChallengeUpdates
 	if req.DryRun {
 		updates = s.mgr.DetectChanges(path)
 	} else {
-		updates = s.mgr.UpdateWithOptions(path, cmgr.UpdateOptions{PruneOldImages: req.PruneOld})
+		updates = s.mgr.UpdateWithOptions(path, cork.UpdateOptions{PruneOldImages: req.PruneOld})
 	}
 
 	resp := UpdateResponse{
@@ -840,13 +840,13 @@ func (s state) versionHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	body, _ := json.Marshal(map[string]string{"version": cmgr.Version(), "build_plane": s.mgr.BuildPlane()})
+	body, _ := json.Marshal(map[string]string{"version": cork.Version(), "build_plane": s.mgr.BuildPlane()})
 	w.Write(body)
 }
 
 // schemaStatus maps the errors a schema operation returns to one status:
 // 409 when every one is a build not yet handed over
-// (cmgr.ErrExternalBuildPlane), 404 when every one is an unknown
+// (cork.ErrExternalBuildPlane), 404 when every one is an unknown
 // identifier, 500 otherwise. A list that mixes either with a real failure
 // is a failure, whatever else it holds: a 409 that hid a launch error would
 // read as "hand over and retry" when the retry could not help.
@@ -854,9 +854,9 @@ func schemaStatus(errs []error) int {
 	status := 0
 	for _, err := range errs {
 		code := http.StatusInternalServerError
-		var unknown *cmgr.UnknownIdentifierError
+		var unknown *cork.UnknownIdentifierError
 		switch {
-		case errors.Is(err, cmgr.ErrExternalBuildPlane):
+		case errors.Is(err, cork.ErrExternalBuildPlane):
 			code = http.StatusConflict
 		case errors.As(err, &unknown):
 			code = http.StatusNotFound
@@ -875,13 +875,13 @@ func schemaStatus(errs []error) int {
 // refuseOnExternalBuildPlane answers 409 to a request only a local build
 // plane can serve -- an update, a manual build, the pins -- and reports
 // whether it did. The request is well-formed; this daemon is just not the
-// one that builds (see cmgr.ErrExternalBuildPlane).
+// one that builds (see cork.ErrExternalBuildPlane).
 func (s state) refuseOnExternalBuildPlane(w http.ResponseWriter) bool {
-	if s.mgr.BuildPlane() != cmgr.BuildPlaneExternal {
+	if s.mgr.BuildPlane() != cork.BuildPlaneExternal {
 		return false
 	}
 	w.WriteHeader(http.StatusConflict)
-	w.Write([]byte(cmgr.ErrExternalBuildPlane.Error()))
+	w.Write([]byte(cork.ErrExternalBuildPlane.Error()))
 	return true
 }
 
@@ -901,7 +901,7 @@ func (s state) schemaHandler(w http.ResponseWriter, r *http.Request) {
 		var data []byte
 		data, err = ioutil.ReadAll(r.Body)
 
-		var schemaDef *cmgr.Schema
+		var schemaDef *cork.Schema
 		if err == nil {
 			err = json.Unmarshal(data, &schemaDef)
 		}
@@ -922,7 +922,7 @@ func (s state) schemaHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		respCode = http.StatusInternalServerError
-		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
+		if _, ok := err.(*cork.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
 		}
 		if errStatus != 0 {

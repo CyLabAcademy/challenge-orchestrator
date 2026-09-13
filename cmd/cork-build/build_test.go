@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 func writeFile(t *testing.T, name, content string) string {
@@ -73,13 +73,13 @@ func TestIdentityMismatches(t *testing.T) {
 	second := builtBuild("event", 2, 1)
 	second.Checksum, second.SourceChecksum = 0xBBBB, 0x1111
 	challenge := builtChallenge("test/pinned", 0x1111, first, second)
-	payloads := map[cmgr.ChallengeId]*cmgr.HandOver{challenge.Id: {Challenge: challenge}}
-	order := []cmgr.ChallengeId{challenge.Id}
+	payloads := map[cork.ChallengeId]*cork.HandOver{challenge.Id: {Challenge: challenge}}
+	order := []cork.ChallengeId{challenge.Id}
 
 	// The identity is asked for with the challenge's own type, the
 	// template being one of its inputs.
 	types := map[string]bool{}
-	agreeing := func(build *cmgr.BuildMetadata, challengeType string) uint32 {
+	agreeing := func(build *cork.BuildMetadata, challengeType string) uint32 {
 		types[challengeType] = true
 		return build.Checksum
 	}
@@ -91,7 +91,7 @@ func TestIdentityMismatches(t *testing.T) {
 	}
 
 	// The pins moved under one of them.
-	moved := func(build *cmgr.BuildMetadata, challengeType string) uint32 {
+	moved := func(build *cork.BuildMetadata, challengeType string) uint32 {
 		if build.Seed == 2 {
 			return 0xCCCC
 		}
@@ -137,7 +137,7 @@ func TestForBuilding(t *testing.T) {
 		t.Fatalf("the schema built is not the schema given: %+v", building)
 	}
 	for id, spec := range building.Challenges {
-		if spec.InstanceCount != cmgr.DYNAMIC_INSTANCES {
+		if spec.InstanceCount != cork.DYNAMIC_INSTANCES {
 			t.Errorf("'%s' is converged at instance count %d here, which launches", id, spec.InstanceCount)
 		}
 		if len(spec.Seeds) != len(schema.Challenges[id].Seeds) {
@@ -151,22 +151,22 @@ func TestForBuilding(t *testing.T) {
 	}
 }
 
-func builtChallenge(id cmgr.ChallengeId, source uint32, builds ...*cmgr.BuildMetadata) *cmgr.ChallengeMetadata {
-	return &cmgr.ChallengeMetadata{
+func builtChallenge(id cork.ChallengeId, source uint32, builds ...*cork.BuildMetadata) *cork.ChallengeMetadata {
+	return &cork.ChallengeMetadata{
 		Id:             id,
 		ChallengeType:  "custom",
 		SourceChecksum: source,
-		Hosts:          []cmgr.HostInfo{{Name: "challenge"}},
+		Hosts:          []cork.HostInfo{{Name: "challenge"}},
 		Builds:         builds,
 	}
 }
 
-func builtBuild(schema string, seed int, count int) *cmgr.BuildMetadata {
-	return &cmgr.BuildMetadata{
-		Id: cmgr.BuildId(seed), Schema: schema, Format: "flag{%s}", Seed: seed,
+func builtBuild(schema string, seed int, count int) *cork.BuildMetadata {
+	return &cork.BuildMetadata{
+		Id: cork.BuildId(seed), Schema: schema, Format: "flag{%s}", Seed: seed,
 		Flag: "flag{x}", InstanceCount: count,
-		Images:    []cmgr.Image{{Host: "challenge"}},
-		Instances: []*cmgr.InstanceMetadata{{Id: 7}},
+		Images:    []cork.Image{{Host: "challenge"}},
+		Instances: []*cork.InstanceMetadata{{Id: 7}},
 	}
 }
 
@@ -175,24 +175,24 @@ func builtBuild(schema string, seed int, count int) *cmgr.BuildMetadata {
 // its own schema asks for rather than the on-demand one it was built at,
 // and nothing of what runs here.
 func TestAssemble(t *testing.T) {
-	event := &cmgr.Schema{Name: "event", FlagFormat: "flag{%s}", Challenges: map[cmgr.ChallengeId]cmgr.BuildSpecification{
+	event := &cork.Schema{Name: "event", FlagFormat: "flag{%s}", Challenges: map[cork.ChallengeId]cork.BuildSpecification{
 		"test/shared": {Seeds: []int{1}, InstanceCount: 2},
-		"test/only":   {Seeds: []int{4}, InstanceCount: cmgr.DYNAMIC_INSTANCES},
+		"test/only":   {Seeds: []int{4}, InstanceCount: cork.DYNAMIC_INSTANCES},
 	}}
-	practice := &cmgr.Schema{Name: "practice", FlagFormat: "flag{%s}", Challenges: map[cmgr.ChallengeId]cmgr.BuildSpecification{
+	practice := &cork.Schema{Name: "practice", FlagFormat: "flag{%s}", Challenges: map[cork.ChallengeId]cork.BuildSpecification{
 		"test/shared": {Seeds: []int{9}, InstanceCount: 1},
 	}}
-	built := map[string][]*cmgr.ChallengeMetadata{
+	built := map[string][]*cork.ChallengeMetadata{
 		"event": {
-			builtChallenge("test/shared", 0x1111, builtBuild("event", 1, cmgr.DYNAMIC_INSTANCES)),
-			builtChallenge("test/only", 0x2222, builtBuild("event", 4, cmgr.DYNAMIC_INSTANCES)),
+			builtChallenge("test/shared", 0x1111, builtBuild("event", 1, cork.DYNAMIC_INSTANCES)),
+			builtChallenge("test/only", 0x2222, builtBuild("event", 4, cork.DYNAMIC_INSTANCES)),
 		},
 		"practice": {
-			builtChallenge("test/shared", 0x1111, builtBuild("practice", 9, cmgr.DYNAMIC_INSTANCES)),
+			builtChallenge("test/shared", 0x1111, builtBuild("practice", 9, cork.DYNAMIC_INSTANCES)),
 		},
 	}
 
-	payloads, order := assemble([]*cmgr.Schema{event, practice}, built, 0xABCD)
+	payloads, order := assemble([]*cork.Schema{event, practice}, built, 0xABCD)
 	if len(order) != 2 || order[0] != "test/shared" || order[1] != "test/only" {
 		t.Fatalf("challenges handed over in the order %v", order)
 	}
@@ -220,7 +220,7 @@ func TestAssemble(t *testing.T) {
 		}
 	}
 	only := payloads["test/only"]
-	if len(only.Challenge.Builds) != 1 || only.Challenge.Builds[0].InstanceCount != cmgr.DYNAMIC_INSTANCES {
+	if len(only.Challenge.Builds) != 1 || only.Challenge.Builds[0].InstanceCount != cork.DYNAMIC_INSTANCES {
 		t.Errorf("'test/only' carries %+v", only.Challenge.Builds)
 	}
 }
@@ -231,44 +231,44 @@ func TestAssemble(t *testing.T) {
 // corpus, and treating none as fatal redeploys the previous generation and
 // reports success.
 func TestScanDidNotHappen(t *testing.T) {
-	chal := []*cmgr.ChallengeMetadata{{Id: "a/one"}}
+	chal := []*cork.ChallengeMetadata{{Id: "a/one"}}
 	for _, tc := range []struct {
 		name    string
-		updates *cmgr.ChallengeUpdates
+		updates *cork.ChallengeUpdates
 		want    bool
 	}{
 		{
 			// The duplicate-id abort: the walk stopped, so every row looks
 			// removed and nothing at all is present.
 			name:    "errors and nothing present",
-			updates: &cmgr.ChallengeUpdates{Errors: []error{errors.New("found multiple challenges with id 'a/one'")}, Removed: chal},
+			updates: &cork.ChallengeUpdates{Errors: []error{errors.New("found multiple challenges with id 'a/one'")}, Removed: chal},
 			want:    true,
 		},
 		{
 			// One challenge would not parse and the rest of the tree was
 			// recorded. This must NOT stop a build.
 			name:    "errors with the rest of the tree present",
-			updates: &cmgr.ChallengeUpdates{Errors: []error{errors.New("challenge file missing name")}, Unmodified: chal},
+			updates: &cork.ChallengeUpdates{Errors: []error{errors.New("challenge file missing name")}, Unmodified: chal},
 			want:    false,
 		},
 		{
 			name:    "a challenge that failed and one that was added",
-			updates: &cmgr.ChallengeUpdates{Errors: []error{errors.New("bad")}, Added: chal},
+			updates: &cork.ChallengeUpdates{Errors: []error{errors.New("bad")}, Added: chal},
 			want:    false,
 		},
 		{
 			name:    "a clean scan of an empty tree",
-			updates: &cmgr.ChallengeUpdates{},
+			updates: &cork.ChallengeUpdates{},
 			want:    false,
 		},
 		{
 			name:    "a clean scan that removed a challenge",
-			updates: &cmgr.ChallengeUpdates{Removed: chal},
+			updates: &cork.ChallengeUpdates{Removed: chal},
 			want:    false,
 		},
 		{
 			name:    "errors alongside a stale build",
-			updates: &cmgr.ChallengeUpdates{Errors: []error{errors.New("bad")}, Stale: chal},
+			updates: &cork.ChallengeUpdates{Errors: []error{errors.New("bad")}, Stale: chal},
 			want:    false,
 		},
 	} {

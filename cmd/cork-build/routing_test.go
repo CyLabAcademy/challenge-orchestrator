@@ -6,18 +6,18 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
-func routedSchema(name, destination, format string, challenges map[cmgr.ChallengeId][]int) *cmgr.Schema {
-	s := &cmgr.Schema{
+func routedSchema(name, destination, format string, challenges map[cork.ChallengeId][]int) *cork.Schema {
+	s := &cork.Schema{
 		Name:        name,
 		Destination: destination,
 		FlagFormat:  format,
-		Challenges:  map[cmgr.ChallengeId]cmgr.BuildSpecification{},
+		Challenges:  map[cork.ChallengeId]cork.BuildSpecification{},
 	}
 	for id, seeds := range challenges {
-		s.Challenges[id] = cmgr.BuildSpecification{Seeds: seeds, InstanceCount: cmgr.DYNAMIC_INSTANCES}
+		s.Challenges[id] = cork.BuildSpecification{Seeds: seeds, InstanceCount: cork.DYNAMIC_INSTANCES}
 	}
 	return s
 }
@@ -31,11 +31,11 @@ func TestRouteSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	year := routedSchema("year-round", "library", "flag{%s}", map[cmgr.ChallengeId][]int{"a/one": {1}})
-	spring := routedSchema("spring", "event", "flag{%s}", map[cmgr.ChallengeId][]int{"a/two": {2}})
-	autumn := routedSchema("autumn", "event", "flag{%s}", map[cmgr.ChallengeId][]int{"a/three": {3}})
+	year := routedSchema("year-round", "library", "flag{%s}", map[cork.ChallengeId][]int{"a/one": {1}})
+	spring := routedSchema("spring", "event", "flag{%s}", map[cork.ChallengeId][]int{"a/two": {2}})
+	autumn := routedSchema("autumn", "event", "flag{%s}", map[cork.ChallengeId][]int{"a/three": {3}})
 
-	routes, err := routeSchemas([]*cmgr.Schema{year, spring, autumn}, nil, dests)
+	routes, err := routeSchemas([]*cork.Schema{year, spring, autumn}, nil, dests)
 	if err != nil {
 		t.Fatalf("routeSchemas: %s", err)
 	}
@@ -61,16 +61,16 @@ func TestRouteSchemas(t *testing.T) {
 
 	// --server overrides routing: everything goes where it says, whatever
 	// the schemas name.
-	routes, err = routeSchemas([]*cmgr.Schema{year, spring}, []string{"http://only:4200"}, dests)
+	routes, err = routeSchemas([]*cork.Schema{year, spring}, []string{"http://only:4200"}, dests)
 	if err != nil || len(routes) != 1 || len(routes[0].schemas) != 2 {
 		t.Fatalf("--server did not override routing: %+v, %v", routes, err)
 	}
 
 	// Every unresolvable schema is named at once: an operator fixing one
 	// destination line wants to hear about the others too.
-	bad := routedSchema("typo-one", "libary", "flag{%s}", map[cmgr.ChallengeId][]int{"a/x": {1}})
-	worse := routedSchema("typo-two", "evnet", "flag{%s}", map[cmgr.ChallengeId][]int{"a/y": {1}})
-	_, err = routeSchemas([]*cmgr.Schema{bad, worse}, nil, dests)
+	bad := routedSchema("typo-one", "libary", "flag{%s}", map[cork.ChallengeId][]int{"a/x": {1}})
+	worse := routedSchema("typo-two", "evnet", "flag{%s}", map[cork.ChallengeId][]int{"a/y": {1}})
+	_, err = routeSchemas([]*cork.Schema{bad, worse}, nil, dests)
 	if err == nil {
 		t.Fatal("schemas naming destinations that do not exist were routed")
 	}
@@ -89,12 +89,12 @@ func TestExclusivityConflicts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shared := map[cmgr.ChallengeId][]int{"a/shared": {1}}
+	shared := map[cork.ChallengeId][]int{"a/shared": {1}}
 
 	// The same content in two schemas bound to different orchestrators.
 	year := routedSchema("year-round", "library", "flag{%s}", shared)
 	spring := routedSchema("spring", "event", "flag{%s}", shared)
-	routes, err := routeSchemas([]*cmgr.Schema{year, spring}, nil, dests)
+	routes, err := routeSchemas([]*cork.Schema{year, spring}, nil, dests)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestExclusivityConflicts(t *testing.T) {
 	// The same content in two schemas on the SAME orchestrator is fine:
 	// contentReferenced keeps a tag while any row still names it.
 	together := routedSchema("also-event", "event", "flag{%s}", shared)
-	routes, err = routeSchemas([]*cmgr.Schema{spring, together}, nil, dests)
+	routes, err = routeSchemas([]*cork.Schema{spring, together}, nil, dests)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestExclusivityConflicts(t *testing.T) {
 	// no conflict -- which is what lets an event and the year-round corpus
 	// hold the same challenge when their formats differ.
 	otherFormat := routedSchema("spring", "event", "ctf{%s}", shared)
-	routes, err = routeSchemas([]*cmgr.Schema{year, otherFormat}, nil, dests)
+	routes, err = routeSchemas([]*cork.Schema{year, otherFormat}, nil, dests)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +132,8 @@ func TestExclusivityConflicts(t *testing.T) {
 	}
 
 	// A different seed likewise.
-	otherSeed := routedSchema("spring", "event", "flag{%s}", map[cmgr.ChallengeId][]int{"a/shared": {2}})
-	routes, err = routeSchemas([]*cmgr.Schema{year, otherSeed}, nil, dests)
+	otherSeed := routedSchema("spring", "event", "flag{%s}", map[cork.ChallengeId][]int{"a/shared": {2}})
+	routes, err = routeSchemas([]*cork.Schema{year, otherSeed}, nil, dests)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestMisroutedSchemaIsRefused(t *testing.T) {
 	event, _ := orchestratorServing(t)
 	dests := &destinations{byName: map[string]string{"library": library, "event": event}}
 
-	routes := []route{{name: "event", address: event, schemas: []*cmgr.Schema{{Name: "spring"}}}}
+	routes := []route{{name: "event", address: event, schemas: []*cork.Schema{{Name: "spring"}}}}
 	problems := misroutedSchemas(routes, dests)
 	if len(problems) != 1 {
 		t.Fatalf("a schema served by library and routed to event gave %d problem(s): %v", len(problems), problems)
@@ -176,8 +176,8 @@ func TestRoutedWhereItAlreadyLivesIsFine(t *testing.T) {
 		name   string
 		routes []route
 	}{
-		{"re-deploy to the same destination", []route{{name: "library", address: library, schemas: []*cmgr.Schema{{Name: "spring"}}}}},
-		{"a schema nobody serves yet", []route{{name: "event", address: event, schemas: []*cmgr.Schema{{Name: "autumn"}}}}},
+		{"re-deploy to the same destination", []route{{name: "library", address: library, schemas: []*cork.Schema{{Name: "spring"}}}}},
+		{"a schema nobody serves yet", []route{{name: "event", address: event, schemas: []*cork.Schema{{Name: "autumn"}}}}},
 	} {
 		if problems := misroutedSchemas(tc.routes, dests); len(problems) != 0 {
 			t.Errorf("%s was refused: %v", tc.name, problems)
@@ -192,7 +192,7 @@ func TestRoutedWhereItAlreadyLivesIsFine(t *testing.T) {
 func TestOneDestinationAsksNothing(t *testing.T) {
 	only, seen := orchestratorServing(t, "spring")
 	dests := &destinations{byName: map[string]string{"library": only}, defName: "library"}
-	routes := []route{{name: "event", address: only, schemas: []*cmgr.Schema{{Name: "spring"}}}}
+	routes := []route{{name: "event", address: only, schemas: []*cork.Schema{{Name: "spring"}}}}
 	if problems := misroutedSchemas(routes, dests); len(problems) != 0 {
 		t.Errorf("a single-destination plane was refused: %v", problems)
 	}
@@ -207,7 +207,7 @@ func TestServerRouteIsNotChecked(t *testing.T) {
 	library, seen := orchestratorServing(t, "spring")
 	other, _ := orchestratorServing(t)
 	dests := &destinations{byName: map[string]string{"library": library, "event": other}}
-	routes := []route{{name: serverRouteName, address: other, schemas: []*cmgr.Schema{{Name: "spring"}}}}
+	routes := []route{{name: serverRouteName, address: other, schemas: []*cork.Schema{{Name: "spring"}}}}
 	if problems := misroutedSchemas(routes, dests); len(problems) != 0 {
 		t.Errorf("--server was refused: %v", problems)
 	}
@@ -228,7 +228,7 @@ func TestAnUnreachableNeighbourDoesNotBlockARedeploy(t *testing.T) {
 		"library": library,
 		"event":   closedAddress(t),
 	}}
-	routes := []route{{name: "library", address: library, schemas: []*cmgr.Schema{{Name: "library-2026"}}}}
+	routes := []route{{name: "library", address: library, schemas: []*cork.Schema{{Name: "library-2026"}}}}
 
 	if problems := misroutedSchemas(routes, dests); len(problems) != 0 {
 		t.Fatalf("an ordinary re-deploy was refused because an unrelated destination was down: %v", problems)
@@ -247,7 +247,7 @@ func TestAnUnreachableNeighbourStillRefusesAnUnknownSchema(t *testing.T) {
 		"event":   event,
 		"library": closedAddress(t),
 	}}
-	routes := []route{{name: "event", address: event, schemas: []*cmgr.Schema{{Name: "spring"}}}}
+	routes := []route{{name: "event", address: event, schemas: []*cork.Schema{{Name: "spring"}}}}
 
 	problems := misroutedSchemas(routes, dests)
 	if len(problems) != 1 {
@@ -288,7 +288,7 @@ func TestAnUnreachableNeighbourIsAskedOncePerRun(t *testing.T) {
 		"event":   event,
 		"library": "http://" + listener.Addr().String(),
 	}}
-	routes := []route{{name: "event", address: event, schemas: []*cmgr.Schema{
+	routes := []route{{name: "event", address: event, schemas: []*cork.Schema{
 		{Name: "one"}, {Name: "two"}, {Name: "three"},
 	}}}
 

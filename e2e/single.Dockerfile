@@ -30,7 +30,7 @@ ARG CORK_VERSION=e2e
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 go build -v \
-      -ldflags "-X github.com/CyLabAcademy/challenge-orchestrator/cmgr.version=${CORK_VERSION} -X main.version=${CORK_VERSION}" \
+      -ldflags "-X github.com/CyLabAcademy/challenge-orchestrator/cork.version=${CORK_VERSION} -X main.version=${CORK_VERSION}" \
       -o /out/ ./cmd/corkd ./cmd/cork
 
 FROM docker:${DIND_VERSION}-dind

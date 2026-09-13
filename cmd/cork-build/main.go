@@ -30,7 +30,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 const (
@@ -94,7 +94,7 @@ func (l *serverList) Set(value string) error {
 func main() {
 	var servers serverList
 	flag.Var(&servers, "server", "orchestrator to hand the builds to; repeat for more than one, omit to build and push without handing anything over")
-	dir := flag.String("dir", "", "challenge directory, overriding "+cmgr.DIR_ENV)
+	dir := flag.String("dir", "", "challenge directory, overriding "+cork.DIR_ENV)
 	verbose := flag.Bool("verbose", false, "log every docker and database step")
 	help := flag.Bool("help", false, "display usage information")
 	showVersion := flag.Bool("version", false, "display version information and exit")
@@ -117,34 +117,34 @@ func main() {
 		// The manager reads the directory from the environment, as the
 		// daemon does. The flag is for a runner that has the tree in its
 		// workspace rather than in its environment.
-		if err := os.Setenv(cmgr.DIR_ENV, *dir); err != nil {
+		if err := os.Setenv(cork.DIR_ENV, *dir); err != nil {
 			os.Exit(runtimeError(err))
 		}
 	}
 
 	// CORK_LOGGING sets the level, as it does for the daemon; --verbose is
 	// the flag form and wins, being the more deliberate of the two.
-	logLevel, logLevelErr := cmgr.LogLevelFromEnv(cmgr.INFO)
+	logLevel, logLevelErr := cork.LogLevelFromEnv(cork.INFO)
 	if logLevelErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", logLevelErr)
 	}
 	if *verbose {
-		logLevel = cmgr.DEBUG
+		logLevel = cork.DEBUG
 	}
 	// A build plane, not an orchestrator: it pushes to the shared registry
 	// and never takes anything back out of it. Its own database is
 	// bookkeeping, and what a schema here stops naming may still be what an
 	// orchestrator is serving.
-	mgr := cmgr.NewManager(logLevel, cmgr.AsBuildPlane())
+	mgr := cork.NewManager(logLevel, cork.AsBuildPlane())
 	if mgr == nil {
-		fmt.Fprintln(os.Stderr, "error: could not initialize cmgr")
+		fmt.Fprintln(os.Stderr, "error: could not initialize cork")
 		os.Exit(RUNTIME_ERROR)
 	}
 	// The one setting this binary cannot honour: it IS the build plane, and
 	// an external one has neither the docker daemon nor the tree it needs.
-	if mgr.BuildPlane() != cmgr.BuildPlaneLocal {
+	if mgr.BuildPlane() != cork.BuildPlaneLocal {
 		fmt.Fprintf(os.Stderr, "error: %s=%s, but cork-build is the build plane itself: it builds from %s on the docker daemon DOCKER_HOST names\n",
-			cmgr.BUILD_PLANE_ENV, mgr.BuildPlane(), cmgr.DIR_ENV)
+			cork.BUILD_PLANE_ENV, mgr.BuildPlane(), cork.DIR_ENV)
 		os.Exit(RUNTIME_ERROR)
 	}
 
