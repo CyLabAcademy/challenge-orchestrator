@@ -31,13 +31,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 go build -v \
       -ldflags "-X github.com/CyLabAcademy/challenge-orchestrator/cmgr.version=${CORK_VERSION} -X main.version=${CORK_VERSION}" \
-      -o /out/ ./cmd/cmgrd ./cmd/cmgrd-cli
+      -o /out/ ./cmd/corkd ./cmd/cork
 
 FROM docker:${DIND_VERSION}-dind
 # bash/curl/jq/nc for the scenario, python3 to run a challenge's own solve
 # script against a live instance. A real class box would not carry these;
 # they are the operator, not the deployment.
 RUN apk add --no-cache bash curl jq netcat-openbsd python3
-COPY --from=build /out/cmgrd /out/cmgrd-cli /usr/local/bin/
+COPY --from=build /out/corkd /out/cork /usr/local/bin/
+# As in the release tarball and the multi-host image: the pre-rename names are
+# symlinks to the new ones until they are dropped.
+RUN ln -s corkd /usr/local/bin/cmgrd && ln -s cork /usr/local/bin/cmgrd-cli
 COPY e2e/single-entrypoint.sh /usr/local/bin/single-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/single-entrypoint.sh"]

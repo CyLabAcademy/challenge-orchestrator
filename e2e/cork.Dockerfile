@@ -24,8 +24,12 @@ FROM alpine:3.22
 # (the remote-make step); the examples' solvers are plain stdlib. None of
 # these is used by cmgrd itself.
 RUN apk add --no-cache ca-certificates bash curl jq netcat-openbsd openssl sqlite python3
-COPY --from=build /out/cmgrd /out/cmgrd-cli /out/cork-build /usr/local/bin/
+COPY --from=build /out/corkd /out/cork /out/cork-build /usr/local/bin/
+# The release tarball ships the pre-rename names as symlinks to the new ones
+# (see .github/workflows/release.yml); the image does the same, so the
+# scenario can check that they still answer.
+RUN ln -s corkd /usr/local/bin/cmgrd && ln -s cork /usr/local/bin/cmgrd-cli
 COPY e2e/cork-entrypoint.sh /usr/local/bin/cork-entrypoint.sh
 EXPOSE 4200
 ENTRYPOINT ["/usr/local/bin/cork-entrypoint.sh"]
-CMD ["cmgrd"]
+CMD ["corkd"]

@@ -1,6 +1,7 @@
 # Ignore binary targets
-cmd/cmgr/cmgr
-cmd/cmgrd/cmgrd
+cmd/corkd/corkd
+cmd/cork/cork
+cmd/cork-build/cork-build
 bin
 *.db
 *.db-shm
