@@ -4,6 +4,268 @@ Notes for whoever operates or changes cork's image build path. Everything here
 concerns the **orchestrator** host: the one machine that runs `cmgrd`, builds
 images and pushes them to the registry. Workers only pull.
 
+That machine can also be told not to build at all. `CMGR_BUILD_PLANE=external`
+starts `cmgrd` with no docker daemon and no challenge tree: everything in this
+document then happens wherever the images are built, and each build reaches
+the daemon through `PUT /challenges/<id>` (issue #18): the challenge as scanned
+there and its builds as left there, with the images already in the registry,
+verified before anything is recorded (every build's content checksum
+recomputed from the inputs the payload names, every image tag looked up in the
+registry). It is JSON and nothing else — artifact bundles stay on the build
+plane, and `has_artifacts` records that a build published one rather than
+carrying it. A build whose row already serves the generation handed over is
+not built over
+again: handing the same thing over twice leaves the images and the
+flag as they are, and converges only what runs them, since the `instance_count`
+the hand-over carries is the schema's and may have moved. `update`, manual
+builds and the pins commands answer 409, a schema converge only checks that
+every build it wants has already arrived, and a launch with no worker
+registered fails instead of running locally. `add-schema` has no successful
+path there, since the builds handed over are the schema: `update-schema` is
+the operation. The default, `local`, is the daemon this document describes.
+
+## The shape of a deployment
+
+One build plane, one registry, one orchestrator per event, and each
+orchestrator's own workers. The [README](README.md#the-shape-of-a-deployment)
+draws it and says why each count is what it is; two of those counts are what
+the rest of this document rests on:
+
+- **One build plane**, because it is the only thing that sees every schema —
+  which is what makes the exclusivity rule below enforceable at all.
+- **One registry**, shared and content-addressed, because that is what makes
+  the same content the same tag wherever it was built, and so what lets a
+  schema move between orchestrators without rebuilding anything.
+
+A single-host deployment collapses all of it onto one box and drops the
+registry: `cmgrd` builds on its own docker daemon and runs what it builds,
+which is the `local` build plane this document otherwise describes.
+
+### Which orchestrator serves a schema
+
+A schema names its destination, and the build plane resolves that name
+against the mapping in `CORK_DESTINATIONS`:
+
+```yaml
+# the schema
+name: spring-ctf
+destination: event
+flag_format: flag{%s}
+```
+
+```yaml
+# CORK_DESTINATIONS, written by the ansible that stands the orchestrators up
+event:   https://event.example.net:4200
+library: https://library.example.net:4200
+```
+
+A name, not an address, so a typo is refused against the list instead of
+dialled, and moving an orchestrator is a change to one file rather than to
+every schema bound to it. A schema that names no destination means the only
+one configured, and is refused once there is more than one: a single
+orchestrator deployment need say nothing, and an event cannot land on the
+year-round orchestrator because a line was forgotten.
+
+`--server` overrides the mapping entirely and sends everything to the
+address given, which is what a test or a one-orchestrator deployment can do.
+
+**One content-addressed tag cannot be served by two orchestrators.** Two
+schemas naming the same challenge at the same seed and flag format resolve
+to the same tag no matter where they are bound, and whichever drops its
+schema first would retire it from under the other. The build plane is the
+only thing that sees both, so it refuses that pairing before building.
+
+It can only refuse what it is shown, though: the check covers the schemas of
+one `build`, and nothing is recorded of a schema's destination between runs
+(the database keys builds by schema name and stores no destination at all).
+So **build the schemas that share a challenge together** -- `cork-build build
+library.yaml event.yaml ...` -- and the rule is enforced. Build them in
+separate runs and neither run can see the other's binding.
+
+### The commands, and what each one means
+
+| | destination | content | images | on the orchestrator |
+|---|---|---|---|---|
+| `build` | as named | built and pushed | pushed | handed over, then **converged** |
+| `migrate-schema` | **must differ** | unchanged | **untouched** | released, then handed over and converged |
+| `remove-schema` | wherever it lives | gone | **retired** | builds and instances dropped |
+
+Each of them finishes what it starts. A hand-over records builds; it does not
+decide what runs them -- the instance counts travel with it, but only a
+converge (`POST /schemas/<name>`, which is `update-schema`) acts on them,
+starting what a schema asks for and stopping what it no longer does. So
+`build` hands over **and** converges, on the destination it resolved: the
+whole point of naming a destination rather than an address is that the
+address is never typed, and a deploy that ended at the hand-over would have
+required typing one for the second half.
+
+`migrate-schema` moves a schema to the destination its file now names. It
+releases the schema from the orchestrator serving it with `?retire=false` --
+the content is changing hands, not ending, and the tag the new orchestrator
+resolves is the one the old one was serving -- and then hands it over, where
+every image is adopted from the registry. Nothing that is served is rebuilt,
+because a build's identity does not depend on which orchestrator serves it.
+(A challenge with a `builder` host is the one qualification: that image is
+never pushed, so it is built again to extract the flag and artifacts from,
+and then thrown away as always. What the workers pull is still adopted.) A
+migration that takes minutes is a migration that went wrong.
+
+It releases before it hands over, so the two never both hold the schema. A
+failure in between leaves it served nowhere, which re-running fixes.
+
+`remove-schema` is the destructive one, on both sides: the orchestrator drops
+its builds and retires their tags, and the build plane drops its own rows for
+them. It takes a **name**, not a schema file — nothing else about the schema
+survives it, and which orchestrator has it is found by asking them rather
+than read off a file. That matters beyond tidiness: a `DELETE` for a schema a
+daemon has no rows for removes nothing and answers 204, so trusting a file
+whose `destination` had been edited but not migrated would report a removal
+that removed nothing while the event went on running. If nothing is serving
+it, the build plane's own rows are dropped and it says so.
+
+There is no `reset`. Clearing a plane is a loop over the names it knows:
+
+```sh
+cork-build list-schemas | xargs -rn1 cork-build remove-schema
+```
+
+which is visible, interruptible, and reports each removal — where one command
+that nuked everything would be the most dangerous thing in the tree, standing
+in for a single line. Reclaiming the registry is a separate job and not
+cork's: nothing here sweeps tags that no row names (see "Limitations"), and
+zot's own garbage collection is the channel for it.
+
+Both halves are necessary. A build row that still carries a flag is one
+the converge considers done, so a removal that left it behind would push
+nothing the next time the schema was built -- and the hand-over would then be
+refused for a tag the orchestrator had already retired.
+
+### Which tool answers what
+
+`cork-build` holds the challenge tree and is where every schema operation
+happens, so it is where cmgr's build and schema commands live: the deploying
+ones above, plus `update`, `list`, `search`, `info`, `list-schemas`,
+`show-schema`, `system-dump`, `dockerfile` and `convert-to-custom`. Those
+are questions about what a challenge *is* and what has been built, and the
+tree and this plane's database are where the answers are.
+
+`cmgrd-cli` is a thin HTTP client for one daemon and stays exactly that.
+What is *running* — instances, workers, a live launch or stop — belongs to
+an orchestrator and only it can answer. It keeps the build and schema
+commands as well, and they are not redundant: a class deployment runs no
+build plane at all, and on that box `cmgrd-cli update` and `cmgrd-cli
+add-schema` are the operator's whole interface. Against an orchestrator on
+an external build plane they are refused rather than missing — `update`, a
+manual `build` and the `pin-*` pair with a 409, and `add-schema` with
+"schema already exists", since the hand-over has already brought the schema
+into being (`schemaExists` is a query over the builds table). That last one
+is a 500 today rather than the 409 it reads like, because `schemaStatus`
+maps only `ErrExternalBuildPlane` to a conflict.
+
+Three of cmgr's commands went nowhere, and deliberately. `freeze` pre-built
+a base layer and pushed it; base pins and the shared write-once registry
+replaced it, and do the job better (see "Why pinning exists"). `test`,
+`playtest` and `check` drove a solver framework that a production build
+plane has no use for; it was removed with the `cmgr` binary itself. `start`,
+`stop` and a manual `build`/`destroy` stay on the orchestrator side: a build
+outside a schema has no destination, so there is nothing here to route it
+to, and what runs is the orchestrator's business.
+
+## cork-build, the build plane on its own
+
+`cork-build` is this document's machine as a binary: cmgr's build path with
+no orchestrator attached. It reads the schema files an event is defined by,
+scans `CMGR_DIR`, builds and pushes every build those schemas name, and hands
+the finished builds to one or more orchestrators over `PUT /challenges/<id>`.
+
+```
+cork-build build event.yaml practice.yaml          # to the destinations they name
+cork-build --server https://orchestrator:4200 build event.yaml
+cork-build pins
+```
+
+It is the same scan and the same converge cmgrd runs, so it reads the same
+environment: `CMGR_DIR`, `CMGR_REGISTRY` (which must name the registry the
+orchestrator's workers pull from), `CMGR_BASE_PINS`, `CMGR_PURGE_AFTER_PUSH`,
+`CMGR_LOGGING` (`--verbose` is the flag form and wins), `CORK_DESTINATIONS`,
+and docker's own variables.
+
+The same library also reads the settings about *serving*, and every one of
+them is inert here, because nothing runs on a build plane:
+`CMGR_CONCURRENT_LAUNCHES`, `CMGR_PORTS`, `CMGR_INTERFACE`,
+`CMGR_ENABLE_DISK_QUOTAS`, `CMGR_PRUNE_AGE` and the six `CMGR_WORKER_*`
+tunables. Each is named in the log at startup if it is set — the mirror of
+the notes an external daemon makes about `CMGR_DIR` and `DOCKER_HOST` — since
+a unit file grown from an orchestrator's is how they arrive, and
+`CMGR_CONCURRENT_LAUNCHES` in particular would otherwise report launch slots
+on a host that will never take a launch.
+
+What it does not do is run anything: every schema is converged here with its
+builds on demand, which launches no instance, and the `instance_count` the
+schema really asks for travels in the hand-over for the orchestrator to
+converge to.
+
+Its database is bookkeeping rather than a source of truth, but it is not
+disposable while anything it built is in service. Keeping it between runs
+saves rebuilding what has not changed. Losing it costs a re-derivation, in
+which every image already in the registry is adopted rather than built again
+(the registry is write-once, so a tag that is there is the content it names)
+— but a re-derivation draws new build ids, and an orchestrator records each
+build under the id this plane gave it, since that is the id its artifact
+bundle is named by and the only id the platform has to address those files
+with. So a hand-over of a re-derived build is refused, naming the id it is
+already on record under.
+
+Keep this database for as long as any schema it built is being served.
+
+If it is lost anyway, recover the whole plane rather than one schema. A fresh
+database numbers from 1, so the ids it draws are the low ones — which on an
+orchestrator serving several schemas from this plane are held by whichever
+schema was handed over first. Releasing only the schema being rebuilt frees
+the wrong ids: the hand-over is refused naming the schema that holds them
+(nothing is written, and no tag is touched), and the way out is releasing
+that one too. So release every schema that orchestrator holds from this
+plane, then build them together.
+
+Release without retiring where you can — `DELETE /schemas/<name>?retire=false`,
+the call `migrate-schema` makes — because the tags then survive and the
+rebuild adopts them instead of building and pushing again. `remove-schema`
+retires, which is correct for a removal and expensive here.
+
+And clear that destination's artifact directory, or move it aside, before
+building into it. Bundles are named by build id, so a plane numbering from 1
+writes over the bundles of whatever already holds ids 1..N there.
+
+Which is why it only ever pushes to the registry. Retiring a tag -- taking
+out a generation nothing needs any more -- means knowing every row that still
+names it, and this database knows only what this build plane built, while an
+orchestrator may still be serving builds these schemas have stopped naming.
+So dropping a seed here, or changing a flag format, reclaims nothing in the
+registry: the orchestrator's own `update-schema` releases those builds and
+untags them, against the database that does know what references them.
+
+One thing a kept database does not carry over: a pin refresh. A build is
+stamped with its identity when it is made, and refreshing the pins rebuilds
+nothing (below), so builds made before a refresh still carry the identity
+they were made under while the hand-over would state the fingerprint in
+force now. `cork-build` compares the two before it sends anything and
+refuses the run naming the builds that disagree; build them again from a
+database that does not hold them.
+
+Two things it and the orchestrator must agree on. The registry, since the
+hand-over is refused for an image the orchestrator cannot find there. And the
+version: the orchestrator recomputes every build's identity with its own copy
+of the challenge templates, so a template that changed between the two makes
+every identity disagree and every hand-over invalid. `cork-build` asks each
+orchestrator its version before it sends anything and says so when they
+differ.
+
+The base image pins live here too, which is why `pins` is a `cork-build`
+command: an orchestrator on an external build plane answers 409 to the pin
+endpoints, having no tree to read the bases from and nothing to build with
+them. Refresh before a build, not after -- a moved base reaches a challenge
+the next time that challenge is built.
+
 ## What the build path does now
 
 cork asks the Docker API for **BuildKit** explicitly (`version=2`) on every
@@ -30,6 +292,40 @@ Three things then sit on top:
 | Purge after push | the builder's local copy of a build's images is dropped once they are in the registry | `cmgr/purge.go` |
 | Write-once publish | a build is pushed only once it has validated, and a tag already in the registry is never pushed over | `publishImages` and `registryTagExists`, `cmgr/docker.go`, `cmgr/registry.go` |
 
+## Where artifact bundles go
+
+A build's `artifacts.tar.gz` is extracted on the plane that built it and
+stays there. It is written to `CMGR_ARTIFACT_DIR`, in a subdirectory named
+for the schema's `destination:` — exactly that name, with nothing prepended,
+so the directory an operator sees is the destination they wrote in
+`CORK_DESTINATIONS`. A schema with no destination (a single-host deployment,
+or a `--server` run) keeps the artifact directory itself.
+
+That layout is what lets one build plane serve several orchestrators: an
+artifact server watches one directory per destination and publishes each
+under that destination's own prefix, so a challenge's files land where its
+own event's players look for them, and retiring an event is deleting one
+prefix. Nothing about this reaches an orchestrator — a hand-over carries no
+bytes, an orchestrator ignores `CMGR_ARTIFACT_DIR`, and cork serves no
+artifacts at all.
+
+A bundle is removed when its build is destroyed, and it is *searched for*
+rather than computed: `remove-schema` takes a name and never learns a
+destination, and `migrate-schema` reads the destination a schema is moving
+*to*, not the one its bundles were written under. Within one plane's database
+a build id is drawn once, so at most one file answers to the name
+(`removeArtifactBundle`, `cmgr/filesystem.go`). A migration therefore moves a
+bundle into the new destination's directory and takes the old one out.
+
+That uniqueness is a property of one database, not of the directory. A plane
+rebuilt from scratch numbers from 1 again while every destination's directory
+still holds bundles 1..N, so a name is no longer evidence of whose file it is.
+That is why the stray prune touches only the artifact directory itself and why
+a relocation never moves a file out of another destination's directory — and
+why building on a re-derived plane into an artifact directory that still holds
+another schema's live bundles would overwrite them. Recover the whole plane at
+once, or clear that destination's directory first.
+
 The publish order is registry, then artifact archive, then build row: each
 store is written only once the one before it holds the generation, so nothing
 ever names a generation the workers cannot pull; a build that fails
@@ -55,6 +351,47 @@ cover) is to remove it and build again — and "again" needs a trigger, since
 the identity is unchanged and nothing is stale: `--prune-old` on the next
 rebuild of the challenge, or `remove-schema` and `add-schema`, whose fresh
 rows build and push what the registry then lacks.
+
+## When the registry is down
+
+**Re-run the command. There is nothing else to do.**
+
+That is worth stating plainly because the instinct after an outage is to go
+looking for drift to reconcile, and there is none to find. The reason is
+structural: cork can leave a tag that no row names, but never a row naming a
+tag that is not there. A row is written only once the push has succeeded, and
+every hand-over re-asks the registry before recording anything. The
+divergence only ever runs one way, towards garbage.
+
+So what each failure leaves behind:
+
+| | while the registry is down | left behind |
+|---|---|---|
+| resolving identities, and the check before a push | the build fails before anything is built | nothing |
+| the push itself | local images removed; the tags it had pushed are deleted, and those deletes fail too | tags no row names |
+| retiring a tag on destroy or prune | best-effort, warned about, the operation still succeeds | tags no row names |
+| a hand-over's registry check | refused, 500, nothing recorded | nothing |
+| a worker's pull before a launch | 503 with Retry-After | nothing |
+
+Every operation is idempotent, because identity is content-addressed and the
+registry is write-once: a build that failed recorded nothing, a hand-over
+that was refused recorded nothing, and a removal that leaked tags had already
+dropped its rows. Reads are retried a few times over about a second
+(`registryAttempts`) so a dropped connection is not an outage; a registry
+that is really down fails the operation while you are still watching, and
+says so with what to re-run.
+
+The one thing to know about the leaked tags: **they are adopted, not
+rebuilt.** Build the same identity again and cork resolves it against the
+registry, finds the tag, and pulls and re-extracts rather than building —
+which is why a post-outage rebuild is fast. That is safe by construction:
+`validateBuild` runs *before* `publishImages`, so nothing reaches the
+registry without having validated, and the only failure after a push is the
+artifact promotion, which adoption redoes anyway.
+
+What the leak actually costs is registry disk. Nothing here sweeps tags no
+row names (see "Limitations"), so a long outage with a lot of churn is a
+reason to run zot's garbage collection afterwards — hygiene, not repair.
 
 ## Why pinning exists
 

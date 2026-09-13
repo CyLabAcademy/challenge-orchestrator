@@ -23,9 +23,13 @@ const (
 	LOGGING_ENV           string = "CMGR_LOGGING"
 	IFACE_ENV             string = "CMGR_INTERFACE"
 	PORTS_ENV             string = "CMGR_PORTS"
-	DISK_QUOTA_ENV        string = "CMGR_ENABLE_DISK_QUOTAS"
-	PRUNE_AGE_ENV         string = "CMGR_PRUNE_AGE"
-	DB_WAL_ENV            string = "CMGR_DB_WAL"
+	// CONCURRENT_LAUNCHES_ENV was the one setting named only as a literal
+	// where it is read; it is a constant so the list of what a build plane
+	// ignores can name it (orchestratorOnlySettings).
+	CONCURRENT_LAUNCHES_ENV string = "CMGR_CONCURRENT_LAUNCHES"
+	DISK_QUOTA_ENV          string = "CMGR_ENABLE_DISK_QUOTAS"
+	PRUNE_AGE_ENV           string = "CMGR_PRUNE_AGE"
+	DB_WAL_ENV              string = "CMGR_DB_WAL"
 
 	// Worker tunables (see workerTiming in workers.go).
 	WORKER_POLL_INTERVAL_ENV   string = "CMGR_WORKER_POLL_INTERVAL"
@@ -45,11 +49,16 @@ type UnknownIdentifierError struct {
 }
 
 type Manager struct {
-	cli                  *client.Client
-	ctx                  context.Context
-	log                  *logger
-	chalDir              string
-	artifactsDir         string
+	cli          *client.Client
+	ctx          context.Context
+	log          *logger
+	chalDir      string
+	artifactsDir string
+	// artifactNamespaces maps a schema's name to the directory under
+	// artifactsDir its builds' bundles go in, which a build plane fills in
+	// from the destinations its schemas name (SetArtifactNamespaces). Empty
+	// everywhere else, and a schema that is not in it keeps artifactsDir.
+	artifactNamespaces   map[string]string
 	db                   *sqlx.DB
 	dbPath               string
 	challengeDockerfiles map[string][]byte
@@ -96,6 +105,21 @@ type Manager struct {
 	pruneAge      time.Duration
 	localQueue    *daemonQueue // slots of the local daemon (instances with no worker)
 	policy        managerPolicy
+	// externalBuildPlane: images are built elsewhere and handed to this
+	// daemon, which then has no local daemon at all (see buildplane.go).
+	// False, the zero value, is the local build plane there always was.
+	externalBuildPlane bool
+	// buildPlane: this process builds and pushes and serves nothing,
+	// which is what cork-build is (see AsBuildPlane). What a process is,
+	// rather than what its environment holds: nothing reads it from a
+	// variable. Two things follow from it, and both read it directly so
+	// that no second field can come to disagree: a registry is required
+	// (initDocker), since everything it builds is pushed to one; and it
+	// never takes a tag back out of the challenge registry
+	// (retireRegistryTag), since its database is bookkeeping and knows
+	// only what it built, while an orchestrator may still be serving
+	// what these schemas have stopped naming.
+	buildPlane bool
 
 	// Multi-worker state (see workers.go). placementEnabled is only set by
 	// cmgrd; the cmgr CLI leaves it false so CLI-started instances always run
@@ -324,6 +348,18 @@ type Schema struct {
 	Name       string                             `json:"name"        yaml:"name"`
 	FlagFormat string                             `json:"flag_format" yaml:"flag_format"`
 	Challenges map[ChallengeId]BuildSpecification `json:"challenges"  yaml:"challenges"`
+	// Destination names the orchestrator this schema is served by, as a
+	// short name a build plane resolves against its configured
+	// destinations rather than an address (see cork-build). A field and
+	// not a header comment: a schema may be json, which has no comments,
+	// and where an event is served is part of what the schema is.
+	//
+	// Nothing here hashes a schema -- a build's identity is its source,
+	// flag format, base pins and template (contentChecksum) -- so this
+	// changes no build that already exists. It is meaningless to a daemon,
+	// which is told what it serves rather than choosing; an orchestrator
+	// ignores it.
+	Destination string `json:"destination,omitempty" yaml:"destination,omitempty"`
 }
 type BuildSpecification struct {
 	Seeds         []int `json:"seeds"          yaml:"seeds"`

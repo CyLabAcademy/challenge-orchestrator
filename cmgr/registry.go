@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,18 +38,29 @@ func (m *Manager) registryEndpoint() (host, prefix string) {
 // and credentials it pushes and pulls with, so a registry dockerd can push to
 // is one this can ask. A registry that cannot be asked is an error, not
 // "absent": pushing on a guess is exactly what the guard exists to prevent.
+// Retried while it fails without an answer, as the direct exchanges are: a
+// build resolves every image against the registry before it builds anything
+// and pushes through this, so a blip here fails a build rather than a
+// challenge, and on the same odds (see registryAttempts).
 func (m *Manager) registryTagExists(imageName string) (bool, error) {
-	ctx, cancel := m.controlCtx()
-	defer cancel()
-	_, err := m.cli.DistributionInspect(ctx, imageName, client.DistributionInspectOptions{EncodedRegistryAuth: m.authString})
-	switch {
-	case err == nil:
-		return true, nil
-	case errdefs.IsNotFound(err) || manifestUnknown(err):
-		return false, nil
-	default:
-		return false, err
-	}
+	var present bool
+	err := m.retryRegistry(fmt.Sprintf("asking the daemon for %s in the registry", imageName), func() error {
+		ctx, cancel := m.controlCtx()
+		defer cancel()
+		_, err := m.cli.DistributionInspect(ctx, imageName, client.DistributionInspectOptions{EncodedRegistryAuth: m.authString})
+		switch {
+		case err == nil:
+			present = true
+			return nil
+		case errdefs.IsNotFound(err) || manifestUnknown(err):
+			// An answer, and the one that means "not pushed yet".
+			present = false
+			return nil
+		default:
+			return err
+		}
+	})
+	return present, err
 }
 
 // manifestUnknown recognizes the registry's own "no such manifest" answers
@@ -61,6 +73,138 @@ func manifestUnknown(err error) bool {
 		}
 	}
 	return false
+}
+
+// registryTagPresent asks the registry itself whether imageName's tag names
+// a manifest, over the daemon's own client (registryHTTPClient) rather than
+// the local docker daemon registryTagExists goes through: it is the
+// question a daemon with no docker daemon asks before it records a build
+// someone else pushed (issue #18). 200 is present and 404 absent; anything
+// else, a registry that cannot be reached included, is an error, since
+// recording a build on a guess is what the check exists to prevent.
+// Retried while it fails without an answer: this is asked once per image of
+// every build of every hand-over, and one that goes unanswered refuses the
+// whole challenge (see registryAttempts).
+func (m *Manager) registryTagPresent(imageName string) (bool, error) {
+	var code int
+	var status string
+	err := m.retryRegistry(fmt.Sprintf("asking the registry for %s", imageName), func() error {
+		var err error
+		code, status, err = m.registryManifestStatus(http.MethodHead, imageName)
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+
+	switch code {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("registry lookup of %s returned %s", imageName, status)
+	}
+}
+
+const (
+	// registryAttempts is how many times a registry exchange that failed
+	// without an answer is tried. A hand-over asks the registry once per
+	// image and an event is thousands of images, so at those odds a blip
+	// that is not retried is not unlikely but routine -- and it refuses a
+	// whole challenge, since a question that cannot be asked is an error
+	// rather than "absent" (see registryTagPresent).
+	//
+	// Three, because this is for a connection that dropped or a registry
+	// restarting, not for one that is down: a registry that is really gone
+	// should fail the operation while an operator is still watching, not
+	// minutes later.
+	registryAttempts = 3
+	// registryRetryDelay is the wait before the second attempt, doubled for
+	// the third. Short: the failures this covers are a reset connection or a
+	// process coming back, and the request timeout already bounds the slow
+	// case.
+	registryRetryDelay = 500 * time.Millisecond
+)
+
+// registryRecovery is what an operator does about a registry that could not
+// be reached, appended to the errors that abort an operation over it.
+//
+// It says the same thing for every one of them, because the same thing is
+// true of every one of them: an operation that could not reach the registry
+// recorded nothing, and re-running it once the registry answers is the whole
+// recovery. Nothing drifts while the registry is down -- cork can leave a tag
+// no row names, never a row naming a tag that is not there -- so there is no
+// state to reconcile afterwards and no repair step to look up. Saying so at
+// the point of failure is cheaper than the operator finding out.
+const registryRecovery = "nothing was recorded. When the registry is up again, retry the same command."
+
+// registryLeak is the other half, for the deletes that are best-effort: the
+// operation itself succeeded and re-running it would do nothing, so the
+// advice has to be the opposite one. What is left is a tag no row names,
+// which nothing will serve and the registry's own garbage collection
+// reclaims. An operator told only "could not remove" reasonably wonders
+// whether the destroy took.
+const registryLeak = "nothing to do. The tag is left in the registry for its garbage collection to reclaim."
+
+// retryRegistry runs a registry exchange again while it fails without an
+// answer, and returns what the last attempt gave.
+//
+// Only a failure to get an answer at all is retried, which is why exchange
+// returns an error rather than a status: a status the registry returned is an
+// answer -- 404 included, which is what "not present" is -- so an exchange
+// that got one reports nil and keeps its own result. The context being done
+// is not retried either: the process is shutting down.
+func (m *Manager) retryRegistry(what string, exchange func() error) error {
+	delay := registryRetryDelay
+	for attempt := 1; ; attempt++ {
+		err := exchange()
+		if err == nil || attempt == registryAttempts || m.ctx.Err() != nil {
+			return err
+		}
+		m.log.warnf("%s failed (attempt %d of %d): %s; retrying in %s",
+			what, attempt, registryAttempts, err, delay)
+		select {
+		case <-time.After(delay):
+		case <-m.ctx.Done():
+			return err
+		}
+		delay *= 2
+	}
+}
+
+// registryManifestStatus makes one distribution API call against the
+// manifest imageName's tag names, over the daemon's own client, and
+// answers with the status the registry gave: the exchange a HEAD
+// (registryTagPresent) and a DELETE (registryDeleteTag) share. The Accept
+// header names every manifest type a push can leave behind, so a registry
+// that filters by it does not answer 404 for a manifest it holds.
+//
+// One call, never retried here. Whether a failure is worth asking again is
+// the caller's to decide and the two callers differ: a HEAD that fails
+// refuses a hand-over and is retried, while a DELETE that fails leaks a tag
+// and is not (see registryDeleteTag).
+func (m *Manager) registryManifestStatus(method, imageName string) (int, string, error) {
+	httpClient, err := m.registryHTTPClient()
+	if err != nil {
+		return 0, "", err
+	}
+	req, err := m.registryManifestRequest(method, imageName)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Accept", strings.Join([]string{
+		"application/vnd.oci.image.manifest.v1+json",
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+	}, ", "))
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	resp.Body.Close()
+	return resp.StatusCode, resp.Status, nil
 }
 
 // registryHTTPClient is an HTTP client trusting and authenticating with the
@@ -142,8 +286,21 @@ func (m *Manager) registryManifestRequest(method, imageName string) (*http.Reque
 		repo = prefix + "/" + repo
 	}
 
-	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", host, repo, tag)
-	req, err := http.NewRequestWithContext(m.ctx, method, url, nil)
+	// Built structurally rather than with Sprintf: repo and tag carry a
+	// challenge id and a host name, which on an external build plane arrive
+	// from the network. A '#' or '?' in either would end the path and re-aim
+	// the request at another repository, and a '..' would climb out of /v2/
+	// entirely -- with this daemon's registry credentials and client
+	// certificate on it. url.URL escapes Path when it writes the request, and
+	// Opaque is not cleaned, so the segments stay the segments they were.
+	// checkHandOver refuses such an id outright (validChallengeId); this is
+	// the second lock, on the one line that turns a name into a request.
+	ref := &url.URL{
+		Scheme: "https",
+		Host:   host,
+		Path:   "/v2/" + repo + "/manifests/" + tag,
+	}
+	req, err := http.NewRequestWithContext(m.ctx, method, ref.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +308,21 @@ func (m *Manager) registryManifestRequest(method, imageName string) (*http.Reque
 		req.SetBasicAuth(m.registryUser, m.registryToken)
 	}
 	return req, nil
+}
+
+// retireRegistryTag takes a tag out of the challenge registry now that no row
+// this process can see names its content any more. Only an orchestrator may:
+// see AsBuildPlane for why a build plane's database is not the one that gets
+// to decide, and registryDeleteTag for the one delete that is not a
+// retirement (a build taking back what it had just pushed, which nothing else
+// has been told about yet).
+//
+// Best-effort by contract, as registryDeleteTag is.
+func (m *Manager) retireRegistryTag(imageName string) error {
+	if m.challengeRegistry == "" || m.buildPlane {
+		return nil
+	}
+	return m.registryDeleteTag(imageName)
 }
 
 // registryDeleteTag removes a tag from the challenge registry so pruned or
@@ -166,31 +338,29 @@ func (m *Manager) registryManifestRequest(method, imageName string) (*http.Reque
 //
 // Best-effort by contract: callers treat any error as "tag leaked in the
 // registry" (recoverable) and must not fail the surrounding operation.
+//
+// One attempt, deliberately, where the reads retry. A failure here costs
+// registry disk and a later garbage collection; a retry costs the backoff on
+// every image of every build being destroyed, while an operator waits for a
+// teardown. Clearing a schema of fifty builds against a registry that is
+// down would spend minutes asking again for deletes whose whole contract is
+// that they may fail.
 func (m *Manager) registryDeleteTag(imageName string) error {
-	httpClient, err := m.registryHTTPClient()
+	code, status, err := m.registryManifestStatus(http.MethodDelete, imageName)
 	if err != nil {
 		return err
 	}
-	req, err := m.registryManifestRequest(http.MethodDelete, imageName)
-	if err != nil {
-		return err
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
 
-	switch {
-	case resp.StatusCode == http.StatusAccepted:
+	switch code {
+	case http.StatusAccepted:
 		return nil
-	case resp.StatusCode == http.StatusNotFound:
+	case http.StatusNotFound:
 		// Already gone — e.g. a shared tuple pruned via another row, or a
 		// tag that was never pushed (builder images). Not an error.
 		return nil
-	case resp.StatusCode == http.StatusMethodNotAllowed:
+	case http.StatusMethodNotAllowed:
 		return fmt.Errorf("registry %s does not accept tag deletes (405); tag %s leaked", m.challengeRegistry, imageName)
 	default:
-		return fmt.Errorf("registry delete of %s returned %s", imageName, resp.Status)
+		return fmt.Errorf("registry delete of %s returned %s", imageName, status)
 	}
 }
