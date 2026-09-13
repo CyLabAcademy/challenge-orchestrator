@@ -97,7 +97,9 @@ Relevant environment variables:
   The daemon lists the CMGR_ names it finds at startup; they go away two
   minor releases after the rename.
 
-  CORK_DB - path to cmgr's database file (defaults to 'cmgr.db')
+  CORK_DB - path to cork's database file (defaults to 'cork.db'; a run
+      before the rename that set nothing made 'cmgr.db' instead, and
+      nothing moves it, so point CORK_DB at it or start afresh)
 
   CORK_DIR - directory containing all challenges (defaults to '.')
 

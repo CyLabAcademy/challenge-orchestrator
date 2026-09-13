@@ -496,7 +496,7 @@ func checksumIgnore(name string) bool {
 		name == "README.md" ||
 		name == "problem.md" ||
 		name == "solver" ||
-		name == "cmgr.db"
+		isDatabaseFile(name)
 }
 
 func contextIgnore(name string) bool {
@@ -505,7 +505,17 @@ func contextIgnore(name string) bool {
 		name == "README.md" ||
 		name == "problem.md" ||
 		name == "solver" ||
-		name == "cmgr.db"
+		isDatabaseFile(name)
+}
+
+// isDatabaseFile reports the default name of the database, under which it
+// commonly sits in the challenge directory itself -- the ansible role puts it
+// at <challenge_dir>/cmgr.db -- and so has to stay out of a challenge's
+// checksum and build context. Both names: cmgr.db is what every database
+// standing today is called, whether by an explicit CORK_DB or by the default
+// this release changed.
+func isDatabaseFile(name string) bool {
+	return name == "cork.db" || name == "cmgr.db"
 }
 
 func (m *Manager) createBuildContext(cm *ChallengeMetadata, dockerfile []byte) (string, error) {

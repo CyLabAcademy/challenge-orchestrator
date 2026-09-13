@@ -915,7 +915,7 @@ if (( FULL )); then
   # names (compose.yaml), so the shipped binary is seen honoring both.
   CMGR_DIR=/challenges \
   CMGR_ARTIFACT_DIR="$fresh/var/lib/cork/artifacts" \
-  CMGR_DB="$fresh/var/lib/cork/db/cmgr.db" \
+  CMGR_DB="$fresh/var/lib/cork/db/cork.db" \
   CMGR_NOT_A_SETTING=1 \
   DOCKER_HOST="$fresh_docker" \
     corkd --port 4299 >"$fresh/corkd.log" 2>&1 &
@@ -944,8 +944,8 @@ if (( FULL )); then
     fail "the throwaway corkd warned about CMGR_NOT_A_SETTING, which is no setting of cork's: the startup warning must speak only about settings it reads (cork/env.go legacySettingsInUse): $(tr '\n' ' ' <"$fresh/corkd.log" | tail -c 400)"
   [[ -d "$fresh/var/lib/cork/artifacts" ]] ||
     fail "the throwaway corkd answered without creating CORK_ARTIFACT_DIR ($fresh/var/lib/cork/artifacts): on a fresh box every artifact bundle would fail until someone made it by hand (cork/filesystem.go setDirectories)"
-  [[ -f "$fresh/var/lib/cork/db/cmgr.db" ]] ||
-    fail "the throwaway corkd left no database at $fresh/var/lib/cork/db/cmgr.db: sqlite creates the file but never its directory, so initDatabase must MkdirAll filepath.Dir(CORK_DB) (cork/database.go)"
+  [[ -f "$fresh/var/lib/cork/db/cork.db" ]] ||
+    fail "the throwaway corkd left no database at $fresh/var/lib/cork/db/cork.db: sqlite creates the file but never its directory, so initDatabase must MkdirAll filepath.Dir(CORK_DB) (cork/database.go)"
   kill "$FRESH_CORKD" >/dev/null 2>&1 || true
   wait "$FRESH_CORKD" 2>/dev/null || true
   FRESH_CORKD=""
@@ -959,7 +959,7 @@ if (( FULL )); then
   rc=0
   CORK_DIR="$fresh/nope" \
   CORK_ARTIFACT_DIR="$fresh/a2" \
-  CORK_DB="$fresh/d2/cmgr.db" \
+  CORK_DB="$fresh/d2/cork.db" \
   DOCKER_HOST="$fresh_docker" \
     timeout 30 corkd --port 4298 >"$fresh/refused.log" 2>&1 || rc=$?
   refuse_took=$(( $(date +%s) - t ))
@@ -992,7 +992,7 @@ if (( FULL )); then
   CORK_DIR="$fresh/nope" \
   CORK_REGISTRY="$E2E_REGISTRY" \
   CORK_ARTIFACT_DIR="$fresh/a3" \
-  CORK_DB="$fresh/d3/cmgr.db" \
+  CORK_DB="$fresh/d3/cork.db" \
     corkd --port 4297 >"$fresh/external.log" 2>&1 &
   FRESH_CORKD=$!
   retry 30 "the external-build-plane corkd to answer on :4297" fresh_answers "$FRESH_CORKD" 4297 "$fresh/external.log" "the throwaway corkd on an external build plane"
@@ -1048,14 +1048,14 @@ if (( FULL )); then
   }
   # Without a registry it must not start at all: the workers pull every
   # image from the registry, and an external build plane has no other copy.
-  CORK_BUILD_PLANE=external CORK_ARTIFACT_DIR="$fresh/a4" CORK_DB="$fresh/d4/cmgr.db" \
+  CORK_BUILD_PLANE=external CORK_ARTIFACT_DIR="$fresh/a4" CORK_DB="$fresh/d4/cork.db" \
     refuses_to_start "on an external build plane with no CORK_REGISTRY (nothing could ever be launched from it)" \
       4296 "$fresh/noregistry.log" "CORK_REGISTRY is required on an external build plane"
   # Nor with a registry it has no client material for: destroy and prune
   # untag in the registry alone on this plane, and a client that fails per
   # tag would only ever be a warning after the fact.
   CORK_BUILD_PLANE=external CORK_REGISTRY="$E2E_REGISTRY" CORK_REGISTRY_CERT_DIR="$fresh/nocerts" \
-  CORK_ARTIFACT_DIR="$fresh/a5" CORK_DB="$fresh/d5/cmgr.db" \
+  CORK_ARTIFACT_DIR="$fresh/a5" CORK_DB="$fresh/d5/cork.db" \
     refuses_to_start "on an external build plane with no registry client material (every untag would fail silently)" \
       4295 "$fresh/nocerts.log" "the registry client could not be built"
   rm -rf "$fresh"
@@ -1331,7 +1331,7 @@ if (( FULL )); then
   CORK_BUILD_PLANE=external \
   CORK_REGISTRY="$E2E_REGISTRY" \
   CORK_ARTIFACT_DIR="$HO/artifacts" \
-  CORK_DB="$HO/db/cmgr.db" \
+  CORK_DB="$HO/db/cork.db" \
     corkd --port 4294 >"$HO/corkd.log" 2>&1 &
   HO_CORKD=$! # the EXIT trap kills it if anything below fails
   HO_SERVER=http://127.0.0.1:4294
@@ -1520,7 +1520,7 @@ EOF
   CORK_BUILD_PLANE=external \
   CORK_REGISTRY="$E2E_REGISTRY" \
   CORK_ARTIFACT_DIR="$CB/artifacts" \
-  CORK_DB="$CB/db/cmgr.db" \
+  CORK_DB="$CB/db/cork.db" \
     corkd --port 4293 >"$CB/corkd.log" 2>&1 &
   CB_CORKD=$! # the EXIT trap kills it if anything below fails
   CB_SERVER=http://127.0.0.1:4293
@@ -1705,7 +1705,7 @@ if (( FULL )); then
     CORK_BUILD_PLANE=external \
     CORK_REGISTRY="$E2E_REGISTRY" \
     CORK_ARTIFACT_DIR="$RT/artifacts-$port" \
-    CORK_DB="$RT/db-$port/cmgr.db" \
+    CORK_DB="$RT/db-$port/cork.db" \
       corkd --port "$port" >"$RT/corkd-$port.log" 2>&1 &
     case $port in
       4290) RT_A_CORKD=$! ;;
@@ -5919,7 +5919,7 @@ if (( FULL )); then
   CORK_BUILD_PLANE=external \
   CORK_REGISTRY="$E2E_REGISTRY" \
   CORK_ARTIFACT_DIR="$MH/artifacts" \
-  CORK_DB="$MH/db/cmgr.db" \
+  CORK_DB="$MH/db/cork.db" \
     corkd --port 4292 >"$MH/corkd.log" 2>&1 &
   MH_CORKD=$! # the EXIT trap kills it if anything below fails
   retry 30 "the multi-host hand-over corkd to answer on :4292" fresh_answers "$MH_CORKD" 4292 "$MH/corkd.log" "the throwaway corkd taking the multi-host hand-over"
@@ -6148,7 +6148,7 @@ if (( FULL )); then
   # This is the one step that reaches behind the API: nothing corkd exposes
   # can hold its write lock, so it is held from outside with sqlite3 against
   # the same file, which is why cork-data is mounted into this container.
-  CORKD_DB=/var/lib/cork/cmgr.db
+  CORKD_DB=/var/lib/cork/cork.db
   # Can another writer take the lock right now? sqlite3's CLI has no busy
   # timeout of its own, so BEGIN IMMEDIATE either takes it at once or says it
   # is locked.

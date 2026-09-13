@@ -36,7 +36,7 @@ services:
       # appends its own --host flags when it is given none.
       DOCKERD_HOST: "unix:///var/run/docker.sock"
       CORK_DIR: /challenges
-      CORK_DB: /var/lib/cork/cmgr.db
+      CORK_DB: /var/lib/cork/cork.db
       CORK_ARTIFACT_DIR: /var/lib/cork/artifacts
       CORK_PORTS: "21000-21029"
       CORK_PRUNE_AGE: 24h

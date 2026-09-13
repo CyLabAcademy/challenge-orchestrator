@@ -220,7 +220,7 @@ const schemaQuery string = `
 func (m *Manager) initDatabase() error {
 	dbPath, isSet := LookupEnv(DB_ENV)
 	if !isSet {
-		dbPath = "cmgr.db"
+		dbPath = "cork.db"
 	}
 
 	// SQLite creates the file but not its directory; a fresh box points

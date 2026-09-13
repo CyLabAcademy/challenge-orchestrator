@@ -67,7 +67,8 @@ func TestChecksumIgnore(t *testing.T) {
 		{"README.md", true},
 		{"problem.md", true},
 		{"solver", true},
-		{"cmgr.db", true},
+		{"cmgr.db", true}, // the name of every database standing today
+		{"cork.db", true},
 		{"Dockerfile", false},
 		{"Makefile", false},
 		{"main.c", false},
@@ -94,7 +95,8 @@ func TestContextIgnore(t *testing.T) {
 		{"README.md", true},
 		{"problem.md", true},
 		{"solver", true},
-		{"cmgr.db", true},
+		{"cmgr.db", true}, // the name of every database standing today
+		{"cork.db", true},
 		{"Dockerfile", false},
 		{"Makefile", false},
 		{"main.c", false},

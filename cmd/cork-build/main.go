@@ -325,7 +325,8 @@ Environment, all as corkd reads them (this is corkd's build path):
       registry or the hand-over is refused for images the orchestrator
       cannot find
 
-  CORK_DB - this builder's own database (defaults to 'cmgr.db'). Keep it
+  CORK_DB - this builder's own database (defaults to 'cork.db', which was
+      'cmgr.db' before the rename; nothing moves one). Keep it
       for as long as any schema it built is being served: an orchestrator
       records each build under the id this plane gave it, because that is
       the id the bundle is named by, so a plane rebuilt from scratch draws

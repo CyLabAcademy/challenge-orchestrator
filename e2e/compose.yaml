@@ -136,7 +136,7 @@ services:
       DOCKER_CERT_PATH: /root/.docker_certs
       CORK_REGISTRY: zot.internal
       CORK_DIR: /challenges
-      CORK_DB: /var/lib/cork/cmgr.db
+      CORK_DB: /var/lib/cork/cork.db
       CORK_ARTIFACT_DIR: /var/lib/cork/artifacts
       # Base image digest pins, at the corpus root as in production, where the
       # file is committed to the challenge repository and versioned with the

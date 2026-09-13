@@ -689,7 +689,7 @@ func TestCheckExternalBuildPlane(t *testing.T) {
 // than stamping checksums whose tags exist nowhere, and refuses to start on
 // them; the same database migrates as before on a local build plane.
 func TestInitDatabaseExternalSkipsChecksumBackfill(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "cmgr.db")
+	dbPath := filepath.Join(t.TempDir(), "cork.db")
 	t.Setenv(DB_ENV, dbPath)
 
 	seed := &Manager{log: newLogger(DISABLED)}
