@@ -223,11 +223,12 @@ func schemaGuard(schemaName string, known []string, wantKnown bool) error {
 	built := slices.Contains(known, schemaName)
 	switch {
 	case wantKnown && !built:
-		// Worth naming the database: it is bookkeeping and may be thrown
-		// away, so a plane rebuilt since the schema was deployed has no row
-		// for a schema an orchestrator is serving right now. `build` is the
-		// way through that, and it re-derives rather than rebuilding.
-		return fmt.Errorf("this build plane has built nothing for schema '%s', so there is no definition to converge to: add-schema is the first one, and build does either -- and if this plane's database was rebuilt since, build re-derives what the registry holds but under new build ids, which the orchestrator serving this schema will refuse, so release it there first", schemaName)
+		// Worth naming the database: a plane rebuilt since the schema was
+		// deployed has no row for a schema an orchestrator is serving right
+		// now. `build` re-derives rather than rebuilding -- but under new
+		// build ids, which an orchestrator adopts and so refuses when they
+		// disagree with what it holds, hence the release.
+		return fmt.Errorf("this build plane has built nothing for schema '%s', so there is no definition to converge to: add-schema is the first one, and build does either -- and if this plane's database was rebuilt since, build re-derives what the registry holds but under new build ids, which the orchestrator serving this schema will refuse, so release the schemas that orchestrator holds from this plane first (BUILDER.md has the whole recovery)", schemaName)
 	case !wantKnown && built:
 		return fmt.Errorf("this build plane has already built schema '%s': update-schema converges it to a new definition, and build does either", schemaName)
 	}

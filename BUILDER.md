@@ -216,13 +216,25 @@ bundle is named by and the only id the platform has to address those files
 with. So a hand-over of a re-derived build is refused, naming the id it is
 already on record under.
 
-Keep this database for as long as any schema it built is being served. If it
-is lost anyway, recovery is `remove-schema` on the orchestrator and then
-`build` — which is destructive on both sides and rebuilds rather than
-adopting, because remove-schema retires the tags the adoption would have
-used. Releasing without retiring (`DELETE /schemas/<name>?retire=false`, the
-call `migrate-schema` makes) is the cheaper path where the situation allows
-it: the tags survive, so the rebuild adopts them and the new ids stick.
+Keep this database for as long as any schema it built is being served.
+
+If it is lost anyway, recover the whole plane rather than one schema. A fresh
+database numbers from 1, so the ids it draws are the low ones — which on an
+orchestrator serving several schemas from this plane are held by whichever
+schema was handed over first. Releasing only the schema being rebuilt frees
+the wrong ids: the hand-over is refused naming the schema that holds them
+(nothing is written, and no tag is touched), and the way out is releasing
+that one too. So release every schema that orchestrator holds from this
+plane, then build them together.
+
+Release without retiring where you can — `DELETE /schemas/<name>?retire=false`,
+the call `migrate-schema` makes — because the tags then survive and the
+rebuild adopts them instead of building and pushing again. `remove-schema`
+retires, which is correct for a removal and expensive here.
+
+And clear that destination's artifact directory, or move it aside, before
+building into it. Bundles are named by build id, so a plane numbering from 1
+writes over the bundles of whatever already holds ids 1..N there.
 
 Which is why it only ever pushes to the registry. Retiring a tag -- taking
 out a generation nothing needs any more -- means knowing every row that still
@@ -300,10 +312,19 @@ artifacts at all.
 A bundle is removed when its build is destroyed, and it is *searched for*
 rather than computed: `remove-schema` takes a name and never learns a
 destination, and `migrate-schema` reads the destination a schema is moving
-*to*, not the one its bundles were written under. Build ids are unique to a
-plane, so at most one file can answer to the name (`removeArtifactBundle`,
-`cmgr/filesystem.go`). A migration therefore moves a bundle into the new
-destination's directory and takes the old one out.
+*to*, not the one its bundles were written under. Within one plane's database
+a build id is drawn once, so at most one file answers to the name
+(`removeArtifactBundle`, `cmgr/filesystem.go`). A migration therefore moves a
+bundle into the new destination's directory and takes the old one out.
+
+That uniqueness is a property of one database, not of the directory. A plane
+rebuilt from scratch numbers from 1 again while every destination's directory
+still holds bundles 1..N, so a name is no longer evidence of whose file it is.
+That is why the stray prune touches only the artifact directory itself and why
+a relocation never moves a file out of another destination's directory — and
+why building on a re-derived plane into an artifact directory that still holds
+another schema's live bundles would overwrite them. Recover the whole plane at
+once, or clear that destination's directory first.
 
 The publish order is registry, then artifact archive, then build row: each
 store is written only once the one before it holds the generation, so nothing

@@ -12,9 +12,15 @@
 //
 // Its database is bookkeeping, not a source of truth: the orchestrator's is
 // the one that matters, and the registry is where the images this made are
-// found. Keeping it between runs only makes them faster (a challenge whose
-// source has not moved is not rebuilt); losing it costs a re-derivation, in
+// found. Keeping it between runs makes them faster (a challenge whose source
+// has not moved is not rebuilt), and losing it costs a re-derivation, in
 // which every image already in the registry is adopted rather than built.
+//
+// It is not disposable, though, while anything it built is being served. An
+// orchestrator records each build under the id this plane gave it, because
+// that is the id the artifact bundle is named by, and a re-derived plane
+// draws new ones -- so its hand-over is refused. See BUILDER.md for what
+// recovering from the loss of this database actually takes.
 package main
 
 import (
@@ -316,8 +322,8 @@ Environment, all as cmgrd reads them (this is cmgrd's build path):
       records each build under the id this plane gave it, because that is
       the id the bundle is named by, so a plane rebuilt from scratch draws
       new ids and its hand-over is refused. Recovering from losing it means
-      remove-schema on the orchestrator and then build, which rebuilds and
-      re-pushes rather than adopting
+      releasing the schemas that orchestrator holds from this plane and
+      rebuilding them together; BUILDER.md has the whole of it
 
   CMGR_ARTIFACT_DIR - where built artifact bundles are kept until they are
       handed over (defaults to '.')

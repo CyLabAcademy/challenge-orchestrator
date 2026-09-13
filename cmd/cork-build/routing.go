@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
@@ -157,10 +158,25 @@ func misroutedSchemas(routes []route, dests *destinations) []string {
 		return nil
 	}
 	problems := []string{}
-	// One answer per destination per run. A destination that could not be
-	// reached is reported once rather than once per schema, and one that was
-	// reached is not asked again.
-	asked := map[string]error{}
+	// Destinations that could not be reached, so that one dead orchestrator
+	// costs one timeout for the whole run rather than one per schema. Only
+	// failures are worth carrying: "does this destination serve schema X" is
+	// a different question for every schema, so a destination that answered
+	// is asked again for the next one -- what is cached is that it cannot
+	// answer at all.
+	unreachable := map[string]error{}
+	// ask puts the failure in that map so that every later schema reuses it.
+	ask := func(name, address, schema string) (bool, error) {
+		if err, dead := unreachable[name]; dead {
+			return false, err
+		}
+		has, err := servesSchema(address, schema)
+		if err != nil {
+			unreachable[name] = err
+			return false, err
+		}
+		return has, nil
+	}
 	for _, r := range routes {
 		if r.name == serverRouteName {
 			continue
@@ -175,7 +191,7 @@ func misroutedSchemas(routes []route, dests *destinations) []string {
 			// the state this guard refuses needs TWO orchestrators serving
 			// one schema, and this one demonstrably serves it.
 			if address, ok := dests.byName[r.name]; ok {
-				has, err := servesSchema(address, schema.Name)
+				has, err := ask(r.name, address, schema.Name)
 				if err != nil {
 					problems = append(problems, fmt.Sprintf(
 						"could not ask %s (%s), the destination schema '%s' names, whether it already serves it: %s", r.name, address, schema.Name, err))
@@ -188,7 +204,7 @@ func misroutedSchemas(routes []route, dests *destinations) []string {
 			// It is not served where it is going, so somewhere else may be
 			// serving it, and every other destination has to answer before
 			// this run can be sure it is not about to make two.
-			where, err := schemaServedElsewhere(schema.Name, r.name, dests, asked)
+			where, err := schemaServedElsewhere(schema.Name, r.name, dests, ask)
 			if err != nil {
 				problems = append(problems, fmt.Sprintf(
 					"could not check whether schema '%s' is already served elsewhere, and handing it over without knowing could have two orchestrators serve one tag (--server deploys without this check): %s", schema.Name, err))
@@ -204,24 +220,24 @@ func misroutedSchemas(routes []route, dests *destinations) []string {
 }
 
 // schemaServedElsewhere names the destination other than `routedTo` serving
-// this schema, if any. `asked` carries each destination's outcome across the
-// whole run so that an unreachable one costs one timeout rather than one per
-// schema.
-func schemaServedElsewhere(schema, routedTo string, dests *destinations, asked map[string]error) (string, error) {
-	for name, address := range dests.byName {
-		if name == routedTo {
-			continue
+// this schema, if any. `ask` is the caller's asker, which remembers which
+// destinations could not be reached so that a dead one costs one timeout for
+// the whole run.
+func schemaServedElsewhere(schema, routedTo string, dests *destinations, ask func(name, address, schema string) (bool, error)) (string, error) {
+	// Sorted so that which destination a run blames is the same every time:
+	// ranging a map would report whichever dead host came up first.
+	names := make([]string, 0, len(dests.byName))
+	for name := range dests.byName {
+		if name != routedTo {
+			names = append(names, name)
 		}
-		if err, seen := asked[name]; seen && err != nil {
-			return "", err
-		}
-		has, err := servesSchema(address, schema)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		has, err := ask(name, dests.byName[name], schema)
 		if err != nil {
-			wrapped := fmt.Errorf("asking %s (%s): %w", name, address, err)
-			asked[name] = wrapped
-			return "", wrapped
+			return "", fmt.Errorf("asking %s (%s): %w", name, dests.byName[name], err)
 		}
-		asked[name] = nil
 		if has {
 			return name, nil
 		}

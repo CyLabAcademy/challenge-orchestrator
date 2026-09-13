@@ -1,7 +1,9 @@
 package main
 
 import (
+	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
@@ -261,9 +263,30 @@ func TestAnUnreachableNeighbourStillRefusesAnUnknownSchema(t *testing.T) {
 // cost five timeouts before any work started.
 func TestAnUnreachableNeighbourIsAskedOncePerRun(t *testing.T) {
 	event, _ := orchestratorServing(t)
+	// A neighbour that counts how often it is dialled and refuses every
+	// time. Counting is the whole point: an assertion on the problems alone
+	// passes just as happily with no caching at all, which is what three
+	// reviewers said about the version of this test that did that.
+	var dialled atomic.Int32
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			dialled.Add(1)
+			conn.Close()
+		}
+	}()
+
 	dests := &destinations{byName: map[string]string{
 		"event":   event,
-		"library": closedAddress(t),
+		"library": "http://" + listener.Addr().String(),
 	}}
 	routes := []route{{name: "event", address: event, schemas: []*cmgr.Schema{
 		{Name: "one"}, {Name: "two"}, {Name: "three"},
@@ -273,11 +296,14 @@ func TestAnUnreachableNeighbourIsAskedOncePerRun(t *testing.T) {
 	if len(problems) != 3 {
 		t.Errorf("got %d problem(s), want one per schema: %v", len(problems), problems)
 	}
-	// Each schema is reported, but the dead host answered for only the first:
-	// the rest reuse the recorded failure.
 	for _, p := range problems {
 		if !strings.Contains(p, "already served elsewhere") {
 			t.Errorf("unexpected problem text: %s", p)
 		}
+	}
+	// Every schema is reported, but the dead host was dialled once: the rest
+	// reuse the recorded failure. Without the cache this is 3.
+	if got := dialled.Load(); got != 1 {
+		t.Errorf("the unreachable destination was dialled %d times for 3 schemas, want 1: a dead host costs one timeout per run, not per schema", got)
 	}
 }

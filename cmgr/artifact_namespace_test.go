@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -552,15 +553,64 @@ func TestRelocateDoesNotRenameAServedNameAcross(t *testing.T) {
 	if os.SameFile(mustStat(t, witness), mustStat(t, to)) {
 		t.Error("the bundle was renamed across directories rather than copied: a watcher on the artifact directory is handed the source path, which no longer exists")
 	}
-	// And nothing staged is left behind under a name anything would serve.
+	// Exactly the bundle and the namespace marker: nothing staged left
+	// behind, and nothing else invented. Asserted as the whole directory
+	// listing rather than as "no .relocating file", which passes just as
+	// happily when there was never any staging at all.
 	entries, err := os.ReadDir(filepath.Join(base, "library"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	names := []string{}
 	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".relocating") {
-			t.Errorf("a staging file was left at %s", entry.Name())
-		}
+		names = append(names, entry.Name())
+	}
+	slices.Sort(names)
+	want := []string{artifactNamespaceMarker, "4.tar.gz"}
+	slices.Sort(want)
+	if !slices.Equal(names, want) {
+		t.Errorf("the destination holds %v, want %v", names, want)
+	}
+}
+
+// The staging step itself: a bundle only ever appears under its served name
+// by a rename within its own directory, so nothing can read a half-written
+// file under a name it would publish. Asserted by making the destination
+// read-only after the copy would have started, which leaves the staged file
+// undone and must leave no partial "<id>.tar.gz" behind.
+func TestRelocateLeavesNoPartialUnderAServedName(t *testing.T) {
+	m := setupTestManager(t)
+	m.log = captureLog(&bytes.Buffer{})
+	base := t.TempDir()
+	m.artifactsDir = base
+	seedBuildRows(t, m, "spring", 4)
+	if err := m.SetArtifactNamespaces(map[string]string{"spring": "library"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "4.tar.gz"), []byte("the bundle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A directory entry in the way of the staging name, which no file
+	// operation can overwrite: the copy fails before anything is renamed.
+	staged := filepath.Join(base, "library", ".4.tar.gz.relocating")
+	if err := os.Mkdir(staged, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	moved, err := m.RelocateArtifactBundles("spring")
+	if err == nil {
+		t.Fatal("a relocation that could not stage its copy reported success")
+	}
+	if moved != 0 {
+		t.Errorf("reported %d moved", moved)
+	}
+	if _, err := os.Stat(filepath.Join(base, "library", "4.tar.gz")); !os.IsNotExist(err) {
+		t.Errorf("a bundle appeared under its served name although the copy failed: %v", err)
+	}
+	// And the original is still there, so nothing was lost.
+	if content, err := os.ReadFile(filepath.Join(base, "4.tar.gz")); err != nil || string(content) != "the bundle" {
+		t.Errorf("the source bundle was disturbed by a failed relocation: %v %q", err, content)
 	}
 }
 
