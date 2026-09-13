@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"os"
 	"time"
 
 	"github.com/CyLabAcademy/challenge-orchestrator/cmgr/dockerfiles"
@@ -37,6 +36,7 @@ func NewManager(logLevel LogLevel, options ...ManagerOption) *Manager {
 	}
 
 	mgr.log.infof("version: %s", Version())
+	mgr.warnLegacyEnv()
 
 	// Before the policy, the directories, the pins and docker: on an
 	// external build plane each of those skips what only a local one reads,
@@ -77,7 +77,7 @@ func NewManager(logLevel LogLevel, options ...ManagerOption) *Manager {
 	}
 
 	mgr.pruneInterval = 1 * time.Minute
-	pruneAgeStr, isSet := os.LookupEnv(PRUNE_AGE_ENV)
+	pruneAgeStr, isSet := LookupEnv(PRUNE_AGE_ENV)
 	if !isSet {
 		mgr.pruneAge = 1 * time.Hour
 	} else {
@@ -331,7 +331,7 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 // functions.  This function may take a significant amount of time because it
 // will implicitly download base docker images and build the artifacts.
 //
-// NOTE: if `CMGR_REGISTRY` is specified, the generation this build displaces
+// NOTE: if `CORK_REGISTRY` is specified, the generation this build displaces
 // is offered to BuildKit as a cache source and the image produced carries
 // inline cache metadata, so a builder whose local cache was reclaimed recovers
 // the shared layers from the registry rather than re-running every install.

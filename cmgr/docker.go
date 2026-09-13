@@ -47,7 +47,7 @@ func (m *Manager) initDocker() error {
 	// he is missing instead of whatever the daemon complains about first.
 	// (The value itself is read again below, where the credentials for it
 	// are; this only decides the refusal.)
-	if os.Getenv(REGISTRY_ENV) == "" {
+	if Getenv(REGISTRY_ENV) == "" {
 		var err error
 		switch {
 		case m.externalBuildPlane:
@@ -105,16 +105,16 @@ func (m *Manager) initDocker() error {
 	m.localQueue = newDaemonQueue(m.launchConcurrency)
 	m.log.infof("launch and teardown slots per daemon: %d", m.launchConcurrency)
 
-	chalInterface, isSet := os.LookupEnv(IFACE_ENV)
+	chalInterface, isSet := LookupEnv(IFACE_ENV)
 	if !isSet {
 		chalInterface = "0.0.0.0"
 	}
 	m.challengeInterface = chalInterface
 
-	m.challengeRegistry, isSet = os.LookupEnv(REGISTRY_ENV)
+	m.challengeRegistry, isSet = LookupEnv(REGISTRY_ENV)
 	if isSet {
-		m.registryUser = os.Getenv(REGISTRY_USER_ENV)
-		m.registryToken = os.Getenv(REGISTRY_TOKEN_ENV)
+		m.registryUser = Getenv(REGISTRY_USER_ENV)
+		m.registryToken = Getenv(REGISTRY_TOKEN_ENV)
 		registryHost, _ := m.registryEndpoint()
 		authPayload := fmt.Sprintf(
 			`{"username":"%s","password":"%s","serveraddress":"%s"}`,
@@ -216,7 +216,7 @@ func (m *Manager) removeLocalImage(imageName string, iro client.ImageRemoveOptio
 }
 
 func getPortRange() (int, int, error) {
-	portRange := os.Getenv(PORTS_ENV)
+	portRange := Getenv(PORTS_ENV)
 	if portRange == "" {
 		return 0, 0, nil
 	}
@@ -695,7 +695,7 @@ func (m *Manager) retagLegacyImages(db *sqlx.DB, id BuildId, challenge string, s
 }
 
 // instanceImageName returns the docker tag for a build's per-host image. When
-// CMGR_REGISTRY is set the name is registry-qualified so that images can be
+// CORK_REGISTRY is set the name is registry-qualified so that images can be
 // pushed after building and pulled before launching; cmgr and cmgrd must be
 // configured with the same registry value for the derived names to agree.
 func (m *Manager) instanceImageName(challenge ChallengeId, bMeta *BuildMetadata, image Image) string {
@@ -709,7 +709,7 @@ func (m *Manager) instanceImageName(challenge ChallengeId, bMeta *BuildMetadata,
 // cacheRefsFor picks the BuildKit cache sources for one image build.
 //
 // Registry deployments only, and that gate is the load-bearing part: BuildKit
-// reads CacheFrom entries as *registry* references, so without CMGR_REGISTRY
+// reads CacheFrom entries as *registry* references, so without CORK_REGISTRY
 // instanceImageName yields a bare `challenge:tag` which normalizes to
 // docker.io/library and sends a Docker Hub lookup per image per build -- the
 // exact exposure base pinning exists to remove. Single-host cmgr gets no cache
@@ -1486,7 +1486,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 				hConfig.SecurityOpt = append(hConfig.SecurityOpt, "no-new-privileges:true")
 			}
 			if cOpts.DiskQuota != "" {
-				_, quotas_enabled := os.LookupEnv(DISK_QUOTA_ENV)
+				_, quotas_enabled := LookupEnv(DISK_QUOTA_ENV)
 				if quotas_enabled {
 					var storageOpt = map[string]string{
 						"size": cOpts.DiskQuota,

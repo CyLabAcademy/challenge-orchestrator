@@ -39,7 +39,7 @@ func (m *Manager) setDirectories() error {
 		return nil
 	}
 
-	artifactsDir, isSet := os.LookupEnv(ARTIFACT_DIR_ENV)
+	artifactsDir, isSet := LookupEnv(ARTIFACT_DIR_ENV)
 	if !isSet {
 		artifactsDir = "."
 	}
@@ -182,7 +182,7 @@ func (m *Manager) findArtifactBundle(filename string) (string, bool) {
 // makes, and is what tells one from any other subdirectory of the artifact
 // directory. It is needed because the two are not otherwise
 // distinguishable and the cost of guessing wrong is a deleted file:
-// CMGR_ARTIFACT_DIR is allowed to be the challenge tree (it is in the
+// CORK_ARTIFACT_DIR is allowed to be the challenge tree (it is in the
 // ansible role's defaults), whose subdirectories are challenges, and a
 // challenge shipping a file that happened to be named for a build id would
 // be swept by a search that took every subdirectory for a namespace.
@@ -276,11 +276,11 @@ func (m *Manager) removeArtifactBundle(schema, filename string) error {
 	return nil
 }
 
-// setChallengeDirectory reads CMGR_DIR, normalizes it to an absolute path
+// setChallengeDirectory reads CORK_DIR, normalizes it to an absolute path
 // and requires it to be a directory that exists: a mistyped challenge path
 // must fail the start, not bring a daemon up over an empty catalogue.
 func (m *Manager) setChallengeDirectory() error {
-	chalDir, isSet := os.LookupEnv(DIR_ENV)
+	chalDir, isSet := LookupEnv(DIR_ENV)
 	if !isSet {
 		chalDir = "."
 	}

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -12,10 +11,10 @@ import (
 
 // BUILD_PLANE_ENV selects where challenge images are built: 'local' (the
 // default) on the docker daemon this process reaches through DOCKER_HOST,
-// from the challenge tree in CMGR_DIR; or 'external', where something else
+// from the challenge tree in CORK_DIR; or 'external', where something else
 // builds, pushes to the registry and hands the finished builds to this
 // daemon, which then has no docker daemon and no challenge tree of its own.
-const BUILD_PLANE_ENV string = "CMGR_BUILD_PLANE"
+const BUILD_PLANE_ENV string = "CORK_BUILD_PLANE"
 
 // The two values of BUILD_PLANE_ENV, and what BuildPlane reports.
 const (
@@ -64,7 +63,7 @@ func AsBuildPlane() ManagerOption {
 // runs before anything that reads the challenge tree, the pin file or
 // DOCKER_HOST, since on an external build plane none of them apply.
 func (m *Manager) initBuildPlane() error {
-	switch value := os.Getenv(BUILD_PLANE_ENV); value {
+	switch value := Getenv(BUILD_PLANE_ENV); value {
 	case "", BuildPlaneLocal:
 		m.externalBuildPlane = false
 	case BuildPlaneExternal:
@@ -80,7 +79,7 @@ func (m *Manager) initBuildPlane() error {
 	// settings: a build plane serves nothing, so everything about serving is
 	// inert here. Worth saying because a unit file grown from an
 	// orchestrator's is the normal way this happens, and the settings below
-	// fail silently rather than loudly -- CMGR_CONCURRENT_LAUNCHES even
+	// fail silently rather than loudly -- CORK_CONCURRENT_LAUNCHES even
 	// reports slots at startup, on a host that will never take a launch.
 	if m.buildPlane {
 		for _, name := range orchestratorOnlySettings {
@@ -118,17 +117,17 @@ func (m *Manager) BuildPlane() string {
 
 // noteIgnoredSetting says at startup that a setting this process does not
 // read is present, and why it does not. A unit file that still carries
-// CMGR_DIR or DOCKER_HOST most likely expects an update to work here, and
+// CORK_DIR or DOCKER_HOST most likely expects an update to work here, and
 // the answer to that is a 409 later rather than a silent no-op; naming the
 // setting now is the earlier of the two. It runs in both directions: an
 // external daemon names the build-plane settings, and a build plane names
 // the orchestrator's.
 //
-// Presence is what counts, not value: an empty CMGR_DIR is the working
-// directory on a local build plane, and an empty CMGR_BASE_PINS fails one,
+// Presence is what counts, not value: an empty CORK_DIR is the working
+// directory on a local build plane, and an empty CORK_BASE_PINS fails one,
 // so neither is a value to pass over.
 func (m *Manager) noteIgnoredSetting(name, because string) {
-	if _, isSet := os.LookupEnv(name); isSet {
+	if _, isSet := LookupEnv(name); isSet {
 		m.log.warnf("%s is set but ignored: %s", name, because)
 	}
 }

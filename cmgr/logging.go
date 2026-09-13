@@ -3,7 +3,6 @@ package cmgr
 import (
 	"fmt"
 	"log"
-	"os"
 	"strings"
 )
 
@@ -17,7 +16,7 @@ const (
 	DEBUG
 )
 
-// LogLevelFromEnv reads CMGR_LOGGING, falling back to the level given when
+// LogLevelFromEnv reads CORK_LOGGING, falling back to the level given when
 // it is unset or unreadable. Unreadable rather than fatal on purpose: a
 // typo in a log level is no reason to refuse to start a daemon, and the
 // complaint it returns is logged once the logger exists.
@@ -27,7 +26,7 @@ const (
 // offered no flag, so there was no way to raise an orchestrator's logging
 // at all -- while `cmgrd --help` went on documenting it.
 func LogLevelFromEnv(fallback LogLevel) (LogLevel, error) {
-	value, isSet := os.LookupEnv(LOGGING_ENV)
+	value, isSet := LookupEnv(LOGGING_ENV)
 	if !isSet || value == "" {
 		return fallback, nil
 	}
@@ -47,7 +46,7 @@ func LogLevelFromEnv(fallback LogLevel) (LogLevel, error) {
 		LOGGING_ENV, value, fallback)
 }
 
-// String names a level the way CMGR_LOGGING spells it.
+// String names a level the way CORK_LOGGING spells it.
 func (l LogLevel) String() string {
 	switch l {
 	case DISABLED:

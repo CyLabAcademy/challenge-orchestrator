@@ -218,13 +218,13 @@ const schemaQuery string = `
 // ensures that the necessary tables and indexes exist and that the sqlite
 // engine is enforcing foreign key constraints.
 func (m *Manager) initDatabase() error {
-	dbPath, isSet := os.LookupEnv(DB_ENV)
+	dbPath, isSet := LookupEnv(DB_ENV)
 	if !isSet {
 		dbPath = "cmgr.db"
 	}
 
 	// SQLite creates the file but not its directory; a fresh box points
-	// CMGR_DB somewhere like /var/lib/cork that may not exist yet.
+	// CORK_DB somewhere like /var/lib/cork that may not exist yet.
 	if dir := filepath.Dir(dbPath); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			m.log.errorf("could not create the database directory %s: %s", dir, err)
@@ -246,7 +246,7 @@ func (m *Manager) initDatabase() error {
 	// the most recent committed transactions on a crash or power loss (potentially
 	// more than one), in exchange for better performance than FULL.
 	dsn := dbPath + "?_fk=true&_journal_mode=WAL&_busy_timeout=100&_synchronous=NORMAL"
-	if walEnv, ok := os.LookupEnv(DB_WAL_ENV); ok && (walEnv == "false" || walEnv == "0" || walEnv == "off") {
+	if walEnv, ok := LookupEnv(DB_WAL_ENV); ok && (walEnv == "false" || walEnv == "0" || walEnv == "off") {
 		dsn = dbPath + "?_fk=true&_busy_timeout=100"
 	}
 

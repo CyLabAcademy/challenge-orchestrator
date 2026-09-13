@@ -12,7 +12,8 @@ const (
 	USAGE_ERROR   = -2
 )
 
-const serverEnv = "CMGRD_SERVER"
+const serverEnv = "CORK_SERVER"
+const legacyServerEnv = "CMGRD_SERVER" // pre-rename name, read when CORK_SERVER is unset
 const defaultServer = "http://127.0.0.1:4200"
 
 // Set at build time from ci/version.sh, which is the single definition of the
@@ -29,9 +30,12 @@ func clientVersion() string {
 func main() {
 	server := os.Getenv(serverEnv)
 	if server == "" {
+		server = os.Getenv(legacyServerEnv)
+	}
+	if server == "" {
 		server = defaultServer
 	}
-	flag.StringVar(&server, "server", server, "base URL of the cmgrd server")
+	flag.StringVar(&server, "server", server, "base URL of the corkd server")
 	help := flag.Bool("help", false, "display usage information")
 	flag.Parse()
 
@@ -109,7 +113,7 @@ Usage: %s [--server <url>] <command> [<args>]
 A thin HTTP client for cmgrd: every command is an API call against the
 server; nothing touches the database, docker, or the registry directly.
 
-On a daemon running with CMGR_BUILD_PLANE=external, the commands that build
+On a daemon running with CORK_BUILD_PLANE=external, the commands that build
 answer 409 -- update, build, and the pin-* pair -- because that daemon
 builds nothing: cork-build does, from the machine holding the challenge
 tree. add-schema is refused there too, though as "schema already exists":
@@ -122,7 +126,7 @@ Deployment:
       re-scan the challenge directory on the server (rebuilding changed
       challenges, and any build a failed rebuild left at an earlier
       generation) and print the resulting changes; <dir> must be inside the
-      server's CMGR_DIR and defaults to all of it; --prune-old additionally
+      server's CORK_DIR and defaults to all of it; --prune-old additionally
       removes the image generation each rebuild displaces from rollback
       retention, on the build daemon and in the registry
   update-schema <schema file>
@@ -181,6 +185,7 @@ Other:
       print client and server versions
 
 The server defaults to %s and can also be set via the
-%s environment variable.
-`, os.Args[0], defaultServer, serverEnv)
+%s environment variable; %s, its name before the
+rename, is read whenever that one is unset.
+`, os.Args[0], defaultServer, serverEnv, legacyServerEnv)
 }

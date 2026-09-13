@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// CMGR_LOGGING is the only way to change an orchestrator's log level --
+// CORK_LOGGING is the only way to change an orchestrator's log level --
 // cmgrd has no flag for it -- so it is worth testing that it is read at all:
 // for a while the constant was declared and used nowhere, and cmgrd
 // hardcoded INFO while its help documented this.

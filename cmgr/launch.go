@@ -3,7 +3,6 @@ package cmgr
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"time"
 
@@ -22,7 +21,7 @@ import (
 //   - launch slot: network create, container create and start, and the port
 //     read-back, each under the control timeout. These serialize inside
 //     dockerd on either firewall backend, per daemon, so the slots are per
-//     worker; that is why CMGR_CONCURRENT_LAUNCHES measured out at 2 on
+//     worker; that is why CORK_CONCURRENT_LAUNCHES measured out at 2 on
 //     iptables and shows no gain past 2 on nftables either (nftables makes
 //     each launch faster, not more parallel). A slot that covers the network
 //     stage keeps the daemon's queue in cmgrd, where it is bounded, instead
@@ -259,7 +258,7 @@ func daemonLabel(instance *InstanceMetadata) string {
 // envSlots reads a per-daemon slot count from the environment: 1 to 16,
 // else the default with a warning.
 func (m *Manager) envSlots(name string, def int) int {
-	s, ok := os.LookupEnv(name)
+	s, ok := LookupEnv(name)
 	if !ok {
 		return def
 	}

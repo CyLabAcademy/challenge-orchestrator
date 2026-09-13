@@ -66,7 +66,7 @@ func buildCommand(mgr *cmgr.Manager, servers []string, dests *destinations, args
 	}
 
 	// Where each schema's artifact bundles go: a directory per destination
-	// under CMGR_ARTIFACT_DIR, so one build plane's artifacts stay sorted for
+	// under CORK_ARTIFACT_DIR, so one build plane's artifacts stay sorted for
 	// the orchestrators they belong to and an artifact server can watch one
 	// per destination. Before the scan below, because that scan rebuilds
 	// every build of a challenge whose source has moved -- builds of any

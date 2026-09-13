@@ -22,11 +22,19 @@ import (
 
 // unsetenv clears a variable for the test and restores it afterwards, which
 // a bare os.Unsetenv would not: the value would be gone for every later test
-// in the package.
+// in the package. A setting is cleared under both its names, since the CMGR_
+// one is read when the CORK_ one is unset (env.go) -- a developer with
+// CMGR_DIR exported would otherwise be running a different test.
 func unsetenv(t *testing.T, name string) {
 	t.Helper()
-	t.Setenv(name, "")
-	os.Unsetenv(name)
+	names := []string{name}
+	if strings.HasPrefix(name, envPrefix) {
+		names = append(names, legacyEnvName(name))
+	}
+	for _, n := range names {
+		t.Setenv(n, "")
+		os.Unsetenv(n)
+	}
 }
 
 // captureLog is a Manager logger that keeps warnings and errors in buf.
@@ -166,8 +174,8 @@ func TestSetDirectoriesExternalIgnoresChallengeDir(t *testing.T) {
 	}
 }
 
-// Presence is what counts: an empty CMGR_DIR is the working directory on a
-// local build plane and an empty CMGR_BASE_PINS fails one, so either, left
+// Presence is what counts: an empty CORK_DIR is the working directory on a
+// local build plane and an empty CORK_BASE_PINS fails one, so either, left
 // in a unit file that now runs an external plane, is worth naming.
 func TestNoteIgnoredSettingKeysOnPresence(t *testing.T) {
 	var logged bytes.Buffer

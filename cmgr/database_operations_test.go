@@ -863,7 +863,7 @@ func TestDatabasePortOperations(t *testing.T) {
 }
 
 // TestExplicitPortReadbackRedundant verifies the invariant that makes the
-// post-start port read-back loop in startContainers safe to skip when CMGR_PORTS
+// post-start port read-back loop in startContainers safe to skip when CORK_PORTS
 // is set (m.portLow != 0). By the time startContainers runs, the explicit-port
 // reservation loop in newInstance has already populated instance.Ports — for
 // every exposed image port — with exactly the host port that Docker will bind.
@@ -2147,7 +2147,7 @@ func TestLookupChallengeMetadataSurfacesOptionsDecodeError(t *testing.T) {
 // port range configured: after stopContainers released an instance's ports,
 // reassignPorts must claim them again (the same numbers while free, a fresh
 // one from the range otherwise) and persist them, so the restarted containers
-// bind inside CMGR_PORTS and the API keeps reporting the port.
+// bind inside CORK_PORTS and the API keeps reporting the port.
 func TestReassignPortsKeepsAddressAcrossRestart(t *testing.T) {
 	mgr := setupTestManager(t)
 	defer mgr.db.Close()
@@ -2232,7 +2232,7 @@ func TestReassignPortsKeepsAddressAcrossRestart(t *testing.T) {
 	}
 
 	// A previous port outside the current range (an instance from before
-	// CMGR_PORTS was set) is not reclaimed; a fresh one from the range is.
+	// CORK_PORTS was set) is not reclaimed; a fresh one from the range is.
 	if err := mgr.removeContainersMetadata(instance); err != nil {
 		t.Fatalf("failed to release container metadata: %v", err)
 	}

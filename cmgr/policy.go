@@ -10,16 +10,15 @@ package cmgr
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 
 	"github.com/docker/go-units"
 )
 
 const (
-	maxArtifactFilesEnv     = "CMGR_MAX_ARTIFACT_FILES"
-	maxArtifactBytesEnv     = "CMGR_MAX_ARTIFACT_BYTES"
-	maxArtifactFileBytesEnv = "CMGR_MAX_ARTIFACT_FILE_BYTES"
+	maxArtifactFilesEnv     = "CORK_MAX_ARTIFACT_FILES"
+	maxArtifactBytesEnv     = "CORK_MAX_ARTIFACT_BYTES"
+	maxArtifactFileBytesEnv = "CORK_MAX_ARTIFACT_FILE_BYTES"
 )
 
 // Defaults for the artifact bounds. artifactLimits falls back to these too, so
@@ -41,7 +40,7 @@ type managerPolicy struct {
 }
 
 func envString(name, fallback string) string {
-	if value, ok := os.LookupEnv(name); ok {
+	if value, ok := LookupEnv(name); ok {
 		return value
 	}
 	return fallback
@@ -57,7 +56,7 @@ func positiveEnvInt(name string, fallback int) (int, error) {
 }
 
 func positiveEnvBytes(name string, fallback int64) (int64, error) {
-	value, isSet := os.LookupEnv(name)
+	value, isSet := LookupEnv(name)
 	if !isSet {
 		return fallback, nil
 	}

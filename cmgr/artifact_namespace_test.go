@@ -297,7 +297,7 @@ func TestRemoveArtifactBundleLeavesOthersAlone(t *testing.T) {
 }
 
 // A subdirectory cork did not make is not a namespace and is never touched,
-// however much the file in it looks like a bundle. CMGR_ARTIFACT_DIR is
+// however much the file in it looks like a bundle. CORK_ARTIFACT_DIR is
 // allowed to be the challenge tree -- it is in the ansible role's defaults --
 // so the subdirectories of an artifact directory are often challenges, and a
 // search that took them for namespaces would delete a challenge's own file

@@ -6,7 +6,7 @@ import (
 )
 
 // TestRegistryManifestRequest covers the distribution API URL for the two
-// shapes CMGR_REGISTRY takes: a bare host, and a host with a path prefix (a
+// shapes CORK_REGISTRY takes: a bare host, and a host with a path prefix (a
 // namespaced registry), whose API still lives at /v2/ on the host with the
 // prefix leading every repository name.
 func TestRegistryManifestRequest(t *testing.T) {

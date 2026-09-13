@@ -86,7 +86,7 @@ func infoCommand(mgr *cmgr.Manager, args []string) int {
 	// The whole tree by default, not the working directory. cmgr's info
 	// defaulted to '.' because it was run from inside a challenge directory;
 	// cork-build is run by ansible or a CI job from wherever it happens to
-	// be, and DetectChanges refuses a path outside CMGR_DIR
+	// be, and DetectChanges refuses a path outside CORK_DIR
 	// (normalizeDirPath), so '.' would fail for the usual caller.
 	path := ""
 	if set.NArg() == 1 {

@@ -44,8 +44,8 @@ func setupProfileTestManager(t *testing.T) *Manager {
 // This benchmark measures time up to the point where Docker commands would be sent,
 // excluding actual Docker operations.
 func TestProfileInstanceLaunchWithDBLoad(t *testing.T) {
-	if os.Getenv("CMGR_TEST_PROFILE") == "" {
-		t.Skip("skipping profiling test; set CMGR_TEST_PROFILE=1 to run")
+	if os.Getenv("CORK_TEST_PROFILE") == "" {
+		t.Skip("skipping profiling test; set CORK_TEST_PROFILE=1 to run")
 	}
 
 	// Test scenarios with different database loads
