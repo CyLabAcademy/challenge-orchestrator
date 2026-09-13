@@ -4,7 +4,7 @@
 # challenge builds openssh into two runtime images, and a schema is built when
 # it is added, so putting it in schema.yaml would charge regular mode for a
 # build regular mode never launches. The second is that adding a schema to a
-# cmgrd that is already serving one is itself untested -- production runs a
+# corkd that is already serving one is itself untested -- production runs a
 # schema per event, and nothing else here has two at once.
 name: e2e-multi
 flag_format: e2e{%s}

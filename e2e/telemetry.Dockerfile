@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# cork-telemetry, the worker health agent cmgrd polls on :2136, built from
+# cork-telemetry, the worker health agent corkd polls on :2136, built from
 # its upstream repository at a pinned tag. The multihost_docker role installs
 # the same project's release binary.
 FROM golang:1.26-alpine AS build

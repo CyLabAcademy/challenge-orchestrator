@@ -172,7 +172,7 @@ containers.
   details.) If these requirements are not met, container creation will fail at runtime.
 
   To help prevent this issue, the `diskquota` option only takes effect if the
-  `CMGR_ENABLE_DISK_QUOTAS` environment variable is set.
+  `CORK_ENABLE_DISK_QUOTAS` environment variable is set.
 
   Specify an integer value with unit, as shown in the example below. Unset by default.
 
@@ -211,7 +211,7 @@ containers.
   them would go unnoticed.)
 
   A complete profile replaces cmgr's policy rather than extending it, so the usual starting point
-  is a copy of `cmgr/seccomp.json` with the specific rules a challenge needs. For example, a
+  is a copy of `cork/seccomp.json` with the specific rules a challenge needs. For example, a
   legacy challenge that calls `personality(READ_IMPLIES_EXEC)` -- directly or via `setarch -X` --
   needs cmgr's `personality` rule widened, since neither cmgr's policy nor Docker's default
   permits that bit:

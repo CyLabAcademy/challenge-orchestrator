@@ -1,5 +1,5 @@
-// cork-build is a cork deployment's build plane: the half of cmgrd that
-// CMGR_BUILD_PLANE=external leaves out (issue #18). It reads the schema files
+// cork-build is a cork deployment's build plane: the half of corkd that
+// CORK_BUILD_PLANE=external leaves out (issue #18). It reads the schema files
 // an event is defined by, scans the challenge directory, builds and pushes
 // every build those schemas name, and hands the finished builds to the
 // orchestrator over PUT /challenges/<id>.
@@ -30,7 +30,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 const (
@@ -94,7 +94,7 @@ func (l *serverList) Set(value string) error {
 func main() {
 	var servers serverList
 	flag.Var(&servers, "server", "orchestrator to hand the builds to; repeat for more than one, omit to build and push without handing anything over")
-	dir := flag.String("dir", "", "challenge directory, overriding "+cmgr.DIR_ENV)
+	dir := flag.String("dir", "", "challenge directory, overriding "+cork.DIR_ENV)
 	verbose := flag.Bool("verbose", false, "log every docker and database step")
 	help := flag.Bool("help", false, "display usage information")
 	showVersion := flag.Bool("version", false, "display version information and exit")
@@ -117,34 +117,34 @@ func main() {
 		// The manager reads the directory from the environment, as the
 		// daemon does. The flag is for a runner that has the tree in its
 		// workspace rather than in its environment.
-		if err := os.Setenv(cmgr.DIR_ENV, *dir); err != nil {
+		if err := os.Setenv(cork.DIR_ENV, *dir); err != nil {
 			os.Exit(runtimeError(err))
 		}
 	}
 
-	// CMGR_LOGGING sets the level, as it does for the daemon; --verbose is
+	// CORK_LOGGING sets the level, as it does for the daemon; --verbose is
 	// the flag form and wins, being the more deliberate of the two.
-	logLevel, logLevelErr := cmgr.LogLevelFromEnv(cmgr.INFO)
+	logLevel, logLevelErr := cork.LogLevelFromEnv(cork.INFO)
 	if logLevelErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", logLevelErr)
 	}
 	if *verbose {
-		logLevel = cmgr.DEBUG
+		logLevel = cork.DEBUG
 	}
 	// A build plane, not an orchestrator: it pushes to the shared registry
 	// and never takes anything back out of it. Its own database is
 	// bookkeeping, and what a schema here stops naming may still be what an
 	// orchestrator is serving.
-	mgr := cmgr.NewManager(logLevel, cmgr.AsBuildPlane())
+	mgr := cork.NewManager(logLevel, cork.AsBuildPlane())
 	if mgr == nil {
-		fmt.Fprintln(os.Stderr, "error: could not initialize cmgr")
+		fmt.Fprintln(os.Stderr, "error: could not initialize cork")
 		os.Exit(RUNTIME_ERROR)
 	}
 	// The one setting this binary cannot honour: it IS the build plane, and
 	// an external one has neither the docker daemon nor the tree it needs.
-	if mgr.BuildPlane() != cmgr.BuildPlaneLocal {
+	if mgr.BuildPlane() != cork.BuildPlaneLocal {
 		fmt.Fprintf(os.Stderr, "error: %s=%s, but cork-build is the build plane itself: it builds from %s on the docker daemon DOCKER_HOST names\n",
-			cmgr.BUILD_PLANE_ENV, mgr.BuildPlane(), cmgr.DIR_ENV)
+			cork.BUILD_PLANE_ENV, mgr.BuildPlane(), cork.DIR_ENV)
 		os.Exit(RUNTIME_ERROR)
 	}
 
@@ -152,6 +152,8 @@ func main() {
 	// written by the same ansible that stands the orchestrators up, so a
 	// rebuilt build plane gets its routing back the way it gets everything
 	// else. Read before any command, since all three route.
+	// Read directly: this setting arrived with the build plane, under the
+	// CORK_ name, so it has no CMGR_ spelling to fall back to.
 	dests, err := loadDestinations(os.Getenv(DESTINATIONS_ENV))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
@@ -211,13 +213,13 @@ func printUsage() {
 Usage: %s [<options>] <command> [<args>]
 
 cork's build plane: it builds what the schema files name and hands the
-finished builds to an orchestrator running with CMGR_BUILD_PLANE=external,
+finished builds to an orchestrator running with CORK_BUILD_PLANE=external,
 which builds nothing itself.
 
 This is where the challenge tree lives and where every schema operation
 happens, so it is where cmgr's build and schema commands live too. What an
 orchestrator HOLDS -- instances, workers, what is running right now -- is
-asked of that daemon instead, with cmgrd-cli.
+asked of that daemon instead, with cork.
 
 Deploying:
   build <schema file> [<schema file> ...]
@@ -290,20 +292,26 @@ This plane's own configuration:
       stand for.
   pins
       re-resolve every base image the challenge directory names to the
-      digest the registry serves now, and write CMGR_BASE_PINS. Nothing is
+      digest the registry serves now, and write CORK_BASE_PINS. Nothing is
       rebuilt on account of it: a moved base reaches a challenge the next
       time that challenge is built, so refresh before a build, not after.
   version
 
 Options:
   --server   orchestrator to hand the builds to; repeat for more than one
-  --dir      challenge directory, overriding CMGR_DIR
+  --dir      challenge directory, overriding CORK_DIR
   --verbose  log every docker and database step
   --help
   --version
 
-Environment, all as cmgrd reads them (this is cmgrd's build path):
-  CMGR_DIR - the challenge directory to build from
+Environment, all as corkd reads them (this is corkd's build path):
+  Each of these also answers to the CMGR_ name it had before the rename
+  (CMGR_DIR for CORK_DIR, and so on), read only when the CORK_ name is
+  unset, and the old names are listed at startup where they are found.
+  CORK_DESTINATIONS is the exception: it arrived with the build plane,
+  under this name, and has no older spelling.
+
+  CORK_DIR - the challenge directory to build from
 
   CORK_DESTINATIONS - a yaml file mapping the destination names schemas use
       to the orchestrators they stand for ("library: https://host:4200").
@@ -312,12 +320,13 @@ Environment, all as cmgrd reads them (this is cmgrd's build path):
       deployment need say nothing, and an event cannot land on the wrong
       orchestrator because a line was forgotten.
 
-  CMGR_REGISTRY - required. The registry built images are pushed to, and
+  CORK_REGISTRY - required. The registry built images are pushed to, and
       the one the orchestrator's workers pull from; both must name the same
       registry or the hand-over is refused for images the orchestrator
       cannot find
 
-  CMGR_DB - this builder's own database (defaults to 'cmgr.db'). Keep it
+  CORK_DB - this builder's own database (defaults to 'cork.db', which was
+      'cmgr.db' before the rename; nothing moves one). Keep it
       for as long as any schema it built is being served: an orchestrator
       records each build under the id this plane gave it, because that is
       the id the bundle is named by, so a plane rebuilt from scratch draws
@@ -325,27 +334,27 @@ Environment, all as cmgrd reads them (this is cmgrd's build path):
       releasing the schemas that orchestrator holds from this plane and
       rebuilding them together; BUILDER.md has the whole of it
 
-  CMGR_ARTIFACT_DIR - where built artifact bundles are kept until they are
+  CORK_ARTIFACT_DIR - where built artifact bundles are kept until they are
       handed over (defaults to '.')
 
-  CMGR_BASE_PINS - the base image pin file, defaulting to
-      <CMGR_DIR>/.base-pins.json. The pins are part of every build's
+  CORK_BASE_PINS - the base image pin file, defaulting to
+      <CORK_DIR>/.base-pins.json. The pins are part of every build's
       identity, so the orchestrator is told the fingerprint they were built
       under and recomputes with it
 
-  CMGR_PURGE_AFTER_PUSH - drop this host's copy of an image once it is in
+  CORK_PURGE_AFTER_PUSH - drop this host's copy of an image once it is in
       the registry, which is what a builder wants: nothing runs here
 
-  CMGR_LOGGING - debug, info, warn, error or disabled (defaults to info).
+  CORK_LOGGING - debug, info, warn, error or disabled (defaults to info).
       --verbose is the flag form of the same setting and wins over it
 
   DOCKER_HOST and the rest of docker's own variables - the daemon that
       builds. See https://docs.docker.com/engine/reference/commandline/cli/
 
 The settings about serving are read by the same library and mean nothing
-here, since nothing runs on a build plane: CMGR_CONCURRENT_LAUNCHES,
-CMGR_PORTS, CMGR_INTERFACE, CMGR_ENABLE_DISK_QUOTAS, CMGR_PRUNE_AGE and the
-six CMGR_WORKER_* tunables. Each is named in the log at startup if it is set,
+here, since nothing runs on a build plane: CORK_CONCURRENT_LAUNCHES,
+CORK_PORTS, CORK_INTERFACE, CORK_ENABLE_DISK_QUOTAS, CORK_PRUNE_AGE and the
+six CORK_WORKER_* tunables. Each is named in the log at startup if it is set,
 because a unit file grown from an orchestrator's is how they get here.
 
 Exit status is non-zero if anything failed to build or to be handed over.

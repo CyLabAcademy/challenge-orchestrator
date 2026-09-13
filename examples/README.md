@@ -56,7 +56,7 @@ Independent of the challenge type above (which controls how a challenge is *buil
 - **`artifact_only`** — the challenge publishes no ports; the `artifacts.tar.gz` produced at build time is the entire challenge and no running container is needed.  All `static-make` challenges are artifact-only, as is any `custom` challenge without a `# PUBLISH` directive.
 - **`flag_only`** — the challenge is a bare submission prompt (no ports, no artifacts); declared with the `flag-only` challenge type described above.
 
-This value is derived from the Dockerfile — authors never write it, and it is reported through the `cmgrd` API so front-ends can distinguish these cases explicitly.
+This value is derived from the Dockerfile — authors never write it, and it is reported through the `corkd` API so front-ends can distinguish these cases explicitly.
 
 Two things follow from this that challenge authors should know:
 
@@ -66,4 +66,4 @@ Two things follow from this that challenge authors should know:
 
 ## Schemas
 
-"Schemas" are a mechanism for declaratively specifying the desired state for a set of builds and instances.  Builds and the associated instances that are created by a schema are locked out from manual control and should be the preferred way to manage a large number of builds and instances for events.  However, they are still event agnostic and can be used for managing other groupings of resources as appropriate.  An example schema can be found [here](./schema.yaml).  It is worth noting that a `-1` for instance count specifies that instances are manually controlled and allows the CLI or `cmgrd` to dynamically increase or decrease the number of running instances (useful for mapping instances uniquely to end-users without having a large number of unused containers).  `instance_count` is only meaningful for challenges with a `service` delivery type; artifact-only challenges listed in a schema get their builds (one per seed, with artifacts and flags) and no instances.
+"Schemas" are a mechanism for declaratively specifying the desired state for a set of builds and instances.  Builds and the associated instances that are created by a schema are locked out from manual control and should be the preferred way to manage a large number of builds and instances for events.  However, they are still event agnostic and can be used for managing other groupings of resources as appropriate.  An example schema can be found [here](./schema.yaml).  It is worth noting that a `-1` for instance count specifies that instances are manually controlled and allows the CLI or `corkd` to dynamically increase or decrease the number of running instances (useful for mapping instances uniquely to end-users without having a large number of unused containers).  `instance_count` is only meaningful for challenges with a `service` delivery type; artifact-only challenges listed in a schema get their builds (one per seed, with artifacts and flags) and no instances.

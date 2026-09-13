@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CMGR_LOGGING: debug
+  CORK_LOGGING: debug
 
 jobs:
   build:
@@ -21,7 +21,8 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
+          - ubuntu-latest # linux/amd64
+          - ubuntu-24.04-arm # linux/arm64, the other architecture released
 
     steps:
     - name: Check out code

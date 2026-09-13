@@ -5,11 +5,11 @@
 # generations, the registry and its failure paths. Repeating any of it here
 # would buy nothing. What no other scenario covers is the deployment that has
 # none of that: one box, one docker daemon, no registry, no workers, no
-# certificates. That is still the default (`CMGR_BUILD_PLANE` unset) and still
+# certificates. That is still the default (`CORK_BUILD_PLANE` unset) and still
 # the legacy cmgr shape, and the multi-host work and the build-plane split
 # both landed on top of it.
 #
-# One service, and one service is the fidelity. dockerd and cmgrd share this
+# One service, and one service is the fidelity. dockerd and corkd share this
 # container (single.Dockerfile), so cork reaches docker at
 # /var/run/docker.sock with no DOCKER_HOST, instances publish on this host,
 # and the scenario runs here beside them -- localhost means what it means on a
@@ -24,7 +24,7 @@ services:
         DIND_VERSION: ${DIND_VERSION:-29.6.0}
     image: cork-e2e/single
     privileged: true          # dockerd
-    command: ["cmgrd"]
+    command: ["corkd"]
     environment:
       # Empty, so dind's entrypoint mints no certificates of its own. It
       # would then serve plain tcp on 2375 as well, which a class box has no
@@ -35,16 +35,16 @@ services:
       # Read by single-entrypoint.sh, not by dockerd: the dind entrypoint
       # appends its own --host flags when it is given none.
       DOCKERD_HOST: "unix:///var/run/docker.sock"
-      CMGR_DIR: /challenges
-      CMGR_DB: /var/lib/cork/cmgr.db
-      CMGR_ARTIFACT_DIR: /var/lib/cork/artifacts
-      CMGR_PORTS: "21000-21029"
-      CMGR_PRUNE_AGE: 24h
+      CORK_DIR: /challenges
+      CORK_DB: /var/lib/cork/cork.db
+      CORK_ARTIFACT_DIR: /var/lib/cork/artifacts
+      CORK_PORTS: "21000-21029"
+      CORK_PRUNE_AGE: 24h
       # Deliberately absent, and the point of this fleet:
       #   DOCKER_HOST          cork uses the local socket, as on a class box
-      #   CMGR_REGISTRY        nothing is pushed; images stay on this daemon
+      #   CORK_REGISTRY        nothing is pushed; images stay on this daemon
       #   DOCKER_CERT_PATH     no worker dockerds to authenticate to
-      #   CMGR_BUILD_PLANE     unset is `local`, which is what a class box runs
+      #   CORK_BUILD_PLANE     unset is `local`, which is what a class box runs
     volumes:
       - ${CHALLENGE_DIR:-../examples}:/challenges-seed:ro
       - single-challenges:/challenges
