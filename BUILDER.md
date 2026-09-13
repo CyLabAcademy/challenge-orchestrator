@@ -1,11 +1,11 @@
 # The builder
 
 Notes for whoever operates or changes cork's image build path. Everything here
-concerns the **orchestrator** host: the one machine that runs `cmgrd`, builds
+concerns the **orchestrator** host: the one machine that runs `corkd`, builds
 images and pushes them to the registry. Workers only pull.
 
-That machine can also be told not to build at all. `CMGR_BUILD_PLANE=external`
-starts `cmgrd` with no docker daemon and no challenge tree: everything in this
+That machine can also be told not to build at all. `CORK_BUILD_PLANE=external`
+starts `corkd` with no docker daemon and no challenge tree: everything in this
 document then happens wherever the images are built, and each build reaches
 the daemon through `PUT /challenges/<id>` (issue #18): the challenge as scanned
 there and its builds as left there, with the images already in the registry,
@@ -38,7 +38,7 @@ the rest of this document rests on:
   schema move between orchestrators without rebuilding anything.
 
 A single-host deployment collapses all of it onto one box and drops the
-registry: `cmgrd` builds on its own docker daemon and runs what it builds,
+registry: `corkd` builds on its own docker daemon and runs what it builds,
 which is the `local` build plane this document otherwise describes.
 
 ### Which orchestrator serves a schema
@@ -149,11 +149,11 @@ ones above, plus `update`, `list`, `search`, `info`, `list-schemas`,
 are questions about what a challenge *is* and what has been built, and the
 tree and this plane's database are where the answers are.
 
-`cmgrd-cli` is a thin HTTP client for one daemon and stays exactly that.
+`cork` is a thin HTTP client for one daemon and stays exactly that.
 What is *running* — instances, workers, a live launch or stop — belongs to
 an orchestrator and only it can answer. It keeps the build and schema
 commands as well, and they are not redundant: a class deployment runs no
-build plane at all, and on that box `cmgrd-cli update` and `cmgrd-cli
+build plane at all, and on that box `cork update` and `cork
 add-schema` are the operator's whole interface. Against an orchestrator on
 an external build plane they are refused rather than missing — `update`, a
 manual `build` and the `pin-*` pair with a 409, and `add-schema` with
@@ -175,7 +175,7 @@ to, and what runs is the orchestrator's business.
 
 `cork-build` is this document's machine as a binary: cmgr's build path with
 no orchestrator attached. It reads the schema files an event is defined by,
-scans `CMGR_DIR`, builds and pushes every build those schemas name, and hands
+scans `CORK_DIR`, builds and pushes every build those schemas name, and hands
 the finished builds to one or more orchestrators over `PUT /challenges/<id>`.
 
 ```
@@ -184,20 +184,20 @@ cork-build --server https://orchestrator:4200 build event.yaml
 cork-build pins
 ```
 
-It is the same scan and the same converge cmgrd runs, so it reads the same
-environment: `CMGR_DIR`, `CMGR_REGISTRY` (which must name the registry the
-orchestrator's workers pull from), `CMGR_BASE_PINS`, `CMGR_PURGE_AFTER_PUSH`,
-`CMGR_LOGGING` (`--verbose` is the flag form and wins), `CORK_DESTINATIONS`,
+It is the same scan and the same converge corkd runs, so it reads the same
+environment: `CORK_DIR`, `CORK_REGISTRY` (which must name the registry the
+orchestrator's workers pull from), `CORK_BASE_PINS`, `CORK_PURGE_AFTER_PUSH`,
+`CORK_LOGGING` (`--verbose` is the flag form and wins), `CORK_DESTINATIONS`,
 and docker's own variables.
 
 The same library also reads the settings about *serving*, and every one of
 them is inert here, because nothing runs on a build plane:
-`CMGR_CONCURRENT_LAUNCHES`, `CMGR_PORTS`, `CMGR_INTERFACE`,
-`CMGR_ENABLE_DISK_QUOTAS`, `CMGR_PRUNE_AGE` and the six `CMGR_WORKER_*`
+`CORK_CONCURRENT_LAUNCHES`, `CORK_PORTS`, `CORK_INTERFACE`,
+`CORK_ENABLE_DISK_QUOTAS`, `CORK_PRUNE_AGE` and the six `CORK_WORKER_*`
 tunables. Each is named in the log at startup if it is set — the mirror of
-the notes an external daemon makes about `CMGR_DIR` and `DOCKER_HOST` — since
+the notes an external daemon makes about `CORK_DIR` and `DOCKER_HOST` — since
 a unit file grown from an orchestrator's is how they arrive, and
-`CMGR_CONCURRENT_LAUNCHES` in particular would otherwise report launch slots
+`CORK_CONCURRENT_LAUNCHES` in particular would otherwise report launch slots
 on a host that will never take a launch.
 
 What it does not do is run anything: every schema is converged here with its
@@ -295,7 +295,7 @@ Three things then sit on top:
 ## Where artifact bundles go
 
 A build's `artifacts.tar.gz` is extracted on the plane that built it and
-stays there. It is written to `CMGR_ARTIFACT_DIR`, in a subdirectory named
+stays there. It is written to `CORK_ARTIFACT_DIR`, in a subdirectory named
 for the schema's `destination:` — exactly that name, with nothing prepended,
 so the directory an operator sees is the destination they wrote in
 `CORK_DESTINATIONS`. A schema with no destination (a single-host deployment,
@@ -306,7 +306,7 @@ artifact server watches one directory per destination and publishes each
 under that destination's own prefix, so a challenge's files land where its
 own event's players look for them, and retiring an event is deleting one
 prefix. Nothing about this reaches an orchestrator — a hand-over carries no
-bytes, an orchestrator ignores `CMGR_ARTIFACT_DIR`, and cork serves no
+bytes, an orchestrator ignores `CORK_ARTIFACT_DIR`, and cork serves no
 artifacts at all.
 
 A bundle is removed when its build is destroyed, and it is *searched for*
@@ -343,7 +343,7 @@ always from a fresh local build while the challenge image is the registry's.
 The existence check goes through the local daemon (the same certs.d material
 and credentials it pushes and pulls with), so a registry dockerd can push to
 is one cork can ask; a registry that cannot be asked fails the build rather
-than pushing on a guess. Only tag deletes need cmgrd's own client
+than pushing on a guess. Only tag deletes need corkd's own client
 certificate, as before.
 
 The repair for a tag that is wrong (a build input the checksum does not
@@ -418,15 +418,15 @@ That knob is `pin-refresh`.
 ## Moving a base
 
 ```
-cmgrd-cli pin-list        # what is pinned, and how many challenges use each
-cmgrd-cli pin-refresh     # re-resolve every base to what the registry serves now
+cork pin-list        # what is pinned, and how many challenges use each
+cork pin-refresh     # re-resolve every base to what the registry serves now
 ```
 
 `pin-refresh` is the **only** moment cork consults a mutable tag. It reads
 manifests (`DistributionInspect`), it does not pull layers: over the real corpus
 that is 32 lookups in about 47 s and zero bytes of image data. The resolves are
 serial, and the pass has an overall budget derived from
-`CMGR_WORKER_CONTROL_TIMEOUT`, so a registry that accepts connections and then
+`CORK_WORKER_CONTROL_TIMEOUT`, so a registry that accepts connections and then
 stalls cannot hold a `POST /pins` open indefinitely. A reference that fails to
 resolve **keeps the digest it already had** — a refresh never un-pins a base
 because the network hiccuped — and the run reports the failure so it can be
@@ -505,8 +505,8 @@ challenge still costs a tag resolution on every build of it. Pin all of them.
   fails the update. There is no gate for this inside cork; it is the platform's
   to close, by not asking for launches during the pass.
 - **Commit the pin file to the challenge repository**, at the corpus root, and
-  point `CMGR_BASE_PINS` at it. cmgrd's own default is
-  `<CMGR_DIR>/.base-pins.json` — a dotfile, which nobody commits and a
+  point `CORK_BASE_PINS` at it. corkd's own default is
+  `<CORK_DIR>/.base-pins.json` — a dotfile, which nobody commits and a
   `git clean -xdf` erases. A committed `base-pins.json` is versioned with the
   corpus it pins, restored by a fresh clone, and reviewable as a diff: the pin
   bump becomes a commit rather than an untracked file on one machine. It sits
@@ -533,7 +533,7 @@ challenge still costs a tag resolution on every build of it. Pin all of them.
   and built on the new base.
 - Don't rebuild under live traffic. See the maintenance point above; this is the
   one operational hazard in the update path that cork cannot close for you.
-- Don't hand-edit the pin file to anything but a `sha256:` value. `cmgrd`
+- Don't hand-edit the pin file to anything but a `sha256:` value. `corkd`
   refuses to start on a malformed pin file, deliberately: silently falling back
   to mutable tags is the exact failure pinning exists to prevent.
 - Don't delete the pin file expecting a no-op. An empty map fingerprints as `0`,
@@ -585,7 +585,7 @@ accumulation, not an error, and `systemctl restart containerd` clears it.
 
 ## Purging after the push
 
-`CMGR_PURGE_AFTER_PUSH` — on by default in registry mode, off with
+`CORK_PURGE_AFTER_PUSH` — on by default in registry mode, off with
 `false`/`0`/`off`, and refused outright without a registry.
 
 Once a build's images are in the registry, nothing reads the builder's copies.
@@ -636,7 +636,7 @@ number in this document currently rests on.
    without it comes back unpinned, and unpinned is a different fingerprint.
    Committing it to the challenge repository (see Do) is what makes this a
    non-issue; a machine-local file is not.
-4. **Inline cache is registry-only.** Without `CMGR_REGISTRY` there is nowhere
+4. **Inline cache is registry-only.** Without `CORK_REGISTRY` there is nowhere
    to publish cache metadata, and `CacheFrom` entries would be read as registry
    references — a bare `challenge:tag` normalizes to `docker.io/library` and
    would send a Hub lookup per image per build. Both are switched off in that

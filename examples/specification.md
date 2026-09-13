@@ -172,7 +172,7 @@ containers.
   details.) If these requirements are not met, container creation will fail at runtime.
 
   To help prevent this issue, the `diskquota` option only takes effect if the
-  `CMGR_ENABLE_DISK_QUOTAS` environment variable is set.
+  `CORK_ENABLE_DISK_QUOTAS` environment variable is set.
 
   Specify an integer value with unit, as shown in the example below. Unset by default.
 

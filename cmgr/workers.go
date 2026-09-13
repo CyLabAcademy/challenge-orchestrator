@@ -57,7 +57,7 @@ const (
 //     under its own, longer ceiling (restartLimits in launch.go).
 //   - launchWait: how long a launch waits for a launch slot on its daemon
 //     before it is refused as busy, a retryable failure. That queue is
-//     cmgrd's own, no daemon involved, so it is kept short: under adverse
+//     corkd's own, no daemon involved, so it is kept short: under adverse
 //     load the platform's retry lands elsewhere (see launch.go).
 type workerTiming struct {
 	pollInterval   time.Duration
@@ -136,7 +136,7 @@ func (m *Manager) timing() workerTiming {
 	return m.workerTiming
 }
 
-// Selection failures, distinguished so cmgrd can map them to 503 vs 500.
+// Selection failures, distinguished so corkd can map them to 503 vs 500.
 var (
 	ErrAllWorkersOverloaded = errors.New("all workers are overloaded")
 	ErrAllWorkersDown       = errors.New("no workers are reachable")
@@ -188,7 +188,7 @@ type WorkerInfo struct {
 }
 
 // EnableWorkerPlacement turns on worker selection for new instances. Only
-// cmgrd calls this; without it, configured workers are still routable for
+// corkd calls this; without it, configured workers are still routable for
 // operations on their existing instances, but new instances stay local.
 func (m *Manager) EnableWorkerPlacement() {
 	m.workersMu.Lock()
@@ -304,7 +304,7 @@ func (m *Manager) newWorkerConn(ip, public string) (*workerConn, error) {
 // (pollWorker). A pass that does not finish is retried at the poll cadence,
 // the worker staying out of placement meanwhile, for as long as the poller
 // tolerates telemetry silence (maxMisses polls). A daemon that is merely
-// still starting when cmgrd starts or the worker is added therefore costs
+// still starting when corkd starts or the worker is added therefore costs
 // seconds, not a worker-add.
 func (m *Manager) runWorker(w *workerConn) {
 	t := m.timing()
@@ -683,7 +683,7 @@ func (m *Manager) ListWorkers() ([]WorkerInfo, error) {
 	return infos, nil
 }
 
-// WorkersConfigured reports whether any workers exist; used by cmgrd to
+// WorkersConfigured reports whether any workers exist; used by corkd to
 // decide between the legacy single-host gate and worker placement.
 func (m *Manager) WorkersConfigured() bool {
 	m.workersMu.RLock()

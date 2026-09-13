@@ -25,7 +25,7 @@ const (
 // ErrExternalBuildPlane answers every operation that needs the local daemon
 // or the challenge tree when the build plane is external: an update and its
 // dry run, a manual build, the base image pins, and a schema converge that
-// wants a build nobody has handed over. cmgrd reports it as 409: the request
+// wants a build nobody has handed over. corkd reports it as 409: the request
 // is well-formed, this daemon is just not the one that builds.
 var ErrExternalBuildPlane = errors.New("the build plane is external: this daemon does not build")
 
@@ -142,7 +142,7 @@ const externalPlaneIgnores = "the build plane is external"
 // that names no seeds wants nothing and is not checked, as a local
 // converge never touches such an entry either. Every challenge that falls
 // short is named, so one refusal lists all of them, and each wraps
-// ErrExternalBuildPlane, which cmgrd answers with 409. Two queries answer
+// ErrExternalBuildPlane, which corkd answers with 409. Two queries answer
 // for the whole schema, however many builds it names.
 func (m *Manager) requireHandedOver(schema *Schema) []error {
 	ids := []ChallengeId{}
@@ -195,7 +195,7 @@ func (m *Manager) requireHandedOver(schema *Schema) []error {
 // missingHandOverError names the builds of one challenge that a schema
 // wants and no hand-over has delivered. The precondition above and the
 // safety net under it (requireIngestedBuilds) report the shortfall in the
-// same words; each wraps ErrExternalBuildPlane, which cmgrd answers with
+// same words; each wraps ErrExternalBuildPlane, which corkd answers with
 // 409.
 func missingHandOverError(challenge ChallengeId, schema, format string, seeds []int) error {
 	listed := make([]string, 0, len(seeds))
@@ -241,7 +241,7 @@ func (m *Manager) checkExternalBuildPlane() error {
 	if local > 0 {
 		what = append(what, fmt.Sprintf("%d instance(s) were placed on the local daemon", local))
 	}
-	err = fmt.Errorf("%s: an external build plane can neither migrate the builds nor reach the instances. Start cmgrd once with %s=%s on the host that built them (it retags and pushes the images, and can stop the instances), or remove those rows",
+	err = fmt.Errorf("%s: an external build plane can neither migrate the builds nor reach the instances. Start corkd once with %s=%s on the host that built them (it retags and pushes the images, and can stop the instances), or remove those rows",
 		strings.Join(what, ", and "), BUILD_PLANE_ENV, BuildPlaneLocal)
 	m.log.error(err)
 	return err

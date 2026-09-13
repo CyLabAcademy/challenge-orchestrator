@@ -33,7 +33,7 @@ func removeSchemaCommand(mgr *cmgr.Manager, servers []string, dests *destination
 	if len(servers) > 1 {
 		return usageError("remove-schema acts on one orchestrator, and %d --server were given", len(servers))
 	}
-	// A name, as cmgr's remove-schema took and as cmgrd-cli's takes. There
+	// A name, as cmgr's remove-schema took and as cork's takes. There
 	// is nothing in the file for a removal to read: the destination comes
 	// from asking which orchestrator is serving the schema, and everything
 	// else about it is being destroyed. Taking a file would only mean the

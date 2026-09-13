@@ -24,7 +24,7 @@
 # a stolen zot-worker cert grants zot read but cannot control any worker's dockerd
 # (dockerd trusts only the docker CA). cmgr's identity is TWO certs (docker-client +
 # zot-client): same CN=cmgr, but each signed by its own CA and deployed to a different
-# directory (DOCKER_CERT_PATH vs certs.d), which cmgrd reads independently
+# directory (DOCKER_CERT_PATH vs certs.d), which corkd reads independently
 # (workers.go vs registry.go) — so no code change is needed.
 #
 # These are the BUNDLE names. At each destination the consuming software fixes the
@@ -96,7 +96,7 @@ issue docker server "$WORKER_NAME" \
   "subjectAltName = DNS:$WORKER_NAME" \
   "extendedKeyUsage = serverAuth"
 
-echo "== [docker] cmgr client cert (cmgrd -> worker dockerd) =="
+echo "== [docker] cmgr client cert (corkd -> worker dockerd) =="
 issue docker client "cmgr" \
   "extendedKeyUsage = clientAuth"
 
@@ -105,7 +105,7 @@ issue zot server "$REGISTRY" \
   "subjectAltName = $REGISTRY_SAN" \
   "extendedKeyUsage = serverAuth"
 
-echo "== [zot] cmgr client cert (orchestrator push + cmgrd delete, read-write) =="
+echo "== [zot] cmgr client cert (orchestrator push + corkd delete, read-write) =="
 issue zot client "cmgr" \
   "extendedKeyUsage = clientAuth"
 
@@ -142,7 +142,7 @@ ORCHESTRATOR
   zot-client-key.pem      -> CERTS.D/client.key
 
 EACH WORKER
-  docker-ca-cert.pem      -> dockerd --tlscacert           (verify cmgrd client cert)
+  docker-ca-cert.pem      -> dockerd --tlscacert           (verify corkd client cert)
   docker-server-cert.pem  -> dockerd --tlscert   (listen tcp://0.0.0.0:2376, --tlsverify)
   docker-server-key.pem   -> dockerd --tlskey
   zot-ca-cert.pem         -> CERTS.D/ca.crt                (verify zot server cert)

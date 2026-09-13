@@ -4,7 +4,7 @@
 # Every build path stamps the same value into both binaries, and they disagreed
 # before this existed: the CI workflow used `--tags --always`, the release
 # workflow `--tags`, and the e2e image `--tags --always --dirty`. Worse, CI
-# stamped only the daemon's variable, so a `cmgrd-cli` built anywhere but a
+# stamped only the daemon's variable, so a `cork` built anywhere but a
 # release reported its version as "unknown".
 #
 # The flags, and why each one is here:

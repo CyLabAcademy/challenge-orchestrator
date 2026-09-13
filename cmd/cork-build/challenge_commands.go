@@ -17,7 +17,7 @@ import (
 //
 // They read and write this build plane and nothing else, and that is the
 // whole division. An orchestrator is told what it serves, so what it holds
-// is asked of the daemon (cmgrd-cli). What a challenge IS -- its metadata,
+// is asked of the daemon (cork). What a challenge IS -- its metadata,
 // its type, its Dockerfile, whether the tree has drifted from the record --
 // is answered here, because here is where the tree is.
 //

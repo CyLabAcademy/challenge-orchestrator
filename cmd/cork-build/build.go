@@ -302,7 +302,7 @@ func pinsCommand(mgr *cmgr.Manager) int {
 	return NO_ERROR
 }
 
-// loadSchema reads a schema file, as cmgrd-cli reads one for the
+// loadSchema reads a schema file, as cork reads one for the
 // orchestrator: the same yaml or json, and here it is what decides what is
 // built.
 func loadSchema(path string) (*cmgr.Schema, error) {

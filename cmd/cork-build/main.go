@@ -1,4 +1,4 @@
-// cork-build is a cork deployment's build plane: the half of cmgrd that
+// cork-build is a cork deployment's build plane: the half of corkd that
 // CORK_BUILD_PLANE=external leaves out (issue #18). It reads the schema files
 // an event is defined by, scans the challenge directory, builds and pushes
 // every build those schemas name, and hands the finished builds to the
@@ -219,7 +219,7 @@ which builds nothing itself.
 This is where the challenge tree lives and where every schema operation
 happens, so it is where cmgr's build and schema commands live too. What an
 orchestrator HOLDS -- instances, workers, what is running right now -- is
-asked of that daemon instead, with cmgrd-cli.
+asked of that daemon instead, with cork.
 
 Deploying:
   build <schema file> [<schema file> ...]
@@ -304,7 +304,7 @@ Options:
   --help
   --version
 
-Environment, all as cmgrd reads them (this is cmgrd's build path):
+Environment, all as corkd reads them (this is corkd's build path):
   Each of these also answers to the CMGR_ name it had before the rename
   (CMGR_DIR for CORK_DIR, and so on), read only when the CORK_ name is
   unset, and the old names are listed at startup where they are found.

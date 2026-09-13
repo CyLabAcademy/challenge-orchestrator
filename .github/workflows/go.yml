@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CMGR_LOGGING: debug
+  CORK_LOGGING: debug
 
 jobs:
   build:

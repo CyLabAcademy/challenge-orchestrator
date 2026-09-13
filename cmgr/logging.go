@@ -22,9 +22,9 @@ const (
 // complaint it returns is logged once the logger exists.
 //
 // This is the whole of that setting's effect, and for a while it had none:
-// the constant was declared and read nowhere, cmgrd hardcoded INFO and
+// the constant was declared and read nowhere, corkd hardcoded INFO and
 // offered no flag, so there was no way to raise an orchestrator's logging
-// at all -- while `cmgrd --help` went on documenting it.
+// at all -- while `corkd --help` went on documenting it.
 func LogLevelFromEnv(fallback LogLevel) (LogLevel, error) {
 	value, isSet := LookupEnv(LOGGING_ENV)
 	if !isSet || value == "" {

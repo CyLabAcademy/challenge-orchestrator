@@ -27,7 +27,7 @@ type serverInfo struct {
 	BuildPlane string `json:"build_plane"`
 }
 
-// handOverResponse is the orchestrator's answer to a hand-over, as cmgrd's
+// handOverResponse is the orchestrator's answer to a hand-over, as corkd's
 // HandOverResponse writes it. Only what is reported here is decoded.
 type handOverResponse struct {
 	Added      []string `json:"added"`
@@ -115,7 +115,7 @@ func handOver(server string, id cmgr.ChallengeId, payload *cmgr.HandOver) error 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// No timeout, as the cmgrd CLI has none for the same reason: a
+	// No timeout, as the corkd CLI has none for the same reason: a
 	// hand-over restarts and relaunches the instances of the generation it
 	// replaces, which legitimately takes minutes.
 	resp, err := (&http.Client{}).Do(req)
@@ -146,7 +146,7 @@ func handOver(server string, id cmgr.ChallengeId, payload *cmgr.HandOver) error 
 	return nil
 }
 
-// httpClient is what an operation uses: no timeout, as the cmgrd CLI has
+// httpClient is what an operation uses: no timeout, as the corkd CLI has
 // none, because a release or a converge legitimately takes minutes.
 func httpClient() *http.Client { return &http.Client{} }
 

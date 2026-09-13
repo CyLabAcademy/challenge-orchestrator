@@ -35,7 +35,7 @@ type takenHandOver struct {
 	body        []byte
 }
 
-// orchestrator stands in for a cmgrd on an external build plane: it reads a
+// orchestrator stands in for a corkd on an external build plane: it reads a
 // hand-over exactly as the endpoint does -- one JSON body -- and answers
 // what `answer` says.
 func orchestrator(t *testing.T, status int, answer any) (*httptest.Server, *takenHandOver) {

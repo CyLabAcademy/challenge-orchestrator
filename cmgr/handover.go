@@ -28,22 +28,22 @@ import (
 
 // ErrLocalBuildPlane refuses a hand-over on a local build plane: that daemon
 // builds its own challenges from its tree, and a build handed to it would be
-// rebuilt over by the next update. cmgrd reports it as 409.
+// rebuilt over by the next update. corkd reports it as 409.
 var ErrLocalBuildPlane = errors.New("the build plane is local: this daemon builds its own challenges and takes no hand-over")
 
 // ErrHandOverInvalid is a hand-over refused for what it says: a payload that
 // contradicts itself, or a build whose content checksum is not what its
-// inputs give. Nothing was written. cmgrd reports it as 400.
+// inputs give. Nothing was written. corkd reports it as 400.
 var ErrHandOverInvalid = errors.New("invalid hand-over")
 
 // ErrNotInRegistry is a hand-over refused for what the registry says: an
 // image it names is not served under its tag, so no worker could pull it.
-// Nothing was written. cmgrd reports it as 409.
+// Nothing was written. corkd reports it as 409.
 var ErrNotInRegistry = errors.New("not in the registry")
 
 // ErrChallengeHasBuilds refuses to remove a challenge with builds on record:
 // they go with the schema that wants them (DeleteSchema) or with Destroy,
-// never silently with the challenge. cmgrd reports it as 409.
+// never silently with the challenge. corkd reports it as 409.
 var ErrChallengeHasBuilds = errors.New("the challenge still has builds")
 
 // HandOver is what PUT /challenges/{id} carries.

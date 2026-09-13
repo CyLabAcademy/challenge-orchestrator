@@ -2,7 +2,7 @@ swagger: "2.0"
 info:
   description: "This is a minimal REST API for `cmgr` that allows front-ends for a CTF to remotely manage challenges and their templating for events.  It is not intended to replace `cmgr` entirely as it does not currently expose the challenge update process."
   version: "0.2.0"
-  title: "cmgrd"
+  title: "corkd"
   contact:
     email: "code@acictf.com"
   license:
@@ -91,7 +91,7 @@ paths:
       consumes: ["application/json"]
       produces: ["application/json"]
       summary: "Hands the challenge and its builds over from an external build plane"
-      description: "How a build reaches a cmgrd on an external build plane (CMGR_BUILD_PLANE=external): the challenge as the build plane scanned it and each build as the build there left it, with the images already pushed to the registry. Metadata and image tags only -- artifact bundles do not travel with a hand-over, they stay on the build plane that made them, and has_artifacts says what the build published rather than promising bytes. Every build's content checksum is recomputed from the payload's inputs (its source checksum, the flag format, the pin fingerprint and this daemon's template for the challenge type) and every image tag is looked up in the registry, both before anything is recorded. The challenge is then persisted under the verdict an update would give it, each build's row is found or opened by its (schema, format, seed), and the build is committed as a rebuild is: the instances of the generation it replaces are restarted or relaunched. A build whose row already serves the generation delivered is left as it is, instances included, so the same hand-over twice changes nothing. A cmgrd on a local build plane refuses the hand-over."
+      description: "How a build reaches a corkd on an external build plane (CORK_BUILD_PLANE=external): the challenge as the build plane scanned it and each build as the build there left it, with the images already pushed to the registry. Metadata and image tags only -- artifact bundles do not travel with a hand-over, they stay on the build plane that made them, and has_artifacts says what the build published rather than promising bytes. Every build's content checksum is recomputed from the payload's inputs (its source checksum, the flag format, the pin fingerprint and this daemon's template for the challenge type) and every image tag is looked up in the registry, both before anything is recorded. The challenge is then persisted under the verdict an update would give it, each build's row is found or opened by its (schema, format, seed), and the build is committed as a rebuild is: the instances of the generation it replaces are restarted or relaunched. A build whose row already serves the generation delivered is left as it is, instances included, so the same hand-over twice changes nothing. A corkd on a local build plane refuses the hand-over."
       parameters:
         - in: "body"
           name: "hand_over"
@@ -108,7 +108,7 @@ paths:
         "400":
           description: "The hand-over contradicts itself or its inputs (a body that is not the HandOver JSON, a build of another challenge or source generation, a content checksum its inputs do not give, an image for a host the challenge does not name); nothing was recorded"
         "409":
-          description: "An image tag the hand-over names is not in the registry (nothing was recorded), or this cmgrd is on a local build plane and builds for itself"
+          description: "An image tag the hand-over names is not in the registry (nothing was recorded), or this corkd is on a local build plane and builds for itself"
         "500":
           description: "The registry or the database could not be asked (nothing was recorded), or a build could not be committed once the writes had begun: the body is the HandOverResponse, its errors naming each such build, dropped or left at its previous generation as after a failed rebuild"
         "200":
@@ -118,7 +118,7 @@ paths:
     delete:
       tags: [challenges]
       summary: "Removes a challenge that has no builds"
-      description: "The counterpart of the hand-over, for a challenge the build plane no longer has. Refused while builds of it are on record: those go with their schema (DELETE /schemas/{name}) or with DELETE /builds/{build_id}. A cmgrd on a local build plane accepts it too, but there its tree decides: the next update finds the challenge again unless it is gone from the tree as well."
+      description: "The counterpart of the hand-over, for a challenge the build plane no longer has. Refused while builds of it are on record: those go with their schema (DELETE /schemas/{name}) or with DELETE /builds/{build_id}. A corkd on a local build plane accepts it too, but there its tree decides: the next update finds the challenge again unless it is gone from the tree as well."
       responses:
         "404":
           description: "Invalid path string to include invalid challenge identifier"

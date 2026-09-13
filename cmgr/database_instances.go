@@ -9,7 +9,7 @@ import (
 
 // ErrDatabaseBusy: SQLite's write lock was not obtained within its busy
 // timeout, which only a burst of concurrent launches brings about.
-// Retryable (cmgrd answers 503 with Retry-After): the same request goes
+// Retryable (corkd answers 503 with Retry-After): the same request goes
 // through moments later.
 var ErrDatabaseBusy = errors.New("database busy")
 

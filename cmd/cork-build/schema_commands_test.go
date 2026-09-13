@@ -19,8 +19,8 @@ type takenRequest struct {
 	body   []byte
 }
 
-// orchestratorServing stands in for a cmgrd serving the schemas named, and
-// records what reached it. It answers as cmgrd does, which is the point of
+// orchestratorServing stands in for a corkd serving the schemas named, and
+// records what reached it. It answers as corkd does, which is the point of
 // it: an empty list for a schema it does not have, not a 404.
 func orchestratorServing(t *testing.T, schemas ...string) (string, *[]takenRequest) {
 	t.Helper()
@@ -35,7 +35,7 @@ func orchestratorServing(t *testing.T, schemas ...string) (string, *[]takenReque
 		*seen = append(*seen, takenRequest{r.Method, r.URL.Path, r.URL.RawQuery, body})
 		switch r.Method {
 		case http.MethodGet:
-			// As cmgrd answers: GET /schemas/<name> is a query over the
+			// As corkd answers: GET /schemas/<name> is a query over the
 			// builds table, so a schema it has never heard of is an empty
 			// list and a 200, not a 404. A fake that 404s there would have
 			// taught this test the wrong contract.
@@ -45,10 +45,10 @@ func orchestratorServing(t *testing.T, schemas ...string) (string, *[]takenReque
 				w.Write([]byte("[]"))
 			}
 		case http.MethodPost:
-			// update-schema, as cmgrd answers it: 204 and no body.
+			// update-schema, as corkd answers it: 204 and no body.
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodDelete:
-			// As cmgrd answers, for a schema it serves and one it has never
+			// As corkd answers, for a schema it serves and one it has never
 			// heard of alike: DeleteSchema over no rows removes nothing and
 			// fails at nothing, so both are 204. A fake that 404d on the
 			// second would have taught this test that a removal aimed at
