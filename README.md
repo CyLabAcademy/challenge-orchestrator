@@ -18,7 +18,7 @@ Cork accomplishes these following goals
 
 Cmgr produced two binaries: cmgr, which is the challenge development tool, and cmgrd, the challenge hosting daemon. Both relied on the cmgr go module, shared between both. Unfortunately, this is not a flexible or extensible framework, as changes to the daemon will impact the challenge development tool. Thus, the decision was made to separate the two functions.
 
-Challenge development capabilities remain with [cmgr](https://github.com/picoCTF/cmgr) as well as [PCM](https://github.com/picoCTF/challenge-manager). Cork is compatible with any challenge files and builds compatible with cmgr.
+Challenge development capabilities remain with [cmgr](https://github.com/picoCTF/cmgr) as well as PCM. Cork is compatible with any challenge files and builds compatible with cmgr.
 
 ### The shape of a deployment
 
@@ -106,9 +106,8 @@ dropped cmgr's development commands along with the `cmgr` binary: there is
 no `test`, `playtest` or `check`, and no solver framework behind them. It
 wants a docker daemon it can push from, and the multi-host shape wants two
 CAs and five certificates before anything starts. If you are writing or
-debugging a challenge, use [cmgr](https://github.com/picoCTF/cmgr) or
-[PCM](https://github.com/picoCTF/challenge-manager) — cork is compatible
-with what they produce, and reads the same challenge files.
+debugging a challenge, use [cmgr](https://github.com/picoCTF/cmgr) or PCM —
+cork is compatible with what they produce, and reads the same challenge files.
 
 To see the whole fleet run on one machine, `e2e/` holds a docker compose simulation of it (orchestrator, build daemon, registry, two workers with telemetry, real PKI) plus a scenario that drives the launch sequence through corkd and checks every box; see [e2e/README.md](e2e/README.md).
 
@@ -440,7 +439,7 @@ tar xzvf ../cmgr_`uname -s | tr '[:upper:]' '[:lower:]'`_amd64.tar.gz
 CMGR_LOGGING=info ./cmgr test --require-solve
 ```
 
-**NOTE:** Published binaries cover `linux_amd64` and `darwin_arm64` (Apple Silicon). On Apple Silicon, change `amd64` to `arm64` in the cmgr tarball URL. Intel Mac and Linux ARM builds are not published — build from source for those platforms (see [Back-End](#back-end)).
+**NOTE:** This applies to cmgr's releases, not cork's — cork publishes `linux_arm64` as well. cmgr's published binaries cover `linux_amd64` and `darwin_arm64` (Apple Silicon). On Apple Silicon, change `amd64` to `arm64` in the cmgr tarball URL. Intel Mac and Linux ARM builds are not published — build from source for those platforms (see [Back-End](#back-end)).
 
 At this point, you can start checking out problems by finding the challenge ID
 of one you would like to play and running `./cmgr playtest <challenge>`.  This
