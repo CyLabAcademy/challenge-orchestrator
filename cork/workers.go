@@ -1159,13 +1159,29 @@ func (m *Manager) AddWorker(ip, public string) error {
 	m.workersMu.Lock()
 	defer m.workersMu.Unlock()
 
+	// An empty public address leaves the stored one alone rather than clearing
+	// it. worker-add is also how an operator forces an immediate reconnect and
+	// reconcile — TROUBLESHOOTING says so — and its one-argument form has to be
+	// safe to run against a worker that is already registered. This column is
+	// the address a player connects to, so overwriting it with "" would
+	// silently repoint every instance cork went on to place there.
 	_, err := m.db.Exec(
-		"INSERT INTO workers(ip, public) VALUES (?, ?) ON CONFLICT(ip) DO UPDATE SET public = excluded.public;",
+		`INSERT INTO workers(ip, public) VALUES (?, ?)
+		 ON CONFLICT(ip) DO UPDATE SET
+		   public = CASE WHEN excluded.public = '' THEN workers.public ELSE excluded.public END;`,
 		ip, public,
 	)
 	if err != nil {
 		m.log.errorf("could not persist worker %s: %s", ip, err)
 		return err
+	}
+	if public == "" {
+		// Use whatever the row ended up holding, so the conn and the table
+		// agree: re-adding a worker must not change where players are sent.
+		if err := m.db.Get(&public, "SELECT public FROM workers WHERE ip = ?;", ip); err != nil {
+			m.log.errorf("could not read back the public address of worker %s: %s", ip, err)
+			return err
+		}
 	}
 
 	w, err := m.newWorkerConn(ip, public, false)

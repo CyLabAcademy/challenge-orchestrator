@@ -7,38 +7,68 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+**A second health axis on every worker.** `GET /workers` gains `reachable`
+(`ok` / `unresponsive` / `down`), from the worker's docker daemon, and `load`
+(`ok` / `overloaded` / `unknown`), from its telemetry agent, alongside `since`
+and `reason`. `health` stays as a derived, deprecated string: `down` or
+`unresponsive` when the worker is not reachable, `overloaded` when its load
+says so, otherwise `ok`. New in that field's vocabulary is `unresponsive`,
+which older clients never saw.
+
+**A real probe against dockerd**, rather than only sampling it with real
+traffic. `/_ping` on every tick, plus a one-container list on a slower one,
+since a daemon can answer a ping while containerd is wedged. A wedged daemon on
+an idle worker used to be found by the next launch, thirty seconds after a
+student asked for it.
+
+**Eleven `CORK_WORKER_*` settings** for the probe cadence, timeouts, miss
+thresholds and recovery backoff, each with its `CMGR_` fallback like the rest.
+`corkd --help` lists them.
+
+**A retryable answer for a fleet that is merely rebooting.** A launch refused
+because every worker is unresponsive is now a 503 with `Retry-After`; every
+worker being `down` remains a 500, because a fleet an operator took down is not
+going to resolve itself.
+
 ### Changed
 
-**Worker health is two states, and losing one is no longer permanent.** A
-worker now carries `reachable` (`ok` / `unresponsive` / `down`), from its
-docker daemon, and `load` (`ok` / `overloaded` / `unknown`), from its telemetry
-agent. They were one value before, which meant a telemetry agent restarting
-during a deploy could take a healthy box — dockerd fine, instances serving —
-out of the fleet until an operator ran `worker-add`. An unknown load now places.
+**Losing a worker is no longer permanent.** The two axes were one value before,
+which meant a telemetry agent restarting during a deploy could take a healthy
+box — dockerd fine, instances serving — out of the fleet until an operator ran
+`worker-add`. An unknown load now places: a box whose sidecar died is almost
+always still serving.
 
 `unresponsive` is cork's own verdict and reverses itself: the worker keeps
 being probed, and once its daemon answers it reconnects and reconciles before
 rejoining placement, the same sequence `worker-add` performs. Repeated failures
 are retried more slowly, and that is forgiven after a spell of running clean.
+A reboot or a `systemctl restart docker` therefore costs seconds of placement
+rather than an operator's attention.
+
 `down` stays what it was — asserted by `worker-down`, lifted only by
 `worker-add` — because an operator taking a box out of service knows something
-the probes do not.
-
-**dockerd is probed rather than only sampled by traffic.** `/_ping` on every
-tick, plus a one-container list on a slower one, since a daemon can answer a
-ping while containerd is wedged. A wedged daemon on an idle worker used to be
-found by the next launch, thirty seconds after a student asked for it. A
-control call that fails still ejects the worker at once and now also wakes the
-probe, so a `systemctl restart docker` costs seconds rather than an operator.
+the probes do not. Use it before a **termination**, not before a reboot: a
+reboot now needs nothing, and marking a box down first opts out of the
+recovery above.
 
 **Retimed.** Probes every 5s (was 500ms), ejecting after 6 consecutive misses
 (was 60). Same 30-second window, but misses are counted consecutively, and at
 the old cadence a worker answering one poll in sixty never tripped the
 threshold at all.
 
-`GET /workers` gains `reachable`, `load`, `since` and `reason`, and keeps
-`health` as a derived, deprecated string. A launch refused because every worker
-is unresponsive is now a retryable 503; every worker being `down` remains a 500.
+**`cork worker-list` prints both axes**, how long the worker has held the
+reachable one, and why — a second line per worker when there is a reason to
+show. Anything parsing that output positionally will need updating; the API is
+the stable contract.
+
+### Fixed
+
+`worker-add` given no public address now keeps the one already stored instead
+of clearing it. It doubles as the way to force an immediate reconnect, so its
+one-argument form has to be safe to run on a worker that is already
+registered — and that column is the address players are sent to.
 
 ## [1.0.1] — 2026-09-18
 
@@ -170,5 +200,6 @@ fallback goes, a build plane needs both.
 4. A single-host deployment needs no build plane: leave `CORK_BUILD_PLANE` unset
    and `corkd` builds on its own docker daemon, as cmgr did.
 
+[1.1.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.0
 [1.0.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.0.1
 [1.0.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.0.0

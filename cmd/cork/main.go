@@ -156,7 +156,8 @@ Workers:
       register a worker, or bring a down one back once it is rebooted or
       repaired (its instances come back with it: their containers restart on
       their own); the optional public address is what players are given for
-      its instances; containers and networks cork created on it for
+      its instances, and leaving it off keeps the address already stored
+      rather than clearing it; containers and networks cork created on it for
       instances it no longer records are removed first (as for every worker at
       corkd start). A daemon that stays unreachable while that runs leaves the
       worker unresponsive -- still probed, and still able to come back by

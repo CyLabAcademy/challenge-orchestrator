@@ -91,7 +91,9 @@ The cause is worth reading before acting, because the three differ:
 
 **When to intervene:** if the duration keeps growing and the box is healthy,
 look at the reason first. `cork worker-add <ip>` forces an immediate
-reconnect-and-reconcile rather than waiting out the backoff.
+reconnect-and-reconcile rather than waiting out the backoff. Given no public
+address it keeps the one already stored, so it is safe to run on a worker that
+is already registered — which is the only way it is ever used here.
 
 Do **not** reach for `cork worker-down` on the way to a reboot. It is asserted
 rather than observed, so no probe lifts it, and the box would come back

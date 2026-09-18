@@ -277,7 +277,8 @@ Workers:
   worker-add <ip> [<public address>]
       register a worker, or bring a down one back (a worker that merely
       stopped answering recovers on its own and needs no worker-add); the
-      optional public address is what players are given for its instances;
+      optional public address is what players are given for its instances, and
+      leaving it off keeps the address already stored rather than clearing it;
       containers and networks cork created on it for instances it no longer
       records are removed first (as for every worker at corkd start). A daemon
       that stays unreachable while that runs leaves the worker unresponsive,
