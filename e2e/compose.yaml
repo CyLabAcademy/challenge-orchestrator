@@ -149,7 +149,23 @@ services:
       # on-demand instances out from under it (production uses 1h).
       CORK_PRUNE_AGE: 24h
       # Detect a silent or hung worker in 10s instead of production's 30s.
+      # The budget is maxMisses x the probe interval, so both have to be set
+      # here: production probes every 5s, which would make 20 misses 100s and
+      # blow every health-transition wait in the scenario.
+      CORK_WORKER_POLL_INTERVAL: 500ms
       CORK_WORKER_MAX_MISSES: "20"
+      # Telemetry going quiet only moves the load axis, and the scenario waits
+      # on that too. Kept proportionally tighter than the docker budget, as the
+      # defaults are: 10 x 500ms = 5s.
+      CORK_WORKER_LOAD_MISSES: "10"
+      # Recovery is a first-class assertion now, not a worker-add, so the
+      # scenario has to be able to watch a worker come back inside a step.
+      # Production waits 10s x however many times the box has been ejected,
+      # capped at 5m; this fleet wants seconds. The decay is left long so a
+      # run that ejects the same worker repeatedly still backs off visibly
+      # rather than being forgiven between steps.
+      CORK_WORKER_RECOVER_BACKOFF: 1s
+      CORK_WORKER_RECOVER_BACKOFF_MAX: 5s
       CORK_WORKER_CONTROL_TIMEOUT: 10s
       # How long a request launch waits for one of a worker's two launch slots
       # before it is refused as busy, and the threshold admission control
