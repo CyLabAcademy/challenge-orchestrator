@@ -8,19 +8,19 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 // handOverPayload is a challenge as this plane hands one over: two builds,
 // the first having published artifacts and the second not. Neither carries
 // them -- HasArtifacts is a fact about the build, not a promise of bytes.
-func handOverPayload() *cmgr.HandOver {
+func handOverPayload() *cork.HandOver {
 	first := builtBuild("event", 1, 1)
 	first.HasArtifacts = true
-	second := builtBuild("event", 2, cmgr.DYNAMIC_INSTANCES)
+	second := builtBuild("event", 2, cork.DYNAMIC_INSTANCES)
 	second.Instances = nil
 	first.Instances = nil
-	return &cmgr.HandOver{
+	return &cork.HandOver{
 		Challenge:      builtChallenge("test/handed-over", 0x1111, first, second),
 		PinFingerprint: 0xABCD,
 	}
@@ -31,11 +31,11 @@ type takenHandOver struct {
 	method      string
 	path        string
 	contentType string
-	payload     cmgr.HandOver
+	payload     cork.HandOver
 	body        []byte
 }
 
-// orchestrator stands in for a cmgrd on an external build plane: it reads a
+// orchestrator stands in for a corkd on an external build plane: it reads a
 // hand-over exactly as the endpoint does -- one JSON body -- and answers
 // what `answer` says.
 func orchestrator(t *testing.T, status int, answer any) (*httptest.Server, *takenHandOver) {
@@ -43,7 +43,7 @@ func orchestrator(t *testing.T, status int, answer any) (*httptest.Server, *take
 	taken := &takenHandOver{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/version" {
-			json.NewEncoder(w).Encode(serverInfo{Version: buildVersion(), BuildPlane: cmgr.BuildPlaneExternal})
+			json.NewEncoder(w).Encode(serverInfo{Version: buildVersion(), BuildPlane: cork.BuildPlaneExternal})
 			return
 		}
 		taken.method, taken.path = r.Method, r.URL.Path
@@ -137,17 +137,17 @@ func TestCheckServer(t *testing.T) {
 		t.Cleanup(server.Close)
 		return server.URL
 	}
-	external := answer(serverInfo{Version: buildVersion(), BuildPlane: cmgr.BuildPlaneExternal}, http.StatusOK)
+	external := answer(serverInfo{Version: buildVersion(), BuildPlane: cork.BuildPlaneExternal}, http.StatusOK)
 	if err := checkServer(external); err != nil {
 		t.Errorf("an orchestrator on an external build plane: %v", err)
 	}
-	local := answer(serverInfo{Version: buildVersion(), BuildPlane: cmgr.BuildPlaneLocal}, http.StatusOK)
+	local := answer(serverInfo{Version: buildVersion(), BuildPlane: cork.BuildPlaneLocal}, http.StatusOK)
 	if err := checkServer(local); err == nil || !strings.Contains(err.Error(), "takes no hand-over") {
 		t.Errorf("an orchestrator that builds for itself: %v", err)
 	}
 	// Neither an older orchestrator nor one that cannot be asked stops a
 	// hand-over: the hand-over itself reports what is really wrong.
-	older := answer(serverInfo{Version: "v0.0.1", BuildPlane: cmgr.BuildPlaneExternal}, http.StatusOK)
+	older := answer(serverInfo{Version: "v0.0.1", BuildPlane: cork.BuildPlaneExternal}, http.StatusOK)
 	if err := checkServer(older); err != nil {
 		t.Errorf("an orchestrator of another version: %v", err)
 	}

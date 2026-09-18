@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 // The challenge-directory commands: what cmgr's own CLI did with a tree, on
@@ -17,7 +17,7 @@ import (
 //
 // They read and write this build plane and nothing else, and that is the
 // whole division. An orchestrator is told what it serves, so what it holds
-// is asked of the daemon (cmgrd-cli). What a challenge IS -- its metadata,
+// is asked of the daemon (cork). What a challenge IS -- its metadata,
 // its type, its Dockerfile, whether the tree has drifted from the record --
 // is answered here, because here is where the tree is.
 //
@@ -52,7 +52,7 @@ func parseCommandFlags(set *flag.FlagSet, args []string) (int, bool) {
 }
 
 // listCommand lists what the challenge directory holds, as recorded.
-func listCommand(mgr *cmgr.Manager, args []string) int {
+func listCommand(mgr *cork.Manager, args []string) int {
 	set := commandFlags("list", "")
 	verbose := set.Bool("verbose", false, "print each challenge's name as well as its id")
 	if code, ok := parseCommandFlags(set, args); !ok {
@@ -63,7 +63,7 @@ func listCommand(mgr *cmgr.Manager, args []string) int {
 }
 
 // searchCommand lists the challenges carrying every tag given.
-func searchCommand(mgr *cmgr.Manager, args []string) int {
+func searchCommand(mgr *cork.Manager, args []string) int {
 	set := commandFlags("search", "[<tag> ...]")
 	verbose := set.Bool("verbose", false, "print each challenge's name as well as its id")
 	if code, ok := parseCommandFlags(set, args); !ok {
@@ -74,7 +74,7 @@ func searchCommand(mgr *cmgr.Manager, args []string) int {
 }
 
 // infoCommand describes the challenges under a path.
-func infoCommand(mgr *cmgr.Manager, args []string) int {
+func infoCommand(mgr *cork.Manager, args []string) int {
 	set := commandFlags("info", "[<path>]")
 	verbose := set.Bool("verbose", false, "print the description, details and hints too")
 	if code, ok := parseCommandFlags(set, args); !ok {
@@ -86,7 +86,7 @@ func infoCommand(mgr *cmgr.Manager, args []string) int {
 	// The whole tree by default, not the working directory. cmgr's info
 	// defaulted to '.' because it was run from inside a challenge directory;
 	// cork-build is run by ansible or a CI job from wherever it happens to
-	// be, and DetectChanges refuses a path outside CMGR_DIR
+	// be, and DetectChanges refuses a path outside CORK_DIR
 	// (normalizeDirPath), so '.' would fail for the usual caller.
 	path := ""
 	if set.NArg() == 1 {
@@ -125,7 +125,7 @@ func infoCommand(mgr *cmgr.Manager, args []string) int {
 // is made per schema, which this command is not given. So an update rebuilds
 // and pushes here, and `build` is what puts the result in front of anyone.
 // The reading form, --dry-run, carries no such caveat.
-func updateCommand(mgr *cmgr.Manager, args []string) int {
+func updateCommand(mgr *cork.Manager, args []string) int {
 	set := commandFlags("update", "[<path>]")
 	verbose := set.Bool("verbose", false, "name the unmodified challenges too")
 	dryRun := set.Bool("dry-run", false, "report what would change without recording or rebuilding anything")
@@ -145,11 +145,11 @@ func updateCommand(mgr *cmgr.Manager, args []string) int {
 		path = set.Arg(0)
 	}
 
-	var updates *cmgr.ChallengeUpdates
+	var updates *cork.ChallengeUpdates
 	if *dryRun {
 		updates = mgr.DetectChanges(path)
 	} else {
-		updates = mgr.UpdateWithOptions(path, cmgr.UpdateOptions{PruneOldImages: *pruneOld})
+		updates = mgr.UpdateWithOptions(path, cork.UpdateOptions{PruneOldImages: *pruneOld})
 	}
 	printChanges(updates, *verbose)
 	if len(updates.Errors) > 0 {
@@ -166,7 +166,7 @@ func updateCommand(mgr *cmgr.Manager, args []string) int {
 // is the starting point for a custom challenge, and it is also the thing
 // folded into every build identity as the template checksum, so reading it
 // is how you see what a type currently means.
-func dockerfileCommand(mgr *cmgr.Manager, args []string) int {
+func dockerfileCommand(mgr *cork.Manager, args []string) int {
 	set := commandFlags("dockerfile", "<challenge type>")
 	outfile := set.String("output", "", "the `file` to write it to (default: stdout)")
 	if code, ok := parseCommandFlags(set, args); !ok {
@@ -204,7 +204,7 @@ var challengeTypeLine = regexp.MustCompile(`\n(\s*-\s*type:)\s*(.*)`)
 // type's reaches the identity as a template checksum instead, so every build
 // of it is a new generation after this -- which is the point: the Dockerfile
 // is the tree's to change now.
-func convertToCustomCommand(mgr *cmgr.Manager, args []string) int {
+func convertToCustomCommand(mgr *cork.Manager, args []string) int {
 	set := commandFlags("convert-to-custom", "<challenge directory>")
 	if code, ok := parseCommandFlags(set, args); !ok {
 		return code
@@ -321,7 +321,7 @@ func writeThenRename(path string, content []byte) error {
 
 // systemDumpCommand prints what this build plane has built -- its own
 // bookkeeping, not what anyone is serving. For that, ask an orchestrator.
-func systemDumpCommand(mgr *cmgr.Manager, args []string) int {
+func systemDumpCommand(mgr *cork.Manager, args []string) int {
 	set := commandFlags("system-dump", "[<challenge> ...]")
 	summary := set.Bool("summary", false, "print build and instance counts only")
 	asJSON := set.Bool("json", false, "print the state as json")
@@ -332,9 +332,9 @@ func systemDumpCommand(mgr *cmgr.Manager, args []string) int {
 		return usageError("system-dump --summary and --json are two different outputs; ask for one")
 	}
 
-	challenges := []cmgr.ChallengeId{}
+	challenges := []cork.ChallengeId{}
 	for _, id := range set.Args() {
-		challenges = append(challenges, cmgr.ChallengeId(id))
+		challenges = append(challenges, cork.ChallengeId(id))
 	}
 	state, err := mgr.DumpState(challenges)
 	if err != nil {
@@ -373,7 +373,7 @@ func systemDumpCommand(mgr *cmgr.Manager, args []string) int {
 	return NO_ERROR
 }
 
-func printChallenges(challenges []*cmgr.ChallengeMetadata, verbose bool) {
+func printChallenges(challenges []*cork.ChallengeMetadata, verbose bool) {
 	for _, challenge := range challenges {
 		if verbose {
 			fmt.Printf("%s: \"%s\"\n", challenge.Id, challenge.Name)
@@ -386,10 +386,10 @@ func printChallenges(challenges []*cmgr.ChallengeMetadata, verbose bool) {
 // printChanges names what a scan found, in the buckets DetectChanges sorts
 // them into. Unmodified is the one bucket that is usually everything, so it
 // is printed only when asked for.
-func printChanges(status *cmgr.ChallengeUpdates, verbose bool) {
+func printChanges(status *cork.ChallengeUpdates, verbose bool) {
 	for _, section := range []struct {
 		title string
-		of    []*cmgr.ChallengeMetadata
+		of    []*cork.ChallengeMetadata
 		quiet bool
 	}{
 		{"Unmodified", status.Unmodified, true},
@@ -419,7 +419,7 @@ func printChanges(status *cmgr.ChallengeUpdates, verbose bool) {
 // to answer from a tree that has drifted from the database: describing a
 // challenge as it was recorded while the directory says something else is
 // worse than being told to run `update`.
-func recordedUnder(mgr *cmgr.Manager, dir string) ([]*cmgr.ChallengeMetadata, error) {
+func recordedUnder(mgr *cork.Manager, dir string) ([]*cork.ChallengeMetadata, error) {
 	cu := mgr.DetectChanges(dir)
 	for i, meta := range cu.Unmodified {
 		full, err := mgr.GetChallengeMetadata(meta.Id)

@@ -10,8 +10,8 @@ tool prints only what actually differs from the baseline.
 Usage:
     python3 profile-diff.py PROFILE [--baseline BASELINE]
 
-The baseline defaults to cmgr's embedded policy (cmgr/seccomp.json),
-auto-located when run inside a cmgr checkout. Outside a checkout, pass
+The baseline defaults to cmgr's embedded policy (cork/seccomp.json),
+auto-located when run inside a cork checkout. Outside a checkout, pass
 --baseline explicitly.
 
 Exit codes: 0 = no semantic difference, 1 = differences found, 2 = error.
@@ -120,14 +120,14 @@ def describe(context_json):
 
 
 def find_default_baseline():
-    # The embedded policy from a cmgr checkout is authoritative; default.json
+    # The embedded policy from a cork checkout is authoritative; default.json
     # beside this script is its test-enforced identical copy, shipped with the
     # examples so the tool also works outside a checkout.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(script_dir, "..", "..", "cmgr", "seccomp.json"),
+        os.path.join(script_dir, "..", "..", "cork", "seccomp.json"),
         os.path.join(script_dir, "default.json"),
-        os.path.join(os.getcwd(), "cmgr", "seccomp.json"),
+        os.path.join(os.getcwd(), "cork", "seccomp.json"),
     ]
     for candidate in candidates:
         if os.path.isfile(candidate):
@@ -142,14 +142,14 @@ def main():
     parser.add_argument("profile", help="profile JSON to inspect")
     parser.add_argument(
         "--baseline",
-        help="baseline profile JSON (default: cmgr/seccomp.json in a cmgr checkout)",
+        help="baseline profile JSON (default: cork/seccomp.json in a cork checkout)",
     )
     options = parser.parse_args()
 
     baseline_path = options.baseline or find_default_baseline()
     if baseline_path is None:
         die(
-            "could not locate cmgr/seccomp.json automatically; "
+            "could not locate cork/seccomp.json automatically; "
             "pass --baseline <path to the embedded default policy>"
         )
 

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 // serverProbeTimeout bounds the one question asked of an orchestrator before
@@ -27,7 +27,7 @@ type serverInfo struct {
 	BuildPlane string `json:"build_plane"`
 }
 
-// handOverResponse is the orchestrator's answer to a hand-over, as cmgrd's
+// handOverResponse is the orchestrator's answer to a hand-over, as corkd's
 // HandOverResponse writes it. Only what is reported here is decoded.
 type handOverResponse struct {
 	Added      []string `json:"added"`
@@ -87,9 +87,9 @@ func checkServer(server string) error {
 		fmt.Fprintf(os.Stderr, "warning: could not read what %s is: %s\n", server, err)
 		return nil
 	}
-	if info.BuildPlane != cmgr.BuildPlaneExternal {
+	if info.BuildPlane != cork.BuildPlaneExternal {
 		return fmt.Errorf("%s builds its own challenges (%s=%s) and takes no hand-over",
-			server, cmgr.BUILD_PLANE_ENV, info.BuildPlane)
+			server, cork.BUILD_PLANE_ENV, info.BuildPlane)
 	}
 	if info.Version != buildVersion() {
 		fmt.Fprintf(os.Stderr, "warning: %s runs cork %s and this is %s; if a challenge template changed between them, every build's identity differs there and the hand-over is refused as invalid\n",
@@ -104,7 +104,7 @@ func checkServer(server string) error {
 // orchestrator is told only that a build has them (HasArtifacts), which is
 // what the platform reads to decide whether to offer a download. What
 // serves them reads this plane's artifact directory; see BUILDER.md.
-func handOver(server string, id cmgr.ChallengeId, payload *cmgr.HandOver) error {
+func handOver(server string, id cork.ChallengeId, payload *cork.HandOver) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("handing '%s' over to %s: %w", id, server, err)
@@ -115,7 +115,7 @@ func handOver(server string, id cmgr.ChallengeId, payload *cmgr.HandOver) error 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// No timeout, as the cmgrd CLI has none for the same reason: a
+	// No timeout, as the corkd CLI has none for the same reason: a
 	// hand-over restarts and relaunches the instances of the generation it
 	// replaces, which legitimately takes minutes.
 	resp, err := (&http.Client{}).Do(req)
@@ -146,7 +146,7 @@ func handOver(server string, id cmgr.ChallengeId, payload *cmgr.HandOver) error 
 	return nil
 }
 
-// httpClient is what an operation uses: no timeout, as the cmgrd CLI has
+// httpClient is what an operation uses: no timeout, as the corkd CLI has
 // none, because a release or a converge legitimately takes minutes.
 func httpClient() *http.Client { return &http.Client{} }
 
@@ -174,7 +174,7 @@ func readAnswer(resp *http.Response) string {
 // concerned (schemaExists is a query over the builds table, and the rows
 // arrived stamped with the name), so a create would be refused for a schema
 // that already exists.
-func convergeOn(address string, schema *cmgr.Schema) error {
+func convergeOn(address string, schema *cork.Schema) error {
 	body, err := json.Marshal(schema)
 	if err != nil {
 		return fmt.Errorf("converging schema '%s' on %s: %w", schema.Name, address, err)

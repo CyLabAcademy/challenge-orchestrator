@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 // takenRequest is what an orchestrator saw.
@@ -19,8 +19,8 @@ type takenRequest struct {
 	body   []byte
 }
 
-// orchestratorServing stands in for a cmgrd serving the schemas named, and
-// records what reached it. It answers as cmgrd does, which is the point of
+// orchestratorServing stands in for a corkd serving the schemas named, and
+// records what reached it. It answers as corkd does, which is the point of
 // it: an empty list for a schema it does not have, not a 404.
 func orchestratorServing(t *testing.T, schemas ...string) (string, *[]takenRequest) {
 	t.Helper()
@@ -35,7 +35,7 @@ func orchestratorServing(t *testing.T, schemas ...string) (string, *[]takenReque
 		*seen = append(*seen, takenRequest{r.Method, r.URL.Path, r.URL.RawQuery, body})
 		switch r.Method {
 		case http.MethodGet:
-			// As cmgrd answers: GET /schemas/<name> is a query over the
+			// As corkd answers: GET /schemas/<name> is a query over the
 			// builds table, so a schema it has never heard of is an empty
 			// list and a 200, not a 404. A fake that 404s there would have
 			// taught this test the wrong contract.
@@ -45,10 +45,10 @@ func orchestratorServing(t *testing.T, schemas ...string) (string, *[]takenReque
 				w.Write([]byte("[]"))
 			}
 		case http.MethodPost:
-			// update-schema, as cmgrd answers it: 204 and no body.
+			// update-schema, as corkd answers it: 204 and no body.
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodDelete:
-			// As cmgrd answers, for a schema it serves and one it has never
+			// As corkd answers, for a schema it serves and one it has never
 			// heard of alike: DeleteSchema over no rows removes nothing and
 			// fails at nothing, so both are 204. A fake that 404d on the
 			// second would have taught this test that a removal aimed at
@@ -234,7 +234,7 @@ func TestMigrateSchemaNeedsDestinations(t *testing.T) {
 // concerned -- and it carries the schema as written, instance counts and all.
 func TestConvergeOn(t *testing.T) {
 	address, seen := orchestratorServing(t, "spring")
-	schema := routedSchema("spring", "event", "flag{%s}", map[cmgr.ChallengeId][]int{"a/one": {1}})
+	schema := routedSchema("spring", "event", "flag{%s}", map[cork.ChallengeId][]int{"a/one": {1}})
 
 	if err := convergeOn(address, schema); err != nil {
 		t.Fatalf("converging: %s", err)
@@ -247,15 +247,15 @@ func TestConvergeOn(t *testing.T) {
 	// What it sent is the schema as written, not the on-demand one the
 	// build plane converged its own database with: the counts are the whole
 	// reason the orchestrator is being asked to converge.
-	var sent cmgr.Schema
+	var sent cork.Schema
 	if err := json.Unmarshal(last.body, &sent); err != nil {
 		t.Fatalf("the converge body is not a schema: %s (%q)", err, last.body)
 	}
 	if sent.Name != "spring" || sent.FlagFormat != "flag{%s}" {
 		t.Errorf("the converge sent name %q, flag format %q", sent.Name, sent.FlagFormat)
 	}
-	if got := sent.Challenges["a/one"].InstanceCount; got != cmgr.DYNAMIC_INSTANCES {
-		t.Errorf("the converge sent instance count %d, want the schema's %d", got, cmgr.DYNAMIC_INSTANCES)
+	if got := sent.Challenges["a/one"].InstanceCount; got != cork.DYNAMIC_INSTANCES {
+		t.Errorf("the converge sent instance count %d, want the schema's %d", got, cork.DYNAMIC_INSTANCES)
 	}
 
 	// A refusal is reported rather than swallowed: a converge that did not

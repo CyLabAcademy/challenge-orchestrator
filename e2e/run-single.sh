@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bring up the class box and run its scenario on it.
 #
-# One container: dockerd and cmgrd together, no registry, no workers, no PKI.
+# One container: dockerd and corkd together, no registry, no workers, no PKI.
 # See compose-single.yaml for why this exists alongside run.sh -- in short,
 # the multi-host fleet covers what cork does, and this covers the deployment
 # that has none of what the multi-host fleet is made of.
@@ -19,7 +19,7 @@ cd "$(dirname "$0")"
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 export CORK_VERSION="${CORK_VERSION:-$(sh ../ci/version.sh)}"
 P=cork-e2e-single
-# No --wait: the scenario's first step waits for cmgrd and says what it was
+# No --wait: the scenario's first step waits for corkd and says what it was
 # waiting for when it gives up, and two waits with two timeouts would drift.
 docker compose -p "$P" -f compose-single.yaml up -d --build
 docker compose -p "$P" -f compose-single.yaml exec -T box bash /opt/e2e/scenario-single.sh

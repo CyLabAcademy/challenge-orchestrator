@@ -19,7 +19,7 @@ skipped by challenge discovery and by `cmgr test`.
 
 ## What the default policy already allows
 
-Every Linux container gets cmgr's embedded policy (`cmgr/seccomp.json`) unless a
+Every Linux container gets cmgr's embedded policy (`cork/seccomp.json`) unless a
 challenge selects otherwise. It is a broad allowlist, not a jail:
 
 - `defaultAction` is `SCMP_ACT_ERRNO` returning `EPERM`
@@ -74,7 +74,7 @@ details, and [../execstack/](../execstack/) for a worked challenge.
 ## What these examples will and will not do
 
 A profile **replaces** the default; there is no "add one rule" form. Each file
-here is a full copy of `cmgr/seccomp.json` with a small delta, which is why they
+here is a full copy of `cork/seccomp.json` with a small delta, which is why they
 are large. When cmgr's embedded policy changes, these do not follow
 automatically.
 
@@ -93,7 +93,7 @@ to miss in review. Review the *delta* instead:
 
 ```console
 $ python3 profile-diff.py execstack.json
-baseline: .../cmgr/seccomp.json
+baseline: .../cork/seccomp.json
 profile:  execstack.json
 
 ~ personality
@@ -154,7 +154,7 @@ profile, Makefile, and solver -- see [../execstack/](../execstack/).
 
 ### `default.json` — the baseline
 
-A pristine copy of the embedded policy (`cmgr/seccomp.json`), kept
+A pristine copy of the embedded policy (`cork/seccomp.json`), kept
 byte-identical by a test. Selecting it as a challenge's profile just
 reproduces the default; its purpose is to be **copied** when you need a
 change the other examples do not cover: copy it beside your `problem.md`,

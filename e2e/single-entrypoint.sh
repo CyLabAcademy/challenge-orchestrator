@@ -1,17 +1,17 @@
 #!/bin/sh
-# Start the box: dockerd first, then cmgrd beside it on the local socket.
+# Start the box: dockerd first, then corkd beside it on the local socket.
 #
 # This is the shape a class deployment has and the multi-host fleet never
 # does -- one daemon, reached at /var/run/docker.sock with no DOCKER_HOST and
-# no certificates. cmgrd runs in the foreground so the container's lifetime is
+# no certificates. corkd runs in the foreground so the container's lifetime is
 # the orchestrator's.
 set -eu
 
 # The tree, seeded once from the read-only mount, so the scenario can edit a
 # challenge and run update. Same contract as cork-entrypoint.sh.
-if [ -d /challenges-seed ] && [ -d "${CMGR_DIR:-/challenges}" ] && [ -z "$(ls -A "${CMGR_DIR:-/challenges}")" ]; then
-  echo "seeding ${CMGR_DIR:-/challenges} from /challenges-seed"
-  cp -a /challenges-seed/. "${CMGR_DIR:-/challenges}/"
+if [ -d /challenges-seed ] && [ -d "${CORK_DIR:-/challenges}" ] && [ -z "$(ls -A "${CORK_DIR:-/challenges}")" ]; then
+  echo "seeding ${CORK_DIR:-/challenges} from /challenges-seed"
+  cp -a /challenges-seed/. "${CORK_DIR:-/challenges}/"
 fi
 
 # dind's own entrypoint, which sets up cgroups, iptables and storage before

@@ -31,7 +31,7 @@ on disk.  See `BUILDER.md`.
 The trade the freeze made is still the trade: holding a base still means not
 picking up its security updates either, so a pinned `node` may collect
 "alternate solutions" over time.  The difference is that moving a base is now a
-deliberate act with a record (`cmgrd-cli pin-refresh`) rather than a property of
+deliberate act with a record (`cork pin-refresh`) rather than a property of
 whichever copy a builder happened to have cached.
 
 ### Publishing ports

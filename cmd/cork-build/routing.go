@@ -5,7 +5,7 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/CyLabAcademy/challenge-orchestrator/cmgr"
+	"github.com/CyLabAcademy/challenge-orchestrator/cork"
 )
 
 // A route is one orchestrator and the schemas it serves. Schemas are grouped
@@ -21,7 +21,7 @@ const serverRouteName = "--server"
 type route struct {
 	name    string // the destination as a schema names it, or "--server"
 	address string
-	schemas []*cmgr.Schema
+	schemas []*cork.Schema
 }
 
 // routeSchemas works out where each schema goes.
@@ -32,7 +32,7 @@ type route struct {
 // stops the run before anything is handed anywhere -- all of them named at
 // once, since an operator fixing one destination line wants to know about
 // the others too.
-func routeSchemas(schemas []*cmgr.Schema, servers []string, dests *destinations) ([]route, error) {
+func routeSchemas(schemas []*cork.Schema, servers []string, dests *destinations) ([]route, error) {
 	if len(servers) > 0 {
 		routes := make([]route, 0, len(servers))
 		for _, address := range servers {

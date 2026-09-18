@@ -16,7 +16,7 @@
 #
 # Every step asserts something that is only true here:
 #
-#   1. cmgrd starts with no registry, no DOCKER_HOST, no certs and no workers
+#   1. corkd starts with no registry, no DOCKER_HOST, no certs and no workers
 #   2. a build is made and kept on the one daemon, with nothing pushed
 #   3. the converge places its instance on that daemon -- no worker on the row
 #   4. it serves, and its own solver gets the flag cork recorded for the build
@@ -29,13 +29,13 @@
 set -uo pipefail
 
 CORK="${E2E_CORK:-http://127.0.0.1:4200}"
-export CMGRD_SERVER="$CORK"
+export CORK_SERVER="$CORK"
 DOCKER_SOCK="${E2E_DOCKER_SOCK:-/var/run/docker.sock}"
-CHALLENGES="${CMGR_DIR:-/challenges}"
+CHALLENGES="${CORK_DIR:-/challenges}"
 SCHEMA_FILE=/opt/e2e/schema-single.yaml
 SCHEMA_NAME=single
 CHALLENGE=cmgr/examples/binex101
-SRC=remote-make/BinEx101.c   # the file the rebuild step edits, under CMGR_DIR
+SRC=remote-make/BinEx101.c   # the file the rebuild step edits, under CORK_DIR
 SEED="${E2E_SEED:-/challenges-seed}"   # the read-only pristine tree, to restore from
 T0=$(date +%s)
 
@@ -75,8 +75,8 @@ image_name() { # image_name <build metadata json> <host>
 
 # ---------------------------------------------------------------- 1. startup
 
-step "startup: cmgrd runs beside dockerd on one box, with no registry, no DOCKER_HOST, no certificates and no workers"
-retry 90 "cmgrd to answer on $CORK" curl -sSf --max-time 3 -o /dev/null "$CORK/version"
+step "startup: corkd runs beside dockerd on one box, with no registry, no DOCKER_HOST, no certificates and no workers"
+retry 90 "corkd to answer on $CORK" curl -sSf --max-time 3 -o /dev/null "$CORK/version"
 version=$(api GET /version)
 [[ "$(jq -r .build_plane <<<"$version")" == "local" ]] ||
   fail "build_plane is '$(jq -r .build_plane <<<"$version")', want local: this fleet is the default deployment, not an external build plane"
@@ -84,11 +84,11 @@ version=$(api GET /version)
   fail "DOCKER_HOST is set to '$DOCKER_HOST': this box is meant to prove cork reaches docker at its local socket"
 box /_ping >/dev/null || fail "the docker daemon is not answering on $DOCKER_SOCK"
 # No workers, and none coming: this is what makes every launch below take the
-# local-daemon path (selectWorker returns "", cmgr/api.go).
+# local-daemon path (selectWorker returns "", cork/api.go).
 workers=$(api GET /workers)
 [[ "$(jq -r 'length' <<<"$workers")" == 0 ]] ||
-  fail "cmgrd came up with workers registered: $workers"
-ok "cmgrd serves with CMGR_REGISTRY, DOCKER_HOST, DOCKER_CERT_PATH and CMGR_BUILD_PLANE all unset, and no worker registered"
+  fail "corkd came up with workers registered: $workers"
+ok "corkd serves with CORK_REGISTRY, DOCKER_HOST, DOCKER_CERT_PATH and CORK_BUILD_PLANE all unset, and no worker registered"
 
 # ------------------------------------------------------- 2. build, no registry
 
@@ -96,12 +96,12 @@ step "build: the challenge tree is scanned and built on the one daemon, with no 
 # --verbose so Unmodified is printed too: nothing else scans the tree, but
 # these volumes outlive a run, so on the second run the challenge is already
 # recorded and a quiet update would name nothing.
-out=$(cmgrd-cli update --verbose) || fail "update failed: $out"
+out=$(cork update --verbose) || fail "update failed: $out"
 sed 's/^/       /' <<<"$out"
 grep -q "$CHALLENGE" <<<"$out" ||
   fail "update did not report $CHALLENGE at all: $out"
 t=$(date +%s)
-cmgrd-cli add-schema "$SCHEMA_FILE" || fail "add-schema failed"
+cork add-schema "$SCHEMA_FILE" || fail "add-schema failed"
 note "the schema converged in $(( $(date +%s) - t ))s"
 
 BUILD=$(api GET "/schemas/$SCHEMA_NAME" | jq -r --arg id "$CHALLENGE" '.[] | select(.id == $id) | .builds[0].id')
@@ -141,7 +141,7 @@ PERSIST=$(api GET /state | jq -r --argjson b "$BUILD" '.[].builds[]? | select(.i
 pmeta=$(api GET "/instances/$PERSIST")
 # The whole point of this fleet. On the multi-host one this field always names
 # a worker; here it must be empty, which is the branch instanceClient takes to
-# hand back m.cli (cmgr/workers.go) instead of a worker's client.
+# hand back m.cli (cork/workers.go) instead of a worker's client.
 worker=$(jq -r '.worker // ""' <<<"$pmeta")
 [[ -z "$worker" ]] ||
   fail "instance $PERSIST was placed on worker '$worker', although none is registered: this deployment has only the local daemon"
@@ -185,7 +185,7 @@ before_tag=$(image_name "$meta" challenge)
 cp "$SEED/$SRC" "$CHALLENGES/$SRC" || fail "could not restore $SRC from the seed"
 sed -i 's/Give me a number/Give me a number, please/' "$CHALLENGES/$SRC" ||
   fail "could not edit $CHALLENGES/$SRC"
-out=$(cmgrd-cli update) || fail "the update after the source edit failed: $out"
+out=$(cork update) || fail "the update after the source edit failed: $out"
 sed 's/^/       /' <<<"$out"
 after=$(api GET "/builds/$BUILD")
 after_tag=$(image_name "$after" challenge)
@@ -214,7 +214,7 @@ pmeta=$(api GET "/instances/$PERSIST") ||
 containers=$(jq -r '.containers[]' <<<"$pmeta")
 # The schema holds this instance, so removing the schema is what stops it --
 # a direct stop of a locked build's instance is refused, as it is anywhere.
-cmgrd-cli remove-schema "$SCHEMA_NAME" || fail "remove-schema failed"
+cork remove-schema "$SCHEMA_NAME" || fail "remove-schema failed"
 [[ "$(api_status GET "/builds/$BUILD")" == 404 ]] || fail "build $BUILD survived the schema removal"
 for cid in $containers; do
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --unix-socket "$DOCKER_SOCK" "http://localhost/containers/$cid/json")
@@ -244,7 +244,7 @@ nets=$(box "/networks" | jq -r '[.[] | select(.Name | test("^cmgr-"))] | length'
 # tree and the database agreeing.
 cp "$SEED/$SRC" "$CHALLENGES/$SRC" || fail "could not restore $SRC from the seed"
 cmp -s "$SEED/$SRC" "$CHALLENGES/$SRC" || fail "$SRC still differs from the seed after the restore"
-cmgrd-cli update >/dev/null || true
+cork update >/dev/null || true
 ok "instances gone, builds gone, both image generations gone from the one daemon, no cmgr containers or networks left, tree restored"
 
 printf '\nALL STEPS PASSED in %ds\n' "$(( $(date +%s) - T0 ))"
