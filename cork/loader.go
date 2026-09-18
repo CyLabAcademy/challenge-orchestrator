@@ -1,11 +1,14 @@
 package cork
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -442,14 +445,23 @@ func (m *Manager) validateBuild(cMeta *ChallengeMetadata, md *BuildMetadata, fil
 	}
 	m.log.debugf("lookups: %#v", refLookup)
 
-	checkTemplated := func(s string) error {
-		var err error
+	// Every problem is collected rather than kept one at a time. An author
+	// with two mistakes should see both, and the published-but-unreferenced
+	// sweeps below run last, so keeping only the newest error let them report
+	// over a bad reference the checks had already found -- the typo that is
+	// usually the cause of both went unmentioned.
+	var problems []error
+	report := func(format string, args ...interface{}) {
+		err := fmt.Errorf(format, args...)
+		m.log.error(err)
+		problems = append(problems, err)
+	}
+
+	checkTemplated := func(s string) {
 		fileRefs := urlRe.FindAllStringSubmatch(s, -1)
 		for _, ref := range fileRefs {
-			_, ok := refFile[ref[1]]
-			if !ok {
-				err = fmt.Errorf("unknown artifact '%s' referenced with '%s': %s/%d", ref[1], ref[0], md.Challenge, md.Id)
-				m.log.error(err)
+			if _, ok := refFile[ref[1]]; !ok {
+				report("unknown artifact '%s' referenced with '%s': %s/%d", ref[1], ref[0], md.Challenge, md.Id)
 			} else {
 				refFile[ref[1]] = true
 			}
@@ -457,44 +469,34 @@ func (m *Manager) validateBuild(cMeta *ChallengeMetadata, md *BuildMetadata, fil
 
 		lookupRefs := lookupRe.FindAllStringSubmatch(s, -1)
 		for _, ref := range lookupRefs {
-			_, ok := refLookup[ref[1]]
-			if !ok {
-				err = fmt.Errorf("unknown lookup key of '%s' referenced with '%s': %s/%d", ref[1], ref[0], md.Challenge, md.Id)
-				m.log.error(err)
+			if _, ok := refLookup[ref[1]]; !ok {
+				report("unknown lookup key of '%s' referenced with '%s': %s/%d", ref[1], ref[0], md.Challenge, md.Id)
 			} else {
 				refLookup[ref[1]] = true
 			}
 		}
-
-		return err
 	}
 
 	// Validate templated fields
-	err := checkTemplated(cMeta.Description)
-	detailsErr := checkTemplated(cMeta.Details)
-	if detailsErr != nil {
-		err = detailsErr
-	}
-
+	checkTemplated(cMeta.Description)
+	checkTemplated(cMeta.Details)
 	for _, hint := range cMeta.Hints {
-		tmpErr := checkTemplated(hint)
+		checkTemplated(hint)
+	}
 
-		if tmpErr != nil {
-			err = tmpErr
+	// Sorted rather than ranged over directly: with more than one of these to
+	// report, map order decided which the author was told about, and now that
+	// they are all reported it would decide what order they came in. Either
+	// way the same challenge gave a different message run to run.
+	for _, f := range slices.Sorted(maps.Keys(refFile)) {
+		if !refFile[f] {
+			report("artifact file '%s' published but not referenced: %s/%d", f, md.Challenge, md.Id)
 		}
 	}
 
-	for f, used := range refFile {
-		if !used {
-			err = fmt.Errorf("artifact file '%s' published but not referenced: %s/%d", f, md.Challenge, md.Id)
-			m.log.error(err)
-		}
-	}
-
-	for key, used := range refLookup {
-		if !used {
-			err = fmt.Errorf("lookup value '%s' published but not referenced: %s/%d", key, md.Challenge, md.Id)
-			m.log.error(err)
+	for _, key := range slices.Sorted(maps.Keys(refLookup)) {
+		if !refLookup[key] {
+			report("lookup value '%s' published but not referenced: %s/%d", key, md.Challenge, md.Id)
 		}
 	}
 
@@ -509,7 +511,7 @@ func (m *Manager) validateBuild(cMeta *ChallengeMetadata, md *BuildMetadata, fil
 		m.log.warnf("challenge publishes no ports and produces no artifacts (missing a '# PUBLISH' directive? if intentional, use the 'flag-only' type): %s/%d", md.Challenge, md.Id)
 	}
 
-	return err
+	return errors.Join(problems...)
 }
 
 // Validates the challenge metadata for compliance with expectations
