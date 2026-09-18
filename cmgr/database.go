@@ -777,32 +777,42 @@ func (m *Manager) dumpState() ([]*ChallengeMetadata, error) {
 	}
 
 	for i, challenge := range challenges {
-		meta, err := m.lookupChallengeMetadata(challenge.Id)
+		meta, err := m.dumpChallenge(challenge.Id)
 		if err != nil {
 			return nil, err
-		}
-
-		meta.Builds = []*BuildMetadata{}
-		err = m.db.Select(&meta.Builds, "SELECT id FROM builds WHERE challenge=?", challenge.Id)
-		if err != nil {
-			m.log.errorf("failed to select builds for '%s': %s", challenge.Id, err)
-			return nil, err
-		}
-
-		for j, build := range meta.Builds {
-			bMeta, err := m.lookupBuildMetadata(build.Id)
-			if err != nil {
-				return nil, err
-			}
-
-			bMeta.Instances, err = m.lookupBuildInstances(bMeta.Id)
-			if err != nil {
-				m.log.errorf("failed to select instances for '%s/%d': %s", challenge.Id, bMeta.Id, err)
-				return nil, err
-			}
-			meta.Builds[j] = bMeta
 		}
 		challenges[i] = meta
 	}
 	return challenges, nil
+}
+
+// dumpChallenge is one element of dumpState: the challenge with every build
+// of it, and every instance of those.
+func (m *Manager) dumpChallenge(challenge ChallengeId) (*ChallengeMetadata, error) {
+	meta, err := m.lookupChallengeMetadata(challenge)
+	if err != nil {
+		return nil, err
+	}
+
+	meta.Builds = []*BuildMetadata{}
+	err = m.db.Select(&meta.Builds, "SELECT id FROM builds WHERE challenge=?", challenge)
+	if err != nil {
+		m.log.errorf("failed to select builds for '%s': %s", challenge, err)
+		return nil, err
+	}
+
+	for j, build := range meta.Builds {
+		bMeta, err := m.lookupBuildMetadata(build.Id)
+		if err != nil {
+			return nil, err
+		}
+
+		bMeta.Instances, err = m.lookupBuildInstances(bMeta.Id)
+		if err != nil {
+			m.log.errorf("failed to select instances for '%s/%d': %s", challenge, bMeta.Id, err)
+			return nil, err
+		}
+		meta.Builds[j] = bMeta
+	}
+	return meta, nil
 }

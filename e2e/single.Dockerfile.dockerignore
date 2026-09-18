@@ -1,0 +1,11 @@
+# Per-Dockerfile ignore file (BuildKit) for e2e/single.Dockerfile, whose
+# context is the repository root. The name is the contract: BuildKit reads
+# <dockerfile>.dockerignore, so cork.Dockerfile's copy does not apply here
+# and this build would otherwise ship .git -- which also invalidates the
+# COPY layer, and so the link step, on every commit or checkout.
+.git
+bin
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.tar.gz

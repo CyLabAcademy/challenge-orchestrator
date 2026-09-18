@@ -420,32 +420,6 @@ func workerListCommand(c *client, args []string) int {
 
 // Other -------------------------------------------------------------------
 
-func artifactsCommand(c *client, args []string) int {
-	if len(args) < 1 || len(args) > 2 {
-		fmt.Fprintln(os.Stderr, "usage: artifacts <build> [<output file>]")
-		return USAGE_ERROR
-	}
-	if _, err := strconv.Atoi(args[0]); err != nil {
-		fmt.Fprintf(os.Stderr, "error: could not interpret '%s' as a build id: %s\n", args[0], err)
-		return USAGE_ERROR
-	}
-
-	outFile := args[0] + ".tar.gz"
-	if len(args) == 2 {
-		outFile = args[1]
-	}
-
-	body, err := c.do("GET", "/builds/"+args[0]+"/artifacts.tar.gz", nil)
-	if err != nil {
-		return runtimeError(err)
-	}
-	if err := os.WriteFile(outFile, body, 0644); err != nil {
-		return runtimeError(err)
-	}
-	fmt.Printf("wrote %s (%d bytes)\n", outFile, len(body))
-	return NO_ERROR
-}
-
 func versionCommand(c *client, args []string) int {
 	fmt.Printf("client: %s\n", clientVersion())
 

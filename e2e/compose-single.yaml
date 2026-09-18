@@ -1,0 +1,65 @@
+# The single-host fleet: one container, because that is the whole claim.
+#
+# This is not a smaller copy of compose.yaml. The multi-host fleet covers what
+# cork does -- every delivery shape, artifacts, ports, admission, rebuild
+# generations, the registry and its failure paths. Repeating any of it here
+# would buy nothing. What no other scenario covers is the deployment that has
+# none of that: one box, one docker daemon, no registry, no workers, no
+# certificates. That is still the default (`CMGR_BUILD_PLANE` unset) and still
+# the legacy cmgr shape, and the multi-host work and the build-plane split
+# both landed on top of it.
+#
+# One service, and one service is the fidelity. dockerd and cmgrd share this
+# container (single.Dockerfile), so cork reaches docker at
+# /var/run/docker.sock with no DOCKER_HOST, instances publish on this host,
+# and the scenario runs here beside them -- localhost means what it means on a
+# real one-box install rather than standing in for it.
+services:
+  box:
+    build:
+      context: ..
+      dockerfile: e2e/single.Dockerfile
+      args:
+        CORK_VERSION: ${CORK_VERSION:-dev}
+        DIND_VERSION: ${DIND_VERSION:-29.6.0}
+    image: cork-e2e/single
+    privileged: true          # dockerd
+    command: ["cmgrd"]
+    environment:
+      # Empty, so dind's entrypoint mints no certificates of its own. It
+      # would then serve plain tcp on 2375 as well, which a class box has no
+      # use for and nothing here reaches; DOCKERD_HOST below cuts it back to
+      # the socket, so "cork talks to docker locally" is what runs and not
+      # only what this comment says.
+      DOCKER_TLS_CERTDIR: ""
+      # Read by single-entrypoint.sh, not by dockerd: the dind entrypoint
+      # appends its own --host flags when it is given none.
+      DOCKERD_HOST: "unix:///var/run/docker.sock"
+      CMGR_DIR: /challenges
+      CMGR_DB: /var/lib/cork/cmgr.db
+      CMGR_ARTIFACT_DIR: /var/lib/cork/artifacts
+      CMGR_PORTS: "21000-21029"
+      CMGR_PRUNE_AGE: 24h
+      # Deliberately absent, and the point of this fleet:
+      #   DOCKER_HOST          cork uses the local socket, as on a class box
+      #   CMGR_REGISTRY        nothing is pushed; images stay on this daemon
+      #   DOCKER_CERT_PATH     no worker dockerds to authenticate to
+      #   CMGR_BUILD_PLANE     unset is `local`, which is what a class box runs
+    volumes:
+      - ${CHALLENGE_DIR:-../examples}:/challenges-seed:ro
+      - single-challenges:/challenges
+      - single-cork-data:/var/lib/cork
+      - single-docker-data:/var/lib/docker
+      - ./scenario-single.sh:/opt/e2e/scenario-single.sh:ro
+      - ./schema-single.yaml:/opt/e2e/schema-single.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4200/version"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 10s
+
+volumes:
+  single-challenges:
+  single-cork-data:
+  single-docker-data:

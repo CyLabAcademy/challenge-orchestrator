@@ -53,7 +53,7 @@ func TestSchemaOperationsSerializeWithUpdates(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("second UpdateSchema did not complete: the first did not release updateMu")
 	}
-	if err := mgr.DeleteSchema(schema.Name); err != nil {
+	if err := mgr.DeleteSchema(schema.Name, true); err != nil {
 		t.Fatalf("DeleteSchema failed: %s", err)
 	}
 	if !mgr.updateMu.TryLock() {

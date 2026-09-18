@@ -70,6 +70,15 @@ func positiveEnvBytes(name string, fallback int64) (int64, error) {
 
 func (m *Manager) initPolicy() error {
 	var err error
+	if m.externalBuildPlane {
+		// These bound what comes out of a build's own container
+		// (cacheArtifacts, from executeBuild), so they are the build plane's
+		// and a daemon that builds nothing never reaches them. Still parsed
+		// below, so a malformed value is reported wherever it is set.
+		for _, name := range []string{maxArtifactFilesEnv, maxArtifactBytesEnv, maxArtifactFileBytesEnv} {
+			m.noteIgnoredSetting(name, externalPlaneIgnores)
+		}
+	}
 	if m.policy.MaxArtifactFiles, err = positiveEnvInt(
 		maxArtifactFilesEnv, defaultMaxArtifactFiles); err != nil {
 		return err

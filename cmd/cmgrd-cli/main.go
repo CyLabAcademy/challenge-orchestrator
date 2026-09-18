@@ -88,8 +88,6 @@ func main() {
 		exitCode = pinListCommand(c, cmdArgs)
 	case "pin-refresh":
 		exitCode = pinRefreshCommand(c, cmdArgs)
-	case "artifacts":
-		exitCode = artifactsCommand(c, cmdArgs)
 	case "version":
 		exitCode = versionCommand(c, cmdArgs)
 	case "help":
@@ -110,6 +108,14 @@ Usage: %s [--server <url>] <command> [<args>]
 
 A thin HTTP client for cmgrd: every command is an API call against the
 server; nothing touches the database, docker, or the registry directly.
+
+On a daemon running with CMGR_BUILD_PLANE=external, the commands that build
+answer 409 -- update, build, and the pin-* pair -- because that daemon
+builds nothing: cork-build does, from the machine holding the challenge
+tree. add-schema is refused there too, though as "schema already exists":
+the hand-over has brought the schema into being before you could add it. On
+a single-host deployment (the default) there is no build plane to separate
+out and every command below is yours.
 
 Deployment:
   update [--dry-run] [--verbose] [--prune-old] [<dir>]
@@ -171,8 +177,6 @@ Base image pins:
       tag is consulted, and it rebuilds nothing by itself
 
 Other:
-  artifacts <build> [<output file>]
-      download the build's artifacts tarball (default: <build>.tar.gz)
   version
       print client and server versions
 

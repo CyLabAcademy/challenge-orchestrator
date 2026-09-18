@@ -92,7 +92,10 @@ func (m *Manager) cacheArtifacts(
 	destination string,
 ) (files []string, err error) {
 	maxFiles, maxBytes, maxFileBytes := m.artifactLimits()
-	tempFile, err := os.CreateTemp(m.artifactsDir, ".cmgr-artifacts-*")
+	// Beside the file it will become, not in the artifact directory itself:
+	// a build plane writes into a directory per destination, and a temporary
+	// file elsewhere would make the rename below a cross-directory move.
+	tempFile, err := os.CreateTemp(filepath.Dir(destination), ".cmgr-artifacts-*")
 	if err != nil {
 		return nil, fmt.Errorf("could not create temporary artifact archive: %w", err)
 	}

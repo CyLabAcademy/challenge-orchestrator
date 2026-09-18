@@ -1,8 +1,6 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -21,8 +19,6 @@ import (
 type state struct {
 	mgr *cmgr.Manager
 }
-
-var artifact_dir string
 
 func main() {
 	var iface string
@@ -45,11 +41,19 @@ func main() {
 		os.Exit(0)
 	}
 
-	artifact_dir, _ = os.LookupEnv(cmgr.ARTIFACT_DIR_ENV)
-	if artifact_dir == "" {
-		artifact_dir = "."
+	// CMGR_LOGGING, which this daemon documented and did not read: it is
+	// the only way to raise an orchestrator's logging, since there is no
+	// flag for it. A level that does not parse is complained about and not
+	// fatal -- a typo here is no reason to refuse to serve.
+	logLevel, logLevelErr := cmgr.LogLevelFromEnv(cmgr.INFO)
+	if logLevelErr != nil {
+		// Before the manager, not after: a start that then fails would
+		// otherwise never say why its logging was not what the unit file
+		// asked for, and this is the one complaint that explains the rest
+		// of the output.
+		log.Printf("warning: %s", logLevelErr)
 	}
-	mgr := cmgr.NewManager(cmgr.INFO)
+	mgr := cmgr.NewManager(logLevel)
 	if mgr == nil {
 		log.Fatal("failed to initialize cmgr library")
 	}
@@ -92,10 +96,14 @@ Relevant environment variables:
 
   CMGR_DIR - directory containing all challenges (defaults to '.')
 
-  CMGR_ARTIFACT_DIR - directory for storing artifact bundles (defaults to '.')
+  CMGR_ARTIFACT_DIR - directory a build's artifact bundle is written to
+      (defaults to '.'). Local build plane only: cork does not serve
+      artifacts and a hand-over carries none, so on CMGR_BUILD_PLANE=external
+      this is read by nothing and saying so is all it gets.
 
   CMGR_MAX_ARTIFACT_FILES - maximum number of entries permitted in a
-      challenge's artifact archive (defaults to 10000)
+      challenge's artifact archive (defaults to 10000); local build plane
+      only, as the two below are
 
   CMGR_MAX_ARTIFACT_BYTES - maximum total uncompressed size of a challenge's
       artifact archive (defaults to '5g')
@@ -172,6 +180,21 @@ Relevant environment variables:
       only moves when the pins are refreshed (POST /pins). Challenge
       Dockerfiles are never modified on disk.
 
+  CMGR_BUILD_PLANE - where challenge images are built: 'local' (the default)
+      on the docker daemon DOCKER_HOST names, from the tree in CMGR_DIR; or
+      'external', where something else builds, pushes to CMGR_REGISTRY and
+      hands the finished builds to cmgrd (PUT /challenges/<id>, under HTTP
+      API below). External means no local docker
+      daemon and no challenge tree at all: CMGR_DIR, CMGR_BASE_PINS,
+      DOCKER_HOST and CMGR_PURGE_AFTER_PUSH are ignored (each is named at
+      startup if set); CMGR_REGISTRY and the material to talk to it
+      (CMGR_REGISTRY_CERT_DIR, the registry being where destroy and prune
+      untag) are required, and a missing DOCKER_CERT_PATH is warned about;
+      POST /update, POST /challenges/<id> and GET/POST /pins answer 409; a
+      schema operation answers 409 naming any build that has not been
+      handed over; and a launch with no worker registered fails instead of
+      running locally.
+
 HTTP API:
   cmgrd owns all state; every action goes through its API (the cmgrd-cli
   binary is a thin wrapper around it). In addition to the challenge, build,
@@ -180,14 +203,27 @@ HTTP API:
   "prune_old": false} — prune_old removes image generations displaced from
   rollback retention, on the build daemon and in the registry),
   GET /state dumps the full challenge/build/instance state,
-  GET /version reports the server version, and GET/POST /pins list the
-  base image pins and re-resolve them.
+  GET /version reports the server version and its build plane, GET/POST
+  /pins list the base image pins and re-resolve them, and on an external
+  build plane PUT /challenges/<id> takes a challenge and its builds handed
+  over by whatever built them: the JSON {"challenge": <the GET /state
+  element>, "pin_fingerprint": <the pin fingerprint the builds were made
+  under, 0 without pins>}, and nothing else -- artifact bundles stay on the
+  build plane that made them, and has_artifacts says what a build published
+  rather than promising bytes. ?prune_old=true is update's --prune-old.
+  Every build's identity is recomputed from those
+  inputs and every image tag asked of the registry before anything is
+  recorded (400 for a payload that contradicts itself, 409 for a tag the
+  registry does not serve); the answer is update's, with the challenge as
+  recorded. DELETE /challenges/<id> removes a challenge with no builds on
+  record (409 while it has any: they go with their schema).
 
 Workers:
   When docker workers are configured (GET/POST/PATCH/DELETE on /workers or
   cmgrd-cli worker-*), new instances are placed on them round robin,
   skipping overloaded and down workers; with none configured, cmgrd behaves
-  as a single-host daemon using DOCKER_HOST. Worker connections use the TLS
+  as a single-host daemon using DOCKER_HOST (on a local build plane; an
+  external one refuses the launch). Worker connections use the TLS
   material from DOCKER_CERT_PATH with the server name pinned to
   'academy-docker-worker' (the shared worker certificate), dockerd on port
   2376, and the telemetry agent on port 2136.
@@ -336,6 +372,9 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 			body, err = json.Marshal(meta)
 		}
 	case "POST":
+		if s.refuseOnExternalBuildPlane(w) {
+			return
+		}
 		var data []byte
 		var buildReq BuildChallengeRequest
 		data, err = ioutil.ReadAll(r.Body)
@@ -355,6 +394,12 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			body, err = json.Marshal(builds)
 		}
+	case "PUT":
+		s.handOverHandler(w, r, challenge)
+		return
+	case "DELETE":
+		err = s.mgr.RemoveChallenge(challenge)
+		respCode = http.StatusNoContent
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -365,6 +410,9 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
 		}
+		if errors.Is(err, cmgr.ErrChallengeHasBuilds) {
+			respCode = http.StatusConflict
+		}
 		body = []byte(err.Error())
 	}
 
@@ -372,12 +420,89 @@ func (s state) challengeHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
+// HandOverResponse is what PUT /challenges/{id} answers: the verdict as
+// POST /update reports one, the challenge as recorded (its builds with
+// their ids), and the errors of builds that could not be committed once the
+// writes had begun, with which the status is 500 rather than 200.
+type HandOverResponse struct {
+	UpdateResponse
+	Challenge *cmgr.ChallengeMetadata `json:"challenge,omitempty"`
+}
+
+// handOverJSONLimit bounds the body of a hand-over, which is one challenge's
+// metadata and image tags: large for what it carries, and nowhere near what
+// a body would have to be to be something else.
+const handOverJSONLimit = 16 << 20
+
+// handOverHandler is PUT /challenges/{id}, the hand-over of a challenge and
+// its builds from an external build plane (cmgr.HandOverChallenge): a JSON
+// cmgr.HandOver body, and nothing else. Artifact bundles do not travel with
+// it -- they stay on the build plane that made them, where what publishes
+// them to players reads them -- so a hand-over is metadata and image tags,
+// and its size is bounded by handOverJSONLimit alone. ?prune_old=true is
+// update's --prune-old.
+func (s state) handOverHandler(w http.ResponseWriter, r *http.Request, challenge cmgr.ChallengeId) {
+	refuse := func(code int, msg string) {
+		w.WriteHeader(code)
+		w.Write([]byte(msg))
+	}
+	var handOver cmgr.HandOver
+	if err := json.NewDecoder(io.LimitReader(r.Body, handOverJSONLimit)).Decode(&handOver); err != nil {
+		refuse(http.StatusBadRequest, "invalid hand-over JSON: "+err.Error())
+		return
+	}
+	options := cmgr.UpdateOptions{PruneOldImages: r.URL.Query().Get("prune_old") == "true"}
+
+	updates, err := s.mgr.HandOverChallenge(challenge, &handOver, options)
+	if err != nil {
+		code := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, cmgr.ErrHandOverInvalid):
+			code = http.StatusBadRequest
+		case errors.Is(err, cmgr.ErrNotInRegistry), errors.Is(err, cmgr.ErrLocalBuildPlane):
+			code = http.StatusConflict
+		}
+		refuse(code, err.Error())
+		return
+	}
+
+	resp := HandOverResponse{UpdateResponse: UpdateResponse{
+		Added:      challengeIds(updates.Added),
+		Refreshed:  challengeIds(updates.Refreshed),
+		Updated:    challengeIds(updates.Updated),
+		Stale:      challengeIds(updates.Stale),
+		Removed:    challengeIds(updates.Removed),
+		Unmodified: challengeIds(updates.Unmodified),
+		Errors:     make([]string, len(updates.Errors)),
+	}}
+	for i, updateErr := range updates.Errors {
+		resp.Errors[i] = updateErr.Error()
+	}
+	for _, bucket := range [][]*cmgr.ChallengeMetadata{updates.Added, updates.Updated, updates.Refreshed, updates.Stale, updates.Unmodified} {
+		if len(bucket) > 0 {
+			resp.Challenge = bucket[0]
+		}
+	}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		refuse(http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(updates.Errors) > 0 {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	w.Write(body)
+}
+
 func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 	path := strings.Split(r.URL.Path, "/")
 	pathLen := len(path)
 
+	// GET /builds/{id}/{artifact} was cmgr's artifact download, and cork does
+	// not serve artifacts: a bundle stays on the build plane that made it and
+	// reaches players from there. A path below a build is nothing here.
 	if pathLen == 4 {
-		s.artifactsHandler(w, r)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
@@ -468,70 +593,6 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-func (s state) artifactsHandler(w http.ResponseWriter, r *http.Request) {
-	path := strings.Split(r.URL.Path, "/")
-	pathLen := len(path)
-	if pathLen < 4 || path[pathLen-3] != "builds" {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	buildInt, err := strconv.Atoi(path[pathLen-2])
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	build := cmgr.BuildId(buildInt)
-	meta, err := s.mgr.GetBuildMetadata(build)
-	_, ok := err.(*cmgr.UnknownIdentifierError)
-	if ok || (err != nil && !meta.HasArtifacts) {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	f, err := os.Open(fmt.Sprintf("%s/%d.tar.gz", artifact_dir, build))
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	defer f.Close()
-
-	if path[pathLen-1] == "artifacts.tar.gz" {
-		io.Copy(w, f)
-		return
-	}
-	srcGz, err := gzip.NewReader(f)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	defer srcGz.Close()
-	srcTar := tar.NewReader(srcGz)
-
-	var h *tar.Header
-	for h, err = srcTar.Next(); err == nil; h, err = srcTar.Next() {
-		if h.Name == path[pathLen-1] {
-			io.Copy(w, srcTar)
-			return
-		}
-	}
-
-	if err == io.EOF {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	w.WriteHeader(http.StatusInternalServerError)
-	w.Write([]byte(err.Error()))
-}
-
 func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {
 	path := strings.Split(r.URL.Path, "/")
 	pathLen := len(path)
@@ -602,6 +663,7 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 
 	var body []byte
 	var err error
+	var errStatus int
 	respCode := http.StatusOK
 	switch r.Method {
 	case "GET":
@@ -627,12 +689,19 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 			} else {
 				errs := s.mgr.UpdateSchema(schemaDef)
 				if len(errs) > 0 {
-					err = fmt.Errorf("%v", errs)
+					err = errors.Join(errs...)
+					errStatus = schemaStatus(errs)
 				}
 			}
 		}
 	case "DELETE":
-		err = s.mgr.DeleteSchema(schema)
+		// ?retire=false releases the schema without taking its images out
+		// of the challenge registry: the build plane sends it when a schema
+		// is moving to another orchestrator, whose hand-over resolves the
+		// same content-addressed tags. Absent or anything else destroys,
+		// which is what a removal is.
+		retire := r.URL.Query().Get("retire") != "false"
+		err = s.mgr.DeleteSchema(schema, retire)
 		respCode = http.StatusNoContent
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -643,6 +712,9 @@ func (s state) existingSchemaHandler(w http.ResponseWriter, r *http.Request) {
 		respCode = http.StatusInternalServerError
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
+		}
+		if errStatus != 0 {
+			respCode = errStatus
 		}
 		body = []byte(err.Error())
 	}
@@ -682,6 +754,9 @@ func challengeIds(metas []*cmgr.ChallengeMetadata) []cmgr.ChallengeId {
 func (s state) updateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.refuseOnExternalBuildPlane(w) {
 		return
 	}
 
@@ -758,13 +833,55 @@ func (s state) versionHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	body, _ := json.Marshal(map[string]string{"version": cmgr.Version()})
+	body, _ := json.Marshal(map[string]string{"version": cmgr.Version(), "build_plane": s.mgr.BuildPlane()})
 	w.Write(body)
+}
+
+// schemaStatus maps the errors a schema operation returns to one status:
+// 409 when every one is a build not yet handed over
+// (cmgr.ErrExternalBuildPlane), 404 when every one is an unknown
+// identifier, 500 otherwise. A list that mixes either with a real failure
+// is a failure, whatever else it holds: a 409 that hid a launch error would
+// read as "hand over and retry" when the retry could not help.
+func schemaStatus(errs []error) int {
+	status := 0
+	for _, err := range errs {
+		code := http.StatusInternalServerError
+		var unknown *cmgr.UnknownIdentifierError
+		switch {
+		case errors.Is(err, cmgr.ErrExternalBuildPlane):
+			code = http.StatusConflict
+		case errors.As(err, &unknown):
+			code = http.StatusNotFound
+		}
+		if code == http.StatusInternalServerError || (status != 0 && status != code) {
+			return http.StatusInternalServerError
+		}
+		status = code
+	}
+	if status == 0 {
+		return http.StatusInternalServerError
+	}
+	return status
+}
+
+// refuseOnExternalBuildPlane answers 409 to a request only a local build
+// plane can serve -- an update, a manual build, the pins -- and reports
+// whether it did. The request is well-formed; this daemon is just not the
+// one that builds (see cmgr.ErrExternalBuildPlane).
+func (s state) refuseOnExternalBuildPlane(w http.ResponseWriter) bool {
+	if s.mgr.BuildPlane() != cmgr.BuildPlaneExternal {
+		return false
+	}
+	w.WriteHeader(http.StatusConflict)
+	w.Write([]byte(cmgr.ErrExternalBuildPlane.Error()))
+	return true
 }
 
 func (s state) schemaHandler(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	var err error
+	var errStatus int
 	respCode := http.StatusOK
 	switch r.Method {
 	case "GET":
@@ -785,7 +902,8 @@ func (s state) schemaHandler(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			errs := s.mgr.CreateSchema(schemaDef)
 			if len(errs) > 0 {
-				err = fmt.Errorf("%v", errs)
+				err = errors.Join(errs...)
+				errStatus = schemaStatus(errs)
 			} else {
 				respCode = http.StatusCreated
 			}
@@ -799,6 +917,9 @@ func (s state) schemaHandler(w http.ResponseWriter, r *http.Request) {
 		respCode = http.StatusInternalServerError
 		if _, ok := err.(*cmgr.UnknownIdentifierError); ok {
 			respCode = http.StatusNotFound
+		}
+		if errStatus != 0 {
+			respCode = errStatus
 		}
 		body = []byte(err.Error())
 	}

@@ -80,7 +80,7 @@ jobs:
           CGO_ENABLED=1 go build -v -ldflags "$LDFLAGS" -o bin ./...
           cp LICENSE bin/LICENSE
           cat NOTICE NOTICE.release > bin/NOTICE
-          cd bin && tar czvf cmgr.tar.gz cmgrd cmgrd-cli LICENSE NOTICE
+          cd bin && tar czvf cmgr.tar.gz cmgrd cmgrd-cli cork-build LICENSE NOTICE
 
       - name: Get OS/architecture suffix
         id: suffix

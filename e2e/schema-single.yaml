@@ -1,0 +1,18 @@
+# One challenge, and one is the point: this fleet is not here to re-test what
+# cork does with a schema -- compose.yaml's fleet covers that -- but to run the
+# one boundary a class deployment has, where the daemon that builds and the
+# daemon that runs are the same one and there is no registry between them.
+#
+# remote-make earns the slot twice over. The converge launches it as a
+# persistent instance, which is the placement path (selectWorker returns "",
+# the row carries no worker); and it ships a solve script that takes
+# --host/--port, so that same instance can be played to the end and the flag
+# checked against the row cork wrote at build time. One instance, not two: a
+# build the schema holds at a fixed count is locked against further
+# launches.
+name: single
+flag_format: single{%s}
+challenges:
+  cmgr/examples/binex101:
+    seeds: [1]
+    instance_count: 1

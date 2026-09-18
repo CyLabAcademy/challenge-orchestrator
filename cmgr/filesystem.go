@@ -14,34 +14,29 @@ import (
 	"strings"
 )
 
-// Reads the environment variable CMGR_CHALLENGE_DIR and then normalizes it
-// to an absolute path and validates that it is a directory.
+// Resolves the artifacts directory and, on a local build plane, the
+// challenge directory from their environment variables.
 func (m *Manager) setDirectories() error {
 	var err error
 
-	chalDir, isSet := os.LookupEnv(DIR_ENV)
-	if !isSet {
-		chalDir = "."
-	}
-
-	m.chalDir, err = filepath.Abs(chalDir)
-
-	if err != nil {
-		m.log.errorf("could not resolve challenge directory: %s", err)
+	if m.externalBuildPlane {
+		// No challenge tree: the build plane has it, and nothing here reads
+		// one (DetectChanges and the pins refuse, the converge does not
+		// scan). m.chalDir stays empty.
+		m.noteIgnoredSetting(DIR_ENV, externalPlaneIgnores)
+	} else if err = m.setChallengeDirectory(); err != nil {
 		return err
 	}
 
-	m.log.infof("challenge directory: %s", m.chalDir)
-
-	info, err := os.Stat(m.chalDir)
-	if err != nil {
-		m.log.errorf("could not stat the challenge directory: %s", err)
-		return err
-	}
-
-	if !info.IsDir() {
-		m.log.error("challenge directory must be a directory")
-		return errors.New(m.chalDir + " is not a directory")
+	if m.externalBuildPlane {
+		// Artifact bundles are written where the build happens and stay
+		// there; a daemon that builds nothing never has one. Nothing below
+		// would fail on an external plane -- it would just make an empty
+		// directory -- but saying so is the point: an orchestrator's unit
+		// file carrying an artifact directory is one whose operator still
+		// expects bundles to arrive here.
+		m.noteIgnoredSetting(ARTIFACT_DIR_ENV, externalPlaneIgnores)
+		return nil
 	}
 
 	artifactsDir, isSet := os.LookupEnv(ARTIFACT_DIR_ENV)
@@ -64,6 +59,250 @@ func (m *Manager) setDirectories() error {
 	if err = os.MkdirAll(m.artifactsDir, 0o755); err != nil {
 		m.log.errorf("could not create the artifacts directory: %s", err)
 		return err
+	}
+	return nil
+}
+
+// SetArtifactNamespaces says which directory under the artifact directory
+// each schema's bundles belong in: schema name to namespace, which a build
+// plane fills in from every schema's destination. A schema named here with
+// an empty namespace keeps the artifact directory itself -- a single-host
+// deployment, or a schema with no destination. A schema not named here at
+// all is a different case, and artifactDirForBuild treats it as one.
+//
+// This is what keeps one build plane's bundles sorted for the several
+// orchestrators it builds for: what publishes artifacts to players watches
+// one namespace and uploads it under one prefix, so a challenge's files land
+// where that destination's players look for them. It is also why a namespace
+// is the destination's name exactly, with nothing prepended: the name an
+// operator wrote in CORK_DESTINATIONS is the name on disk, and the prefix a
+// deployment wants is a destination named that way rather than a convention
+// cork invented.
+//
+// Keyed on the schema rather than set around each build for a reason that
+// cost a defect to find: an update rebuilds every build of a challenge whose
+// source moved, and those rebuilds happen before any schema is converged and
+// span every schema on the plane at once. A "current namespace" moved between
+// schemas would send all of them to whichever directory happened to be set,
+// while a build row already carries the schema it belongs to.
+//
+// Called once, before anything is built, and never concurrently with a
+// build. Nothing else calls it: an orchestrator holds no bundles.
+func (m *Manager) SetArtifactNamespaces(bySchema map[string]string) error {
+	namespaces := make(map[string]string, len(bySchema))
+	for schema, name := range bySchema {
+		if name != "" && (name != filepath.Base(filepath.Clean(name)) || name == "." || name == "..") {
+			return fmt.Errorf("schema '%s': artifact namespace %q is not a single directory name", schema, name)
+		}
+		// Kept even when empty. "This schema belongs in the artifact
+		// directory itself" and "nothing here knows where this schema
+		// belongs" are different answers: the first is an operator taking a
+		// destination back off a schema, whose bundles should move back, and
+		// the second is a build of some other command's schema, whose
+		// bundles should stay where they are (artifactDirForBuild).
+		namespaces[schema] = name
+	}
+	m.artifactNamespaces = namespaces
+	if m.artifactsDir == "" {
+		// An external build plane resolves no artifact directory, so there is
+		// nothing for a namespace to be under. Nothing is built there either,
+		// which is why this is not an error.
+		return nil
+	}
+	// Made now rather than at the first build, so a directory that cannot be
+	// created is reported before an event's worth of building rather than in
+	// the middle of it.
+	for _, name := range namespaces {
+		if name == "" {
+			continue
+		}
+		dir := filepath.Join(m.artifactsDir, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("could not create the artifact directory %s: %w", dir, err)
+		}
+		// What later tells this directory from any other subdirectory of the
+		// artifact directory; see artifactNamespaceMarker.
+		marker := filepath.Join(dir, artifactNamespaceMarker)
+		if err := os.WriteFile(marker, nil, 0o644); err != nil {
+			return fmt.Errorf("could not mark the artifact directory %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// artifactDirFor is where a build of this schema keeps its bundle: the
+// namespace its schema was given, or the artifact directory itself.
+func (m *Manager) artifactDirFor(schema string) string {
+	// No artifact directory at all is an external build plane, which holds no
+	// bundles. Guarded rather than assumed: filepath.Join("", "library") is
+	// the relative path "library", and a bundle written beside whatever the
+	// working directory happens to be would be a hard thing to find.
+	if m.artifactsDir == "" {
+		return ""
+	}
+	if name, ok := m.artifactNamespaces[schema]; ok && name != "" {
+		return filepath.Join(m.artifactsDir, name)
+	}
+	return m.artifactsDir
+}
+
+// artifactDirForBuild is where this build's bundle goes. When this process
+// was told the schema's namespace, that is the answer and nothing else is
+// consulted: an operator who has just given a schema a destination means
+// its bundles to move there. When it was not, the bundle stays where the
+// generation it replaces is -- because a build plane is only ever told the
+// namespaces of the schemas one command was given, while an update rebuilds
+// every build of a challenge whose source moved, schemas it was not given
+// included. Those rebuilds would otherwise land in the artifact directory
+// itself and their destination's artifact server would go on publishing the
+// generation before, silently.
+func (m *Manager) artifactDirForBuild(build *BuildMetadata) string {
+	if _, known := m.artifactNamespaces[build.Schema]; known {
+		return m.artifactDirFor(build.Schema)
+	}
+	if where, ok := m.findArtifactBundle(build.getArtifactsFilename()); ok {
+		return where
+	}
+	return m.artifactsDir
+}
+
+// findArtifactBundle is the directory under the artifact directory holding
+// this bundle, if any: the namespaces first and then the directory itself. A
+// build id is unique to a plane, so at most one file can answer to the name.
+func (m *Manager) findArtifactBundle(filename string) (string, bool) {
+	for _, dir := range m.artifactDirs() {
+		if _, err := os.Stat(filepath.Join(dir, filename)); err == nil {
+			return dir, true
+		}
+	}
+	return "", false
+}
+
+// artifactNamespaceMarker is dropped in every namespace directory cork
+// makes, and is what tells one from any other subdirectory of the artifact
+// directory. It is needed because the two are not otherwise
+// distinguishable and the cost of guessing wrong is a deleted file:
+// CMGR_ARTIFACT_DIR is allowed to be the challenge tree (it is in the
+// ansible role's defaults), whose subdirectories are challenges, and a
+// challenge shipping a file that happened to be named for a build id would
+// be swept by a search that took every subdirectory for a namespace.
+//
+// A dot file, so it is invisible to what publishes the bundles: an artifact
+// server takes the "<build id>.tar.gz" files and nothing else.
+const artifactNamespaceMarker = ".cork-artifact-namespace"
+
+// artifactDirs is every directory a bundle could be in: the namespaces cork
+// made, and the artifact directory itself last, since a plane that has never
+// had a namespace keeps everything there.
+func (m *Manager) artifactDirs() []string {
+	if m.artifactsDir == "" {
+		// No artifact directory at all. Returning it anyway would make every
+		// lookup below a relative path, and a bundle "found" beside whatever
+		// the working directory happens to be is one that would be deleted.
+		return nil
+	}
+	dirs := []string{}
+	if entries, err := os.ReadDir(m.artifactsDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			dir := filepath.Join(m.artifactsDir, entry.Name())
+			if _, err := os.Stat(filepath.Join(dir, artifactNamespaceMarker)); err == nil {
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+	return append(dirs, m.artifactsDir)
+}
+
+// pruneStrayArtifactBundle removes a copy of this build's bundle left in the
+// artifact directory itself, once the new generation is in place under a
+// namespace. There is one only after a schema was given a destination it did
+// not have, and leaving it would have an artifact server go on publishing an
+// older generation of the same build at the prefix the schema used to use.
+//
+// Deliberately the artifact directory itself and nowhere else. A filename is
+// "<build id>.tar.gz" and a build id is unique only within one plane's
+// database: rebuild that database, as BUILDER.md says a plane may, and its
+// ids start at 1 again while every destination's directory still holds
+// bundles 1..N. A name is therefore not evidence of whose file it is, so
+// another destination's directory is never swept -- doing so would delete an
+// orchestrator's live bundles on every promote and the artifact server would
+// carry that into the bucket. The artifact directory itself is the one place
+// a copy can only be this build's own: it is where the schema's bundles were
+// written before it was given a destination, which is the case this exists
+// for. A destination that CHANGES goes through migrate-schema, which drops
+// the rows and removes the bundles outright.
+//
+// Best-effort: a stray that cannot be removed costs disk and a stale URL, and
+// failing a build that has already validated and published would cost more.
+func (m *Manager) pruneStrayArtifactBundle(filename string) {
+	if m.artifactsDir == "" {
+		return
+	}
+	stray := filepath.Join(m.artifactsDir, filename)
+	if err := os.Remove(stray); err == nil {
+		m.log.infof("removed %s, left by this build's previous artifact directory", stray)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		m.log.warnf("could not remove the stray artifact bundle %s: %s", stray, err)
+	}
+}
+
+// removeArtifactBundle deletes a build's bundle: from the directory its
+// schema names, and failing that from anywhere under the artifact directory
+// it could be. The search is not belt-and-braces -- it is the only thing that
+// works for the commands that do the removing. remove-schema is given a name
+// and never learns a destination, and migrate-schema reads the destination a
+// schema is moving TO rather than the one its bundles were written under, so
+// neither can compute the directory. A build id is unique to a plane, so at
+// most one file can answer to the name and there is nothing to disambiguate.
+//
+// Best-effort past the first directory: a bundle that cannot be removed costs
+// disk, and failing a destroy over it would cost the build's row.
+func (m *Manager) removeArtifactBundle(schema, filename string) error {
+	err := os.Remove(filepath.Join(m.artifactDirFor(schema), filename))
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	where, ok := m.findArtifactBundle(filename)
+	if !ok {
+		return err // the not-exist destroyImages tolerates and logs
+	}
+	if removeErr := os.Remove(filepath.Join(where, filename)); removeErr != nil {
+		return removeErr
+	}
+	m.log.debugf("removed %s", filepath.Join(where, filename))
+	return nil
+}
+
+// setChallengeDirectory reads CMGR_DIR, normalizes it to an absolute path
+// and requires it to be a directory that exists: a mistyped challenge path
+// must fail the start, not bring a daemon up over an empty catalogue.
+func (m *Manager) setChallengeDirectory() error {
+	chalDir, isSet := os.LookupEnv(DIR_ENV)
+	if !isSet {
+		chalDir = "."
+	}
+
+	var err error
+	m.chalDir, err = filepath.Abs(chalDir)
+	if err != nil {
+		m.log.errorf("could not resolve challenge directory: %s", err)
+		return err
+	}
+
+	m.log.infof("challenge directory: %s", m.chalDir)
+
+	info, err := os.Stat(m.chalDir)
+	if err != nil {
+		m.log.errorf("could not stat the challenge directory: %s", err)
+		return err
+	}
+
+	if !info.IsDir() {
+		m.log.error("challenge directory must be a directory")
+		return errors.New(m.chalDir + " is not a directory")
 	}
 
 	return nil
@@ -368,4 +607,113 @@ func (m *Manager) createBuildContext(cm *ChallengeMetadata, dockerfile []byte) (
 	}
 
 	return tmpFile.Name(), nil
+}
+
+// RelocateArtifactBundles moves a schema's existing bundles into the
+// directory its destination now names, and reports how many it moved.
+//
+// It exists because giving a schema a destination changes nothing a build is
+// made of. Identity is source, flag format, pins and template; a schema is
+// never hashed. So adding `destination:` to a schema whose builds are all
+// complete leaves generateBuilds short-circuiting on buildsComplete,
+// executeBuild never runs, no bundle is promoted, and the files stay where
+// they were -- while SetArtifactNamespaces has already made the new directory
+// and every message says the deploy succeeded. The artifact server goes on
+// publishing the old prefix and the new one stays empty.
+//
+// Only out of the artifact directory itself, and for that the same reason the
+// prune has: a bundle is named "<build id>.tar.gz" and an id is unique only
+// within one plane's database, so a file of that name under ANOTHER
+// destination is not evidence of anything and is left alone. The artifact
+// directory itself is where a schema's bundles were written before it had a
+// destination, which is the case this exists for. A destination that changes
+// from one name to another goes through migrate-schema, which drops the rows
+// and rebuilds.
+func (m *Manager) RelocateArtifactBundles(schema string) (int, error) {
+	if m.artifactsDir == "" {
+		return 0, nil
+	}
+	into := m.artifactDirFor(schema)
+	if into == m.artifactsDir {
+		return 0, nil
+	}
+	builds, err := m.getSchemaBuilds(schema)
+	if err != nil {
+		return 0, fmt.Errorf("reading the builds of schema '%s' to move their artifact bundles: %w", schema, err)
+	}
+	moved := 0
+	for _, id := range builds {
+		filename := (&BuildMetadata{Id: id}).getArtifactsFilename()
+		from := filepath.Join(m.artifactsDir, filename)
+		if _, err := os.Stat(from); err != nil {
+			continue
+		}
+		to := filepath.Join(into, filename)
+		if err := m.copyArtifactBundle(from, to); err != nil {
+			return moved, fmt.Errorf("moving the artifact bundle of build %d into '%s': %w", id, into, err)
+		}
+		// Only once the copy is in place, and as a removal rather than as
+		// the other half of a rename: see copyArtifactBundle.
+		if err := os.Remove(from); err != nil {
+			return moved, fmt.Errorf("removing the artifact bundle of build %d from '%s' after copying it into '%s': %w", id, m.artifactsDir, into, err)
+		}
+		m.log.infof("moved %s to %s, where schema '%s' now publishes", from, to, schema)
+		moved++
+	}
+	return moved, nil
+}
+
+// copyArtifactBundle puts a bundle at its new path, staged and then renamed
+// within the destination directory so that nothing ever observes a partial
+// file under a served name.
+//
+// Deliberately a copy followed by a remove rather than one os.Rename across
+// the two directories, which is what this did first and is a mistake worth
+// recording. What publishes these bundles watches the artifact directory and
+// each namespace under it, and a rename between two watched directories is
+// delivered as a single event naming the SOURCE path first -- a path that no
+// longer exists. A watcher that decides what a path is from the path alone
+// then opens a file that is gone. Copy-then-remove gives it the two events it
+// can act on instead: a new file appearing under the destination, and a plain
+// removal of the old one, which is also what tells it to drop the object it
+// published at the old prefix.
+//
+// The staged name is dot-prefixed for the same reason executeBuild's is: it
+// cannot collide with a served "<id>.tar.gz" and a watcher ignores it.
+func (m *Manager) copyArtifactBundle(from, to string) error {
+	staged := filepath.Join(filepath.Dir(to), "."+filepath.Base(to)+".relocating")
+	source, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	destination, err := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		destination.Close()
+		os.Remove(staged)
+		return err
+	}
+	// Durable before it is visible: a crash between the rename and the
+	// removal must not leave both copies unreadable.
+	if err := destination.Sync(); err != nil {
+		destination.Close()
+		os.Remove(staged)
+		return err
+	}
+	if err := destination.Close(); err != nil {
+		os.Remove(staged)
+		return err
+	}
+	if err := os.Rename(staged, to); err != nil {
+		os.Remove(staged)
+		return err
+	}
+	if directory, err := os.Open(filepath.Dir(to)); err == nil {
+		_ = directory.Sync()
+		_ = directory.Close()
+	}
+	return nil
 }
