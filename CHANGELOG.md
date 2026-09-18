@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+**Worker health is two states, and losing one is no longer permanent.** A
+worker now carries `reachable` (`ok` / `unresponsive` / `down`), from its
+docker daemon, and `load` (`ok` / `overloaded` / `unknown`), from its telemetry
+agent. They were one value before, which meant a telemetry agent restarting
+during a deploy could take a healthy box — dockerd fine, instances serving —
+out of the fleet until an operator ran `worker-add`. An unknown load now places.
+
+`unresponsive` is cork's own verdict and reverses itself: the worker keeps
+being probed, and once its daemon answers it reconnects and reconciles before
+rejoining placement, the same sequence `worker-add` performs. Repeated failures
+are retried more slowly, and that is forgiven after a spell of running clean.
+`down` stays what it was — asserted by `worker-down`, lifted only by
+`worker-add` — because an operator taking a box out of service knows something
+the probes do not.
+
+**dockerd is probed rather than only sampled by traffic.** `/_ping` on every
+tick, plus a one-container list on a slower one, since a daemon can answer a
+ping while containerd is wedged. A wedged daemon on an idle worker used to be
+found by the next launch, thirty seconds after a student asked for it. A
+control call that fails still ejects the worker at once and now also wakes the
+probe, so a `systemctl restart docker` costs seconds rather than an operator.
+
+**Retimed.** Probes every 5s (was 500ms), ejecting after 6 consecutive misses
+(was 60). Same 30-second window, but misses are counted consecutively, and at
+the old cadence a worker answering one poll in sixty never tripped the
+threshold at all.
+
+`GET /workers` gains `reachable`, `load`, `since` and `reason`, and keeps
+`health` as a derived, deprecated string. A launch refused because every worker
+is unresponsive is now a retryable 503; every worker being `down` remains a 500.
+
 ## [1.0.1] — 2026-09-18
 
 No code changes. 1.0.0 published no binaries — the workflow uploaded assets

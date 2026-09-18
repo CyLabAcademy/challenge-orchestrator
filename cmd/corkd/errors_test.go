@@ -10,9 +10,12 @@ import (
 )
 
 // The response code is a contract the platform reads: a 503 tells a caller to
-// place the launch again, a 500 tells it the launch failed. The two worker
-// exhaustion errors sit on opposite sides of that line and are one word apart,
-// so both are pinned here by name.
+// place the launch again, a 500 tells it the launch failed. The three worker
+// exhaustion errors straddle that line and are one identifier-word apart, so
+// each is pinned here by name. Unresponsive is the one that matters most and
+// the one most recently added: a fleet that is rebooting answers it for as
+// long as the reboot takes, and answering 500 there would have the platform
+// report a launch failed seconds before the box came back.
 func TestErrorResponseLaunch(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -21,6 +24,7 @@ func TestErrorResponseLaunch(t *testing.T) {
 		retry bool
 	}{
 		{"all workers overloaded is retryable", cork.ErrAllWorkersOverloaded, http.StatusServiceUnavailable, true},
+		{"all workers unresponsive is retryable", cork.ErrAllWorkersUnresponsive, http.StatusServiceUnavailable, true},
 		{"all workers down is not", cork.ErrAllWorkersDown, http.StatusInternalServerError, false},
 		{"worker busy is retryable", cork.ErrWorkerBusy, http.StatusServiceUnavailable, true},
 		{"one worker down is retryable", cork.ErrWorkerDown, http.StatusServiceUnavailable, true},

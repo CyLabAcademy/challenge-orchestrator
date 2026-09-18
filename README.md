@@ -275,24 +275,29 @@ Challenges and instances:
 
 Workers:
   worker-add <ip> [<public address>]
-      register a worker, or bring a down one back once it is rebooted or
-      repaired (its instances come back with it: their containers restart on
-      their own); the optional public address is what players are given for
-      its instances; containers and networks cork created on it for instances
-      it no longer records are removed first (as for every worker at corkd
-      start). A daemon that stays unreachable while that runs is marked down
-      and takes nothing until another worker-add; one that answers but leaves
-      the cleanup unfinished takes placements anyway, with an error in the
-      log, since what is left costs a launch here and there rather than the
-      whole box
+      register a worker, or bring a down one back (a worker that merely
+      stopped answering recovers on its own and needs no worker-add); the
+      optional public address is what players are given for its instances;
+      containers and networks cork created on it for instances it no longer
+      records are removed first (as for every worker at corkd start). A daemon
+      that stays unreachable while that runs leaves the worker unresponsive,
+      still probed and still able to come back by itself; one that answers but
+      leaves the cleanup unfinished takes placements anyway, with an error in
+      the log, since what is left costs a launch here and there rather than
+      the whole box
   worker-remove <ip>
       purge the worker and all of its instance records, for a box that is
       terminated and recreated rather than rebooted (nothing on the worker
       itself is touched; re-adding it cleans up); a persistent instance it
       hosted is only relaunched by the next update-schema
   worker-down <ip>
-      mark the worker down, taking it out of placement but keeping its records
+      take the worker out of placement while keeping its records. The one
+      state no probe will lift, so it is for a box you are about to terminate;
+      a reboot needs nothing, since a worker that stops answering is ejected
+      and rejoins on its own once its daemon is back. Undone by worker-add
   worker-list
+      show every worker, its two health states, how long it has been in the
+      reachable one and why, and how many instances it holds
 
 Base image pins:
   pin-list
@@ -313,7 +318,52 @@ rename, is read whenever that one is unset.
 
 The canonical way to operate cork is through schemas and remote HTTP requests.
 
-First, connect the workers that you desire to cork using the worker-add commands. If the health test checks out, they should immediately switch to the okay status.
+First, connect the workers that you desire to cork using the worker-add commands. Each is reconciled before it takes anything, and switches to the okay status once its docker daemon answers.
+
+A worker carries two states, because reachability and load come from different
+agents and mean different things:
+
+| | comes from | values | effect |
+|---|---|---|---|
+| `reachable` | the worker's docker daemon (`/_ping`, plus a periodic one-container list, plus any real control call that fails) | `ok`, `unresponsive`, `down` | anything but `ok` takes the worker out of placement, and sends stops for its instances down the records-only path |
+| `load` | the worker's telemetry agent on port 2136 | `ok`, `overloaded`, `unknown` | `overloaded` takes it out of placement; `unknown` does not |
+
+A worker takes new instances when it is `reachable: ok` and not `overloaded`.
+An `unknown` load still places: a box whose telemetry agent died is usually
+serving perfectly well, and holding it out of a small fleet costs more than
+placing on it blind.
+
+`unresponsive` is cork's own verdict and **reverses itself**. The worker keeps
+being probed, and once its daemon answers again it reconnects and reconciles
+before rejoining placement — the same sequence a worker-add performs. A
+reboot, a `systemctl restart docker`, or a telemetry agent restarting during a
+deploy therefore cost seconds of placement, not an operator's attention. A box
+that keeps failing is retried more slowly each time, and earns that back after
+a spell of running clean.
+
+`down` is the exception, and the only state you can set by hand
+(`cork worker-down <ip>`). An operator taking a box out of service knows
+something the probes do not, so no probe will lift it: it stands until
+`worker-add`.
+
+Use it before a **termination**, not before a reboot. A reboot needs nothing:
+the box is ejected while it is away and rejoins by itself, which is the whole
+point of the paragraph above. Marking it `down` first opts out of that and
+leaves it sitting out of the fleet afterwards, waiting for an operator who has
+no reason to expect it. What `down` is for is a box that will answer its
+probes perfectly well and still must not be placed on — one you are about to
+terminate, or are debugging in place.
+
+If a worker is **reimaged** rather than rebooted, its instance records survive
+while its containers do not, and nothing detects the difference. Purge and
+re-add it, then relaunch what it held:
+
+```
+cork worker-remove <ip>
+cork worker-add <ip> [<public address>]
+cork update-schema <schema.yaml>    # relaunches persistent instances
+```
+
 
 Then the schemas, and this is where the two deployments differ.
 
@@ -359,10 +409,16 @@ Every setting also answers to its pre-rename `CMGR_` name (`CMGR_DB` for `CORK_D
 | CORK_DB_WAL              | Enable WAL journaling for SQLite                                                                                                   | on                                                                       |
 | CORK_LOGGING             | Log verbosity for `corkd` and `cork-build`: `debug`, `info`, `warn`, `error` or `disabled`. There is no flag for it on `corkd`, so this is the only way to raise an orchestrator's logging; `cork-build --verbose` is the flag form and wins over it. A value that does not parse is warned about and not fatal | info |
 | CORK_CONCURRENT_LAUNCHES | Launch slots per daemon (1-16), and as many teardown slots: network creation plus container starts, which dockerd serializes internally on either firewall backend; no gain measured past 2 | 2                                                                        |
-| CORK_WORKER_POLL_INTERVAL | How often each worker's telemetry agent is polled                                                                                  | 500ms                                                                    |
-| CORK_WORKER_POLL_TIMEOUT | Per-poll timeout; must be under the poll interval (clamped to half of it otherwise)                                                | 250ms                                                                    |
-| CORK_WORKER_MAX_MISSES   | Consecutive failed polls before a worker is marked down (sticky until worker-add)                                                  | 60 (30s of silence)                                                      |
-| CORK_WORKER_CONTROL_TIMEOUT | Ceiling for one container/network call to a worker's dockerd; hitting it marks the worker down                                     | 30s                                                                      |
+| CORK_WORKER_POLL_INTERVAL | How often each worker is probed (telemetry and docker on the same tick)                                                           | 5s                                                                       |
+| CORK_WORKER_POLL_TIMEOUT | Telemetry poll timeout; must be under the probe interval (clamped to half of it otherwise)                                         | 250ms                                                                    |
+| CORK_WORKER_PING_TIMEOUT | Docker `/_ping` timeout; clamped the same way. Looser than the telemetry one — dockerd under load answers more slowly than a cached verdict, and there is TLS in the path | 1s                          |
+| CORK_WORKER_DEEP_PROBE_INTERVAL | How often the deeper docker probe runs, a one-container list. A daemon can answer `/_ping` while wedged underneath; the list is capped at one container so its cost does not grow with the fleet's | 30s |
+| CORK_WORKER_MAX_MISSES   | Consecutive failed docker probes before a worker is ejected as unresponsive; it keeps being probed and recovers on its own         | 6 (30s)                                                                  |
+| CORK_WORKER_LOAD_MISSES  | Consecutive failed telemetry polls before a worker's load is unknown. Tighter than the above on purpose: unknown still places      | 3 (15s)                                                                  |
+| CORK_WORKER_HEALTHY_THRESHOLD | Consecutive good probes before an unresponsive worker is recovered, so a daemon flapping as it starts does not bounce in and out of placement | 2                                             |
+| CORK_WORKER_RECOVER_BACKOFF / _MAX | Wait before a recovery attempt, multiplied by how many times the worker has been ejected, and its cap                    | 10s / 5m                                                                 |
+| CORK_WORKER_EJECTION_DECAY | How long a worker must run clean to have one ejection forgiven. A decay rather than a reset, so forgiveness is proportional to how badly the box has behaved | 5m                             |
+| CORK_WORKER_CONTROL_TIMEOUT | Ceiling for one container/network call to a worker's dockerd; a call that hits it, or fails at the connection level, ejects the worker at once | 30s                                     |
 | CORK_WORKER_PULL_TIMEOUT | Ceiling for one image pull before a launch; hitting it fails the launch as retryable (503) only. A restart during an update pulls under a 5m ceiling, or this value when it is longer | 30s                                                                      |
 | CORK_WORKER_LAUNCH_WAIT  | How long a launch waits for a launch slot before failing as retryable (503 with Retry-After); one that would evidently wait longer is refused at once | 10s                                                                      |
 | CORK_BASE_PINS           | JSON map of base image reference to digest. When present, `FROM name:tag` is rewritten to the digest in the build context, so the builder never re-resolves a mutable tag. See [BUILDER.md](BUILDER.md) | \<CORK_DIR\>/base-pins.json (commit it at the corpus root; see BUILDER.md)                       |
@@ -382,7 +438,7 @@ Everything above is read by the shared `cork` library, so `corkd` and
 `cork-build` accept the same surface — but each ignores the other's half, and
 says so at startup rather than silently. A build plane runs nothing, so
 `CORK_CONCURRENT_LAUNCHES`, `CORK_PORTS`, `CORK_INTERFACE`,
-`CORK_ENABLE_DISK_QUOTAS`, `CORK_PRUNE_AGE` and the six `CORK_WORKER_*`
+`CORK_ENABLE_DISK_QUOTAS`, `CORK_PRUNE_AGE` and the `CORK_WORKER_*`
 tunables are inert on `cork-build`; an orchestrator on an external build
 plane builds nothing, so `CORK_DIR`, `CORK_BASE_PINS`, `DOCKER_HOST` and
 `CORK_PURGE_AFTER_PUSH` are inert on it. Either way, a setting that is set

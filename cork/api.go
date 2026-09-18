@@ -510,14 +510,14 @@ func (m *Manager) Stop(instance InstanceId) error {
 }
 
 // unreachable reports an instance no daemon of this process can reach: one
-// on a down (or purged) worker, or one placed on the local daemon, which an
+// on an unreachable (or purged) worker, or one placed on the local daemon, which an
 // external build plane does not have. Both are stopped by clearing records
 // alone (stopInstance); instanceClient refuses the latter outright.
 func (m *Manager) unreachable(instance *InstanceMetadata) bool {
 	if instance.Worker == "" {
 		return m.externalBuildPlane
 	}
-	return m.workerIsDown(instance.Worker)
+	return m.workerUnreachable(instance.Worker)
 }
 
 // whereUnreachable says why an instance is out of reach, for the log.
@@ -525,11 +525,11 @@ func (m *Manager) whereUnreachable(instance *InstanceMetadata) string {
 	if instance.Worker == "" {
 		return "placed on the local daemon, which an external build plane has none of"
 	}
-	return fmt.Sprintf("worker %s down", instance.Worker)
+	return fmt.Sprintf("worker %s is not reachable", instance.Worker)
 }
 
 func (m *Manager) stopInstance(instance *InstanceMetadata) error {
-	// A daemon that cannot be reached -- a down (or purged) worker, or the
+	// A daemon that cannot be reached -- an unreachable (or purged) worker, or the
 	// local daemon an external build plane does not have: clear our records
 	// and report success so callers (the platform's stop/restart/TTL flows,
 	// a schema delete, a prune) are never wedged behind it. Any containers
@@ -543,12 +543,12 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 
 	err := m.teardown(instance)
 	if err != nil {
-		// The teardown itself took the worker down (a control call hung), or
-		// the worker went down while it waited for its slot: finish the way a
-		// stop on a down worker does, so the caller gets its success now
-		// rather than from a second attempt.
+		// The teardown itself ejected the worker (a control call hung), or the
+		// worker stopped answering while it waited for its slot: finish the
+		// way a stop on an unreachable worker does, so the caller gets its
+		// success now rather than from a second attempt.
 		if m.unreachable(instance) {
-			m.log.warnf("worker %s went down during the stop of instance %d: clearing its records without further docker teardown", instance.Worker, instance.Id)
+			m.log.warnf("worker %s stopped answering during the stop of instance %d: clearing its records without further docker teardown", instance.Worker, instance.Id)
 			return m.removeInstanceMetadata(instance.Id)
 		}
 		return err

@@ -190,13 +190,13 @@ func (m *Manager) reconcileFailed(w *workerConn, what string, err error) reconci
 // It runs after their rows are deleted, which is the first moment their
 // containers count as orphans; before it, reconcileWorker spares them because
 // a row still names them. A worker that is down is skipped: adding it back
-// reconciles it anyway, and every call to it would only time out.
+// reconciles it anyway, and every call to it would only time out meanwhile.
 func (m *Manager) reclaimAfterGC(workers []string) {
 	for _, ip := range workers {
 		m.workersMu.RLock()
 		w, ok := m.workers[ip]
 		m.workersMu.RUnlock()
-		if !ok || workerHealth(w.health.Load()) == workerDown {
+		if !ok || workerReachable(w.reachable.Load()) != workerReachableOk {
 			continue
 		}
 		if result := m.reconcileWorker(w); result != reconcileDone {

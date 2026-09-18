@@ -40,7 +40,7 @@ func TestAcquireSlotRefusesDownWorker(t *testing.T) {
 }
 
 func TestAcquireSlotHoldsAndReleases(t *testing.T) {
-	m := &Manager{log: newLogger(DISABLED), workers: map[string]*workerConn{"10.0.0.1": testWorkerConn(workerOk)}}
+	m := &Manager{log: newLogger(DISABLED), workers: map[string]*workerConn{"10.0.0.1": testWorkerConn(workerReachableOk)}}
 	sem := make(chan struct{}, 2)
 	inst := &InstanceMetadata{Id: 7, Worker: "10.0.0.1"}
 
@@ -107,12 +107,11 @@ func TestRestartLimitsAndTransportTimeout(t *testing.T) {
 	}
 }
 
-// A launch queued for a slot gives up the moment its worker is marked down,
-// instead of waiting out its launch wait against a daemon that will not come
-// back: the platform's worker is freed for a retry placed elsewhere.
-func TestAcquireSlotWakesOnWorkerDown(t *testing.T) {
-	w := testWorkerConn(workerOk)
-	w.downCh = make(chan struct{})
+// A launch queued for a slot gives up the moment its worker stops being
+// reachable, instead of waiting out its launch wait against a daemon that is
+// not answering: the platform's worker is freed for a retry placed elsewhere.
+func TestAcquireSlotWakesOnWorkerUnreachable(t *testing.T) {
+	w := testWorkerConn(workerReachableOk)
 	m := &Manager{log: newLogger(DISABLED), workers: map[string]*workerConn{"10.0.0.1": w}}
 	sem := make(chan struct{}, 1)
 	sem <- struct{}{} // held by a launch that never finishes

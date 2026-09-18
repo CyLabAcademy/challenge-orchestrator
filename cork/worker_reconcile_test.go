@@ -89,14 +89,32 @@ func reconcileTestManager() *Manager {
 	return &Manager{log: newLogger(DISABLED), ctx: context.Background()}
 }
 
+// notEjected asserts a pass did not eject the worker. It has to read
+// daemonFailed, not reachability or the ejection count: every conn starts
+// unresponsive, so an eject that should not have happened moves neither of
+// those and an assertion on them holds under exactly the bug it guards.
+// daemonFailed is set on every ejection regardless, and is what the stop path
+// reads, so it is the honest witness.
+func notEjected(t *testing.T, w *workerConn, what string) {
+	t.Helper()
+	if w.daemonFailed.Load() {
+		t.Fatalf("%s ejected the worker: removeOrphans reports, reconcileWithRetries decides", what)
+	}
+	if got := w.ejections.Load(); got != 0 {
+		t.Fatalf("%s counted %d ejection(s)", what, got)
+	}
+}
+
 func reconcileTestConn() *workerConn {
-	w := &workerConn{ip: "10.0.0.1", done: make(chan struct{})}
-	w.health.Store(int32(workerOverloaded))
+	w := &workerConn{ip: "10.0.0.1", done: make(chan struct{}), unreachCh: make(chan struct{})}
+	// As newWorkerConn leaves it: nothing has been heard from the box yet.
+	w.reachable.Store(int32(workerUnresponsive))
+	w.load.Store(int32(workerLoadUnknown))
 	return w
 }
 
 // A daemon that is still starting is retried, the worker staying out of
-// placement as overloaded rather than going down.
+// placement meanwhile and joining it once the pass finishes.
 func TestReconcileWithRetriesWaitsForTheDaemon(t *testing.T) {
 	m := reconcileTestManager()
 	w := reconcileTestConn()
@@ -108,27 +126,37 @@ func TestReconcileWithRetriesWaitsForTheDaemon(t *testing.T) {
 		}
 		return reconcileUnreachable
 	}
-	if !m.reconcileWithRetries(w, reconcile, time.Second, time.Millisecond) {
-		t.Fatal("a daemon that came up within the budget was not waited for")
+	if got := m.reconcileWithRetries(w, reconcile, time.Second, time.Millisecond); got != reconcileReady {
+		t.Fatalf("a daemon that came up within the budget was not waited for: %d", got)
 	}
 	if attempts != 3 {
 		t.Fatalf("reconcile attempted %d times, want 3", attempts)
 	}
-	if got := healthOf(w); got != workerOverloaded {
-		t.Fatalf("health while waiting: %s, want overloaded", got)
+	// The pass does not admit the worker itself; runWorker does, once it has
+	// the outcome.
+	if got := reachableOf(w); got != workerUnresponsive {
+		t.Fatalf("reachable while waiting: %s, want unresponsive", got)
 	}
 }
 
-// A daemon still unreachable once the budget is spent marks the worker down.
+// A daemon still unreachable once the budget is spent ejects the worker --
+// reversibly, so that the probe brings it back rather than an operator.
 func TestReconcileWithRetriesGivesUp(t *testing.T) {
 	m := reconcileTestManager()
 	w := reconcileTestConn()
 	never := func(*workerConn) reconcileResult { return reconcileUnreachable }
-	if m.reconcileWithRetries(w, never, 20*time.Millisecond, time.Millisecond) {
-		t.Fatal("an unreachable daemon was reported ready to poll")
+	if got := m.reconcileWithRetries(w, never, 20*time.Millisecond, time.Millisecond); got != reconcileEjected {
+		t.Fatalf("an unreachable daemon: got outcome %d, want ejected", got)
 	}
-	if got := healthOf(w); got != workerDown {
-		t.Fatalf("health after the budget: %s, want down", got)
+	if got := reachableOf(w); got != workerUnresponsive {
+		t.Fatalf("reachable after the budget: %s, want unresponsive", got)
+	}
+	// Unresponsive, not down: the poller keeps probing and nothing here needs
+	// an operator to undo it. No ejection is counted, because the worker was
+	// never admitted in the first place -- a box that is slow to boot should
+	// not start its recovery backoff already stretched.
+	if got := w.ejections.Load(); got != 0 {
+		t.Fatalf("a worker that never joined placement counted %d ejection(s)", got)
 	}
 }
 
@@ -143,30 +171,26 @@ func TestReconcileWithRetriesJoinsWhenIncomplete(t *testing.T) {
 		attempts++
 		return reconcileIncomplete
 	}
-	if !m.reconcileWithRetries(w, incomplete, 20*time.Millisecond, time.Millisecond) {
-		t.Fatal("an incomplete reconcile kept the worker out of placement")
+	if got := m.reconcileWithRetries(w, incomplete, 20*time.Millisecond, time.Millisecond); got != reconcileReady {
+		t.Fatalf("an incomplete reconcile kept the worker out of placement: outcome %d", got)
 	}
 	if attempts < 2 {
 		t.Fatalf("an incomplete reconcile was attempted %d time(s), want a retry", attempts)
 	}
-	if got := healthOf(w); got != workerOverloaded {
-		t.Fatalf("an incomplete reconcile changed the health: %s", got)
-	}
+	notEjected(t, w, "an incomplete reconcile")
 }
 
 // A conn replaced or removed while waiting is left alone: not polled, not
-// marked down.
+// ejected.
 func TestReconcileWithRetriesStopsWhenGone(t *testing.T) {
 	m := reconcileTestManager()
 	w := reconcileTestConn()
 	never := func(*workerConn) reconcileResult { return reconcileUnreachable }
 	close(w.done)
-	if m.reconcileWithRetries(w, never, time.Hour, time.Hour) {
-		t.Fatal("a gone conn was reported ready to poll")
+	if got := m.reconcileWithRetries(w, never, time.Hour, time.Hour); got != reconcileAbandoned {
+		t.Fatalf("a gone conn: got outcome %d, want abandoned", got)
 	}
-	if got := healthOf(w); got != workerOverloaded {
-		t.Fatalf("a gone conn had its health changed: %s", got)
-	}
+	notEjected(t, w, "a gone conn")
 }
 
 // Removals run a few at a time, every one is counted, and a transport failure
@@ -209,9 +233,12 @@ func TestRemoveOrphansBoundedParallel(t *testing.T) {
 	if c := calls.Load(); c > reconcileParallelism*2 {
 		t.Fatalf("%d removals were attempted after the daemon hung, want the pass to stop", c)
 	}
-	if got := healthOf(w); got != workerOverloaded {
-		t.Fatalf("a removal failure changed the health itself: %s", got)
+	// removeOrphans reports; it does not decide. Ejecting is reconcileWithRetries'
+	// call, once the whole budget is spent.
+	if got := reachableOf(w); got != workerUnresponsive {
+		t.Fatalf("a removal failure changed reachability itself: %s", got)
 	}
+	notEjected(t, w, "a removal failure")
 
 	// A removal the daemon refuses leaves the pass incomplete, but every
 	// other orphan is still attempted: the ones that go, go.

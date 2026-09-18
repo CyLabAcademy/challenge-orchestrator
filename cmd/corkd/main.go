@@ -21,14 +21,17 @@ type state struct {
 }
 
 // retryableLaunch is what a launch can fail with where the caller should
-// simply place it again. Every worker was skipped but overloaded somewhere
-// means retryable, where everything down is a real failure and stays a 500
-// (ErrAllWorkersDown is deliberately absent here). A launch refused by its
-// own worker -- no slot in time, the worker went down under it, or its image
-// pull timed out -- is retryable too, as is one that lost the race for the
-// database's write lock: the retry is placed afresh.
+// simply place it again. Every worker being skipped is retryable when they
+// are states a worker leaves on its own -- overloaded, or unresponsive, which
+// the probes recover from without anyone intervening. Every worker having
+// been taken down by an operator is not going to resolve itself, so it stays
+// a 500 (ErrAllWorkersDown is deliberately absent here). A launch refused by
+// its own worker -- no slot in time, the worker stopped answering under it,
+// or its image pull timed out -- is retryable too, as is one that lost the
+// race for the database's write lock: the retry is placed afresh.
 var retryableLaunch = []error{
 	cork.ErrAllWorkersOverloaded,
+	cork.ErrAllWorkersUnresponsive,
 	cork.ErrWorkerBusy,
 	cork.ErrWorkerDown,
 	cork.ErrPullTimeout,
@@ -101,7 +104,7 @@ func main() {
 	// corkd is the sole owner of the database and the docker/registry state:
 	// every action (deploys, builds, instance lifecycle, worker management)
 	// goes through its HTTP API. New instances are placed on the configured
-	// workers (round robin, skipping overloaded/down ones).
+	// workers (round robin, skipping overloaded and unreachable ones).
 	mgr.EnableWorkerPlacement()
 
 	s := state{mgr: mgr}
@@ -191,22 +194,54 @@ Relevant environment variables:
       in corkd instead of inside dockerd, which it used to make slow, then
       unresponsive.
 
-  CORK_WORKER_POLL_INTERVAL, CORK_WORKER_POLL_TIMEOUT, CORK_WORKER_MAX_MISSES -
-      how often each worker's telemetry agent is polled (defaults to '500ms'),
-      the per-poll timeout (defaults to '250ms'; clamped to half the interval
-      when not under it)
-      and how many consecutive failed polls mark the worker down (defaults to
-      60, i.e. 30s of silence); down is sticky until the next worker-add.
+  Each worker carries two states, from two agents on two ports. 'reachable'
+  (ok / unresponsive / down) comes from its docker daemon and says whether a
+  launch there could work at all. 'load' (ok / overloaded / unknown) comes
+  from its telemetry agent and says whether one should be added. A worker
+  takes placements when it is reachable and not overloaded -- an unknown load
+  still places, since a box whose telemetry agent died is usually serving
+  perfectly well and holding it out of a small fleet costs more.
+
+  Only 'down' is asserted rather than observed: an operator sets it with
+  worker-down, and no probe will lift it. 'unresponsive' is cork's own
+  verdict, and the worker recovers from it on its own once its daemon answers
+  again -- reconnecting and reconciling first, exactly as a worker-add does.
+
+  CORK_WORKER_POLL_INTERVAL, CORK_WORKER_POLL_TIMEOUT, CORK_WORKER_PING_TIMEOUT -
+      how often each worker is probed (defaults to '5s'), the telemetry
+      timeout (defaults to '250ms') and the docker /_ping timeout (defaults
+      to '1s'); each is clamped to half the interval when not under it.
+
+  CORK_WORKER_DEEP_PROBE_INTERVAL - how often the deeper docker probe runs, a
+      one-container list (defaults to '30s'). A daemon can answer /_ping while
+      wedged underneath, which the ping alone would never notice; the listing
+      is capped at one container so its cost does not grow with the fleet's.
+
+  CORK_WORKER_MAX_MISSES, CORK_WORKER_LOAD_MISSES - consecutive failed docker
+      probes before the worker is ejected as unresponsive (defaults to 6, i.e.
+      30s), and consecutive failed telemetry polls before its load is unknown
+      (defaults to 3). Tighter for load on purpose: unknown still places, so
+      being wrong about it costs a flag rather than a worker.
+
+  CORK_WORKER_HEALTHY_THRESHOLD, CORK_WORKER_RECOVER_BACKOFF,
+  CORK_WORKER_RECOVER_BACKOFF_MAX, CORK_WORKER_EJECTION_DECAY - how a worker
+      comes back: consecutive good probes required (defaults to 2, so a daemon
+      flapping as it starts does not bounce in and out of placement), the wait
+      before a recovery attempt multiplied by how many times the worker has
+      been ejected (defaults to '10s', capped at '5m'), and how long it must
+      then run clean to have one ejection forgiven (defaults to '5m').
 
   CORK_WORKER_CONTROL_TIMEOUT - ceiling for one container or network call to
-      a worker's docker daemon (defaults to '30s'); a call that hits it marks
-      the worker down.
+      a worker's docker daemon (defaults to '30s'); a call that hits it, or
+      fails at the connection level, ejects the worker at once. One failure is
+      enough because it is evidence already paid for, about the daemon that
+      matters -- and because the ejection reverses itself.
 
   CORK_WORKER_PULL_TIMEOUT - ceiling for one image pull before a launch
       (defaults to '30s'); a pull that hits it fails that launch as
-      retryable (503) but does not mark the worker down. It is also the
-      ceiling for a restart's pull whenever it is set above the five minutes
-      those get by default.
+      retryable (503) but does not eject the worker, the registry being the
+      likelier culprit. It is also the ceiling for a restart's pull whenever
+      it is set above the five minutes those get by default.
 
   CORK_WORKER_LAUNCH_WAIT - how long a launch waits for a launch slot on its
       daemon (defaults to '10s'); past that it fails as retryable (503 with
@@ -268,46 +303,55 @@ HTTP API:
 Workers:
   When docker workers are configured (GET/POST/PATCH/DELETE on /workers or
   cork worker-*), new instances are placed on them round robin,
-  skipping overloaded and down workers; with none configured, corkd behaves
+  skipping any worker that is not reachable or is reporting overloaded;
+  with none configured, corkd behaves
   as a single-host daemon using DOCKER_HOST (on a local build plane; an
   external one refuses the launch). Worker connections use the TLS
   material from DOCKER_CERT_PATH with the server name pinned to
   'academy-docker-worker' (the shared worker certificate), dockerd on port
   2376, and the telemetry agent on port 2136.
 
-  A worker goes down (sticky) after CORK_WORKER_MAX_MISSES failed telemetry
-  polls (30s of silence by default), a single hung/refused docker control
-  call, or a PATCH of {"health": "down"}. Recovery is the operator's call:
-  re-add it (POST /workers or cork worker-add) once the box is rebooted
-  or repaired, and its instances come back with it (their containers restart
-  on their own); or, when the box is terminated and recreated, DELETE it from
-  /workers, which purges the worker and all of its instance records, and add
-  the new one. Stops for instances on a down worker clear the records and
-  return success without touching docker.
+  A worker is ejected as unresponsive after CORK_WORKER_MAX_MISSES failed
+  dockerd probes (30s by default) or a single hung/refused docker control
+  call. That verdict reverses itself: the probe keeps running, and once the
+  daemon answers again the worker reconnects and reconciles before rejoining
+  placement, with its instances (their containers restart on their own). A
+  reboot or a 'systemctl restart docker' therefore needs no operator action.
+  Telemetry silence does not eject anything -- it moves the load axis to
+  unknown, and unknown still takes placements.
+
+  A PATCH of {"health": "down"} is the exception: it is asserted rather than
+  observed, so no probe will lift it, and it is meant for a box about to be
+  terminated. Recovery from it is POST /workers (or cork worker-add). When
+  the box is terminated and recreated instead, DELETE it from /workers, which
+  purges the worker and all of its instance records, and add the new one.
+  Stops for instances on a worker that is down, or that the probes have given
+  up on, clear the records and return success without touching docker.
 
   Whenever a worker is added, and for every worker at startup, the containers
   and cmgr-<id> networks cork created on it for instances it no longer records
   there (left behind by those stops, or by DELETE) are removed before it takes
   placements, so their host ports are free again. A daemon that cannot be
-  reached at that point (still starting, say) is retried for as long as
-  telemetry silence is tolerated before the worker is marked down.
+  reached at that point (still starting, say) is retried for
+  CORK_WORKER_MAX_MISSES poll intervals before the worker is ejected; it is
+  still probed after that, and still comes back on its own.
 
   That cleanup is not guaranteed. When it reaches the daemon but cannot
   finish, because a database read failed or the daemon refused a removal, it
   is retried for the same span and the worker then takes placements anyway,
   with an error naming it in the log. What is left holds its host ports, so a
-  launch there may fail on a bind and be retried elsewhere until the next
-  worker-add or corkd start reconciles the box again, or docker-reaper
-  removes the containers. The alternative, holding a whole box out of the
+  launch there may fail on a bind and be retried elsewhere until the box is
+  reconciled again -- by its own recovery, a worker-add or a corkd start -- or
+  docker-reaper removes the containers. The alternative, holding a whole box out of the
   fleet over one container its daemon will not remove, costs more.
 
   Under load a launch fails fast rather than queueing: it is refused at once
   when the launches already waiting on its worker would keep it waiting
   longer than CORK_WORKER_LAUNCH_WAIT, waits at most that long otherwise, and
-  is refused as soon as its worker goes down; all three answer 503 with
-  Retry-After so the platform's retry is placed afresh. A stop whose worker
-  hangs mid-way clears the
-  records once the worker is marked down and returns success. Stops wait
+  is refused as soon as its worker stops being reachable; all three answer 503
+  with Retry-After so the platform's retry is placed afresh. A stop whose
+  worker hangs mid-way clears the records once the worker is ejected and
+  returns success. Stops wait
   for a teardown slot on their worker as long as it takes, since a stop must
   go through, so a deluge of them queues in corkd, bounded, rather than
   inside dockerd.
