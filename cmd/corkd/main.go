@@ -20,6 +20,46 @@ type state struct {
 	mgr *cork.Manager
 }
 
+// retryableLaunch is what a launch can fail with where the caller should
+// simply place it again. Every worker was skipped but overloaded somewhere
+// means retryable, where everything down is a real failure and stays a 500
+// (ErrAllWorkersDown is deliberately absent here). A launch refused by its
+// own worker -- no slot in time, the worker went down under it, or its image
+// pull timed out -- is retryable too, as is one that lost the race for the
+// database's write lock: the retry is placed afresh.
+var retryableLaunch = []error{
+	cork.ErrAllWorkersOverloaded,
+	cork.ErrWorkerBusy,
+	cork.ErrWorkerDown,
+	cork.ErrPullTimeout,
+	cork.ErrDatabaseBusy,
+}
+
+// retryableStop is the same for a stop, which places nothing and so can only
+// lose the race for the database's write lock, retryable like a launch that
+// did.
+var retryableStop = []error{cork.ErrDatabaseBusy}
+
+// errorResponse maps a failed manager call onto the response code, and onto
+// whether the caller is being told to try again -- which the handler turns
+// into a Retry-After. An unknown identifier is a 404; anything in retryable
+// is a 503; everything else is a 500.
+//
+// The unknown-identifier test is a type assertion rather than errors.As, so
+// a wrapped one reports 500. That is the behavior the handlers have always
+// had, and the manager returns these bare.
+func errorResponse(err error, retryable []error) (code int, retry bool) {
+	if _, ok := err.(*cork.UnknownIdentifierError); ok {
+		return http.StatusNotFound, false
+	}
+	for _, target := range retryable {
+		if errors.Is(err, target) {
+			return http.StatusServiceUnavailable, true
+		}
+	}
+	return http.StatusInternalServerError, false
+}
+
 func main() {
 	var iface string
 	var port int
@@ -580,19 +620,9 @@ func (s state) buildHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		respCode = http.StatusInternalServerError
-		if _, ok := err.(*cork.UnknownIdentifierError); ok {
-			respCode = http.StatusNotFound
-		}
-		// Every worker was skipped: overloaded somewhere means retryable,
-		// everything down means a real failure. A launch refused by its own
-		// worker (no slot in time, the worker went down under it, or its
-		// image pull timed out) is retryable too, as is one that lost the
-		// race for the database's write lock: the retry is placed afresh.
-		if errors.Is(err, cork.ErrAllWorkersOverloaded) || errors.Is(err, cork.ErrWorkerBusy) ||
-			errors.Is(err, cork.ErrWorkerDown) || errors.Is(err, cork.ErrPullTimeout) ||
-			errors.Is(err, cork.ErrDatabaseBusy) {
-			respCode = http.StatusServiceUnavailable
+		var retry bool
+		respCode, retry = errorResponse(err, retryableLaunch)
+		if retry {
 			w.Header().Set("Retry-After", "1")
 		}
 		body = []byte(err.Error())
@@ -643,14 +673,9 @@ func (s state) instanceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		respCode = http.StatusInternalServerError
-		if _, ok := err.(*cork.UnknownIdentifierError); ok {
-			respCode = http.StatusNotFound
-		}
-		// A stop that lost the race for the database's write lock is
-		// retryable, like a launch that did.
-		if errors.Is(err, cork.ErrDatabaseBusy) {
-			respCode = http.StatusServiceUnavailable
+		var retry bool
+		respCode, retry = errorResponse(err, retryableStop)
+		if retry {
 			w.Header().Set("Retry-After", "1")
 		}
 		body = []byte(err.Error())

@@ -410,9 +410,18 @@ func printChanges(status *cork.ChallengeUpdates, verbose bool) {
 	if len(status.Errors) > 0 {
 		fmt.Println("Errors:")
 		for i, err := range status.Errors {
-			fmt.Printf("    %d) %s\n", i+1, err)
+			fmt.Printf("    %d) %s\n", i+1, indentContinuation(err.Error(), "       "))
 		}
 	}
+}
+
+// indentContinuation lines the later lines of a multi-line message up under
+// the first. A single error can now report several problems at once --
+// validateBuild returns every one it found, joined -- and without this all
+// but the first sit flush against the margin, reading as separate output
+// rather than as part of the entry they belong to.
+func indentContinuation(msg, indent string) string {
+	return strings.ReplaceAll(strings.TrimRight(msg, "\n"), "\n", "\n"+indent)
 }
 
 // recordedUnder is the metadata of the challenges under a path. It refuses
@@ -432,7 +441,7 @@ func recordedUnder(mgr *cork.Manager, dir string) ([]*cork.ChallengeMetadata, er
 	if len(cu.Errors) > 0 {
 		lines := make([]string, 0, len(cu.Errors))
 		for _, err := range cu.Errors {
-			lines = append(lines, "  "+err.Error())
+			lines = append(lines, "  "+indentContinuation(err.Error(), "  "))
 		}
 		return nil, fmt.Errorf("the challenge directory does not parse:\n%s", joinLines(lines))
 	}

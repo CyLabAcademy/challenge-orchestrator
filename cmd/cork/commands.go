@@ -108,11 +108,20 @@ func updateCommand(c *client, args []string) int {
 	if len(resp.Errors) > 0 {
 		fmt.Println("Errors:")
 		for i, msg := range resp.Errors {
-			fmt.Printf("  %d) %s\n", i+1, msg)
+			fmt.Printf("  %d) %s\n", i+1, indentContinuation(msg, "     "))
 		}
 		return RUNTIME_ERROR
 	}
 	return NO_ERROR
+}
+
+// indentContinuation lines the later lines of a multi-line message up under
+// the first. A single error can now report several problems at once --
+// validateBuild returns every one it found, joined -- and without this all
+// but the first sit flush against the margin, reading as separate output
+// rather than as part of the entry they belong to.
+func indentContinuation(msg, indent string) string {
+	return strings.ReplaceAll(strings.TrimRight(msg, "\n"), "\n", "\n"+indent)
 }
 
 func loadSchema(path string) (*Schema, error) {

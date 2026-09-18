@@ -924,7 +924,7 @@ if (( FULL )); then
     # Fail on a daemon that died rather than spend the whole retry budget on
     # a port nothing will ever answer on, and say why it died. NewManager
     # returns nil on any startup failure and corkd log.Fatals on that
-    # (cmd/corkd/main.go:52-54), so a dead process here is the assertion.
+    # (cmd/corkd/main.go:92-94), so a dead process here is the assertion.
     # Its own short curl rather than the api helper: that one carries the
     # fleet's ten-minute ceiling, and a probe has to give up in seconds.
     kill -0 "$1" 2>/dev/null ||
@@ -2054,10 +2054,11 @@ if (( FULL )); then
       case "$COLD_CODE" in
         200|201) return ;;
         503)
-          # Every 503 here is retryable by contract (cmd/corkd/main.go:447-452)
-          # and none of them is this step's subject: a momentarily overloaded
-          # box, a busy launch queue, or a pull that ran out of time on a
-          # loaded host. Say which it was, wait for the fleet, ask again. The
+          # Every 503 here is retryable by contract (retryableLaunch in
+          # cmd/corkd/main.go) and none of them is this step's subject: a
+          # momentarily overloaded box, a busy launch queue, or a pull that
+          # ran out of time on a loaded host. Say which it was, wait for the
+          # fleet, ask again. The
           # ErrPullTimeout case is still covered, by the health check below:
           # a timed-out pull must not have cost the worker its place.
           note "the launch for e2e-user-$i was refused as retryable after ${COLD_TOOK}s ($(head -c 140 <<<"$COLD_INST")); waiting for both workers and trying again"
@@ -2433,7 +2434,7 @@ note "${#burst_ids[@]} accepted, $burst_slot refused for want of a slot, $burst_
 # that is behaving perfectly; demanding neither would pass on a corkd that
 # answered 503 for some unrelated reason.
 (( burst_slot + burst_admit > 0 )) ||
-  fail "$burst_503 launch(es) on $WB were refused without naming the busy refusal: an overflowing launch queue must fail with ErrWorkerBusy, which is what corkd answers 503 + Retry-After to (cmd/corkd/main.go:447)"
+  fail "$burst_503 launch(es) on $WB were refused without naming the busy refusal: an overflowing launch queue must fail with ErrWorkerBusy, which is what corkd answers 503 + Retry-After to (retryableLaunch in cmd/corkd/main.go)"
 # The bound, which is what actually bites: a refusal costs its wait and no
 # more. An unbounded wait accepts the overflow late instead of refusing it,
 # and the 10s default would show here as a ~10s refusal; 6s leaves room for
@@ -2749,7 +2750,7 @@ if (( FULL )); then
   # The negative control, and it is nearly free: an instance of a challenge
   # that declares no options at all. Every challenge carries a containerOptions
   # row for host "" -- the loader stores the zero value even when there is no
-  # block (cork/loader.go:43-46) -- so hasContainerOpts is true here too and
+  # block (cork/loader.go:46-49) -- so hasContainerOpts is true here too and
   # the branch at cork/docker.go:1047-1105 does run; the limits are the only
   # evidence that distinguishes a declared option from a daemon default.
   # Deliberately no assertion on Init: that "" row makes cork send an explicit
@@ -3268,7 +3269,7 @@ PERSIST_META_G1=$(api GET "/instances/$PERSIST_INST")
 set_generation 2 both
 # Both updates go out together. UpdateWithOptions takes updateMu as its very
 # first statement, before DetectChanges (cork/api.go:183-190, cork/types.go:57-59),
-# and updateHandler touches no state before calling it (cmd/corkd/main.go:670-700),
+# and updateHandler touches no state before calling it (cmd/corkd/main.go:695-725),
 # so the loser blocks for the whole rebuild and only looks at the tree
 # afterwards -- by which time updateChallenges has persisted the new checksums
 # (cork/database_challenges.go:364-369) and nothing is left to do. Nothing else
@@ -3559,9 +3560,9 @@ if (( FULL )); then
   mk_launch "$mk_dir" cold "$COLD_WORKER"
   note "the launch on the image-less $COLD_WORKER answered HTTP $MK_CODE after ${MK_TOOK}s: $(head -c 160 <<<"$MK_BODY")"
   [[ "$MK_CODE" == 500 ]] ||
-    fail "a launch whose pull the registry cannot serve answered HTTP $MK_CODE, expected 500: a missing manifest is none of the retryable classes (cmd/corkd/main.go:447-449), so the platform must not be told to place it again. If the team decides this should be a 503, this is the assertion that says so ($(head -c 200 <<<"$MK_BODY"))"
+    fail "a launch whose pull the registry cannot serve answered HTTP $MK_CODE, expected 500: a missing manifest is none of the retryable classes (retryableLaunch in cmd/corkd/main.go), so the platform must not be told to place it again. If the team decides this should be a 503, this is the assertion that says so ($(head -c 200 <<<"$MK_BODY"))"
   if grep -qi '^Retry-After' "$mk_dir/cold.head"; then
-    fail "the failed pull carried a Retry-After header: only the retryable classes set it (cmd/corkd/main.go:447-452), and the platform would re-place a launch no retry can fix until the build is repaired"
+    fail "the failed pull carried a Retry-After header: only the retryable classes set it (retryableLaunch in cmd/corkd/main.go), and the platform would re-place a launch no retry can fix until the build is repaired"
   fi
   # The failure has to name the image it could not get, so an operator reading
   # a 500 can tell a broken build from a broken box. Two wordings are legitimate
@@ -3758,8 +3759,9 @@ fi
 # (b) The regression. A 503 during a rebuild is legitimate - a busy or
 # overloaded worker, a worker that went down under the launch, a lost database
 # write - and the platform's celery worker retries it (see the retryable classes
-# in cmd/corkd/main.go:449). A 500 is what it cannot retry, and it is exactly
-# what the rebuild produces without the guard at database_challenges.go:719:
+# in retryableLaunch, cmd/corkd/main.go). A 500 is what it cannot retry, and
+# it is exactly what the rebuild produces without the guard at
+# database_challenges.go:719:
 # stopInstance would delete an unfinalized row under a running launch, its
 # container and port rows cascade with it, and that launch's finalizeInstance
 # then fails on the foreign key - an error no retryable class covers. 000 means
@@ -5217,7 +5219,7 @@ if (( FULL )); then
   same_bytes "$ART_TMP/ondemand.before" "$CHALLENGES/$ONDEMAND_SRC" ||
     fail "the persistent-only generation bump changed $ONDEMAND_SRC: this step's update would rebuild the on-demand challenge and tear down the instances the scenario still tracks"
   # cacheArtifacts stages the three-entry archive and validateBuild then refuses
-  # the build (cork/loader.go:487-491) -- the cheapest failure that happens
+  # the build (cork/loader.go:491-495) -- the cheapest failure that happens
   # AFTER the archive is staged. A build that failed earlier (a broken
   # Dockerfile) never reaches the promotion at all and would prove nothing about
   # it. The extra file is planted by the Dockerfile rather than taken from
@@ -5240,7 +5242,7 @@ if (( FULL )); then
   sed 's/^/       /' <<<"$out"
   note "the failing rebuild took $(( $(date +%s) - t ))s"
   (( rc != 0 )) ||
-    fail "cork update exited 0 although the rebuilt image publishes an artifact the challenge text never references: validateBuild (cork/loader.go:487-491) let it through, so everything below would pass for the wrong reason"
+    fail "cork update exited 0 although the rebuilt image publishes an artifact the challenge text never references: validateBuild (cork/loader.go:491-495) let it through, so everything below would pass for the wrong reason"
   grep -q '^Errors:' <<<"$out" ||
     fail "the update printed no Errors section although the rebuild of $CH_PERSISTENT had to fail validation"
   # The negative control: without it a build that failed for any other reason (a
@@ -5381,9 +5383,10 @@ if (( FULL )); then
     # one to noteWorkerTransportError (cork/launch.go:142-150); a pull that
     # merely ran out of time is exempt, because the registry is the likelier
     # culprit. The regression answers the platform the same retryable 503
-    # (ErrPullTimeout, cmd/corkd/main.go:447-452) while quietly taking the box
-    # out of the fleet until an operator re-adds it -- in production one slow
-    # registry would walk the whole fleet down. The second promise is
+    # (ErrPullTimeout, retryableLaunch in cmd/corkd/main.go) while quietly
+    # taking the box out of the fleet until an operator re-adds it -- in
+    # production one slow registry would walk the whole fleet down. The
+    # second promise is
     # imagePresent (cork/launch.go:163-178): a tag the daemon already holds is
     # never pulled, so a launch onto a warm worker does not touch the registry
     # at all. Nothing else in this scenario reaches pullImage's timeout.
@@ -5550,7 +5553,7 @@ if (( FULL )); then
       if grep -qiE 'tls handshake|connection refused|no such host|certificate' <<<"$body"; then
         fail "the stalled launch answered HTTP $code after ${took_ms}ms with a registry error rather than a timeout: the stand-in did not hold the pull open (dockerd bounds a TLS handshake long before cork's ${PULL_TIMEOUT}s pull timeout), so this is the fixture failing, not cork: $(head -c 200 <<<"$body")"
       fi
-      fail "the launch whose pull hung on the registry answered HTTP $code after ${took_ms}ms, expected 503: a pull that ran out of time is retryable (ErrPullTimeout at cmd/corkd/main.go:447-452), and a 500 is what makes the platform's celery worker give the player up ($(head -c 200 <<<"$body"))"
+      fail "the launch whose pull hung on the registry answered HTTP $code after ${took_ms}ms, expected 503: a pull that ran out of time is retryable (ErrPullTimeout at retryableLaunch in cmd/corkd/main.go), and a 500 is what makes the platform's celery worker give the player up ($(head -c 200 <<<"$body"))"
     fi
     grep -q "image pull timed out" <<<"$body" ||
       fail "the 503 does not name the pull timeout, so it is some other retryable refusal and this step proved nothing: $(head -c 200 <<<"$body")"
@@ -6138,9 +6141,10 @@ fi
 if (( FULL )); then
   step "database busy: a launch and a stop that lose the race for SQLite's write lock are answered as retryable 503s, and the same requests go through once it is free"
   # The only coverage of ErrDatabaseBusy in either handler
-  # (cmd/corkd/main.go:449 for a launch, :571 for a stop). corkd opens the
-  # database with _busy_timeout=100 (cork/database.go:246), so a writer
-  # holding the lock for longer than that is exactly the burst that timeout is
+  # (retryableLaunch for a launch, retryableStop for a stop, both in
+  # cmd/corkd/main.go). corkd opens the database with _busy_timeout=100
+  # (cork/database.go:246), so a writer holding the lock for longer than that
+  # is exactly the burst that timeout is
   # sized against; every write on the launch and stop paths goes through
   # retryableDB (cork/database_instances.go:20), and the platform's celery
   # workers retry a 503 and fail a 500.
@@ -6191,7 +6195,7 @@ if (( FULL )); then
     timed_launch "$dbtmp" busy "$OD_BUILD" "$(jq -cn '{user_id: "db-busy", env: {CUSTOM_VAR: "e2e"}}')"
     read -r code _ <"$dbtmp/busy.code"
     [[ "$code" == 503 ]] ||
-      fail "a launch that lost the race for the write lock answered HTTP $code, not 503: $(head -c 300 "$dbtmp/busy.body"). ErrDatabaseBusy is retryable, and the platform retries a 503 and fails a 500 (cmd/corkd/main.go:449)"
+      fail "a launch that lost the race for the write lock answered HTTP $code, not 503: $(head -c 300 "$dbtmp/busy.body"). ErrDatabaseBusy is retryable, and the platform retries a 503 and fails a 500 (retryableLaunch in cmd/corkd/main.go)"
     grep -qi '^retry-after:' "$dbtmp/busy.head" ||
       fail "the 503 for a launch that lost the write lock carried no Retry-After: $(tr -d '\r' <"$dbtmp/busy.head" | head -20)"
     grep -qi 'database busy' "$dbtmp/busy.body" ||
@@ -6212,7 +6216,7 @@ if (( FULL )); then
       -X DELETE "$CORK_SERVER/instances/$busy_id" >"$dbtmp/stop.code" 2>/dev/null || true
     code=$(cat "$dbtmp/stop.code")
     [[ "$code" == 503 ]] ||
-      fail "a stop that lost the race for the write lock answered HTTP $code, not 503: $(head -c 300 "$dbtmp/stop.body") (cmd/corkd/main.go:571)"
+      fail "a stop that lost the race for the write lock answered HTTP $code, not 503: $(head -c 300 "$dbtmp/stop.body") (retryableStop in cmd/corkd/main.go)"
     grep -qi '^retry-after:' "$dbtmp/stop.head" ||
       fail "the 503 for a stop that lost the write lock carried no Retry-After"
 
