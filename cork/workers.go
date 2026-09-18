@@ -857,6 +857,18 @@ func (m *Manager) setReachable(w *workerConn, to workerReachable, reason string)
 	for {
 		prev := workerReachable(w.reachable.Load())
 		if prev == to {
+			// Already there, but there is a fresher cause: keep the reason
+			// current so an operator reads why the worker is *still*
+			// unresponsive rather than why it first was. This is not an edge
+			// case — a worker that has never been admitted starts
+			// unresponsive, so the verdict its own reconcile reaches is a
+			// no-op transition, and without this a box that never came up
+			// would carry no explanation at all. Nothing else moves: the
+			// state did not change, so neither `since` nor the ejection count
+			// may, and the caller is told it made no transition.
+			if reason != "" {
+				w.reason.Store(&reason)
+			}
 			return false
 		}
 		if prev == workerDown && to != workerDown {

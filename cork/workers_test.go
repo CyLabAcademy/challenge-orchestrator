@@ -90,6 +90,38 @@ func TestAConnNeverReturnsToOk(t *testing.T) {
 	m.markWorkerDown(w)
 }
 
+// A worker that has never been admitted is already unresponsive, so the
+// verdict its own reconcile reaches is a transition to the state it is in.
+// That must still record why — a box that never came up is exactly the one an
+// operator has no other way to ask about — while leaving everything that
+// describes a *change* alone.
+func TestReasonIsRecordedWithoutATransition(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED)}
+	w := testWorkerConn(workerUnresponsive) // as newWorkerConn leaves it
+	w.since.Store(time.Now().Add(-time.Hour).UnixNano())
+	entered := w.since.Load()
+
+	if m.setReachable(w, workerUnresponsive, "its daemon did not answer while it was being reconciled") {
+		t.Fatal("storing a reason on the state the worker is already in was reported as a transition")
+	}
+	r := w.reason.Load()
+	if r == nil || *r == "" {
+		t.Fatal("a worker that never came up carries no reason: an operator has nothing to go on")
+	}
+	if w.since.Load() != entered {
+		t.Fatal("since moved although the worker did not change state")
+	}
+	if got := w.ejections.Load(); got != 0 {
+		t.Fatalf("ejections %d: a worker that was never admitted was not ejected from anything", got)
+	}
+
+	// A later cause replaces an earlier one rather than going unrecorded.
+	m.setReachable(w, workerUnresponsive, "dockerd did not answer: connection refused")
+	if r := w.reason.Load(); r == nil || *r != "dockerd did not answer: connection refused" {
+		t.Fatalf("reason was not refreshed by a later cause: %v", r)
+	}
+}
+
 // The reconcile that admits a worker must not do so behind the back of a
 // control call that failed while it ran: the conn is retired by then, and the
 // poller replaces it rather than admitting a daemon nothing has re-proved.
