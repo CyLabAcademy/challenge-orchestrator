@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-09-18
+
+No code changes. 1.0.0 published no binaries — the workflow uploaded assets
+after publishing, which an immutable release refuses — so that release is
+permanent and empty. This is the first tag carrying binaries.
+
 ## [1.0.0] — 2026-09-18
 
 The first release under the cork name.
@@ -129,4 +135,5 @@ fallback goes, a build plane needs both.
 4. A single-host deployment needs no build plane: leave `CORK_BUILD_PLANE` unset
    and `corkd` builds on its own docker daemon, as cmgr did.
 
+[1.0.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.0.1
 [1.0.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.0.0
