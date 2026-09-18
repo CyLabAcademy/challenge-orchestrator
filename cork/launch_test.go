@@ -31,8 +31,8 @@ func TestAcquireSlotRefusesDownWorker(t *testing.T) {
 	inst := &InstanceMetadata{Id: 7, Worker: "10.0.0.1"}
 
 	_, err := m.acquireSlot(sem, inst, "launch", time.Second)
-	if !errors.Is(err, ErrWorkerDown) {
-		t.Fatalf("expected ErrWorkerDown, got %v", err)
+	if !errors.Is(err, ErrWorkerUnreachable) {
+		t.Fatalf("expected ErrWorkerUnreachable, got %v", err)
 	}
 	if len(sem) != 0 {
 		t.Fatalf("a refused launch leaked a slot: %d held", len(sem))
@@ -123,8 +123,8 @@ func TestAcquireSlotWakesOnWorkerUnreachable(t *testing.T) {
 	}()
 	start := time.Now()
 	_, err := m.acquireSlot(sem, inst, "launch", time.Minute)
-	if !errors.Is(err, ErrWorkerDown) {
-		t.Fatalf("expected ErrWorkerDown, got %v", err)
+	if !errors.Is(err, ErrWorkerUnreachable) {
+		t.Fatalf("expected ErrWorkerUnreachable, got %v", err)
 	}
 	if waited := time.Since(start); waited > 30*time.Second {
 		t.Fatalf("the launch waited %s for a worker that had gone down", waited)

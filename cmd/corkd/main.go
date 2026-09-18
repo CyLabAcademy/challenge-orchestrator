@@ -33,7 +33,7 @@ var retryableLaunch = []error{
 	cork.ErrAllWorkersOverloaded,
 	cork.ErrAllWorkersUnresponsive,
 	cork.ErrWorkerBusy,
-	cork.ErrWorkerDown,
+	cork.ErrWorkerUnreachable,
 	cork.ErrPullTimeout,
 	cork.ErrDatabaseBusy,
 }

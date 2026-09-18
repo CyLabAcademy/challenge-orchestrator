@@ -39,9 +39,10 @@ var (
 	// ErrWorkerBusy: no slot on the instance's daemon within the wait.
 	// Retryable (corkd answers 503 with Retry-After).
 	ErrWorkerBusy = errors.New("worker is busy")
-	// ErrWorkerDown: the instance's worker went down between placement and
-	// the launch stage. Retryable: placement now skips it.
-	ErrWorkerDown = errors.New("worker went down")
+	// ErrWorkerUnreachable: the instance's worker stopped answering between
+	// placement and the launch stage. Retryable: placement now skips it, and
+	// the worker probes its own way back.
+	ErrWorkerUnreachable = errors.New("worker stopped answering")
 	// ErrPullTimeout: an image pull exceeded the pull timeout. Retryable: the
 	// next attempt may land on a worker that already holds the image.
 	ErrPullTimeout = errors.New("image pull timed out")
@@ -85,12 +86,12 @@ func (m *Manager) restartLimits() launchLimits {
 // caller can clear the instance's records without a docker round trip,
 // which against a wedged daemon would cost another control timeout. A
 // failure that leaves the worker unreachable (its hung call is what ejected it) is
-// reported as ErrWorkerDown: the platform's retry is placed elsewhere.
+// reported as ErrWorkerUnreachable: the platform's retry is placed elsewhere.
 func (m *Manager) launch(build *BuildMetadata, instance *InstanceMetadata, netOpts NetworkOptions,
 	opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string, limits launchLimits) (started bool, err error) {
 	started, err = m.launchStages(build, instance, netOpts, opts, envVars, revPortMap, limits)
-	if err != nil && !errors.Is(err, ErrWorkerDown) && instance.Worker != "" && m.workerUnreachable(instance.Worker) {
-		err = fmt.Errorf("%w: worker %s, during the launch of instance %d: %v", ErrWorkerDown, instance.Worker, instance.Id, err)
+	if err != nil && !errors.Is(err, ErrWorkerUnreachable) && instance.Worker != "" && m.workerUnreachable(instance.Worker) {
+		err = fmt.Errorf("%w: worker %s, during the launch of instance %d: %v", ErrWorkerUnreachable, instance.Worker, instance.Id, err)
 	}
 	return started, err
 }
@@ -102,7 +103,7 @@ func (m *Manager) launchStages(build *BuildMetadata, instance *InstanceMetadata,
 		return false, err
 	}
 	if instance.Worker != "" && m.workerUnreachable(instance.Worker) {
-		return false, fmt.Errorf("%w: worker %s, before the launch of instance %d", ErrWorkerDown, instance.Worker, instance.Id)
+		return false, fmt.Errorf("%w: worker %s, before the launch of instance %d", ErrWorkerUnreachable, instance.Worker, instance.Id)
 	}
 	if err := m.ensureImages(cli, build, instance, limits); err != nil {
 		return false, err
@@ -225,7 +226,7 @@ func (m *Manager) acquireLaunchSlot(q *daemonQueue, instance *InstanceMetadata, 
 // be called when the stage is over.
 func (m *Manager) acquireSlot(sem chan struct{}, instance *InstanceMetadata, what string, wait time.Duration) (release func(), err error) {
 	if instance.Worker != "" && m.workerUnreachable(instance.Worker) {
-		return nil, fmt.Errorf("%w: worker %s, before the %s stage of instance %d", ErrWorkerDown, instance.Worker, what, instance.Id)
+		return nil, fmt.Errorf("%w: worker %s, before the %s stage of instance %d", ErrWorkerUnreachable, instance.Worker, what, instance.Id)
 	}
 	var expired <-chan time.Time // nil, so never, when the wait is unbounded
 	if wait > 0 {
@@ -237,13 +238,13 @@ func (m *Manager) acquireSlot(sem chan struct{}, instance *InstanceMetadata, wha
 	select {
 	case sem <- struct{}{}:
 	case <-unreachable:
-		return nil, fmt.Errorf("%w: worker %s, while instance %d waited for a %s slot", ErrWorkerDown, instance.Worker, instance.Id, what)
+		return nil, fmt.Errorf("%w: worker %s, while instance %d waited for a %s slot", ErrWorkerUnreachable, instance.Worker, instance.Id, what)
 	case <-expired:
 		return nil, fmt.Errorf("%w: no %s slot on %s for instance %d within %s", ErrWorkerBusy, what, daemonLabel(instance), instance.Id, wait)
 	}
 	if instance.Worker != "" && m.workerUnreachable(instance.Worker) {
 		<-sem
-		return nil, fmt.Errorf("%w: worker %s, while instance %d waited for a %s slot", ErrWorkerDown, instance.Worker, instance.Id, what)
+		return nil, fmt.Errorf("%w: worker %s, while instance %d waited for a %s slot", ErrWorkerUnreachable, instance.Worker, instance.Id, what)
 	}
 	return func() { <-sem }, nil
 }
