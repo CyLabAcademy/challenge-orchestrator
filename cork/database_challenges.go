@@ -984,15 +984,15 @@ func (m *Manager) reconcileBuild(build *BuildMetadata, cMeta *ChallengeMetadata,
 		}
 		// Restart in place, or remove. The restart pulls the new generation
 		// first, while the old one keeps serving, then swaps. One that cannot
-		// happen (its worker down: every docker call to it would only time
+		// happen (its worker unreachable: every docker call to it would only time
 		// out) or that fails at any point removes the instance instead, like
-		// any stop on a down worker, and reports it; the converge below
+		// any stop on an unreachable worker, and reports it; the converge below
 		// relaunches it fresh, through placement. Left in place it would
 		// either count as present while dead, or come back serving the old
 		// image once its box rejoins, since a later update finds nothing to
 		// rebuild.
-		if instance.Worker != "" && m.workerIsDown(instance.Worker) {
-			err = fmt.Errorf("worker %s is down", instance.Worker)
+		if instance.Worker != "" && m.workerUnreachable(instance.Worker) {
+			err = fmt.Errorf("worker %s is not reachable", instance.Worker)
 		} else {
 			err = m.restartInstance(build, cMeta, instance, revPortMap)
 		}

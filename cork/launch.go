@@ -28,7 +28,7 @@ import (
 //     of inside dockerd, where a deep queue looks like a hung call.
 //
 // Waiting for a slot is bounded for a request-driven launch and refused
-// outright once the worker is down: under adverse load a request fails
+// outright once the worker is unreachable: under adverse load a request fails
 // fast, and the platform retries onto another worker instead of queueing
 // behind a wedged or saturated daemon. The bounds are a launchLimits; a
 // restart during a rebuild gets looser ones. A launch that would evidently
@@ -39,9 +39,10 @@ var (
 	// ErrWorkerBusy: no slot on the instance's daemon within the wait.
 	// Retryable (corkd answers 503 with Retry-After).
 	ErrWorkerBusy = errors.New("worker is busy")
-	// ErrWorkerDown: the instance's worker went down between placement and
-	// the launch stage. Retryable: placement now skips it.
-	ErrWorkerDown = errors.New("worker went down")
+	// ErrWorkerUnreachable: the instance's worker stopped answering between
+	// placement and the launch stage. Retryable: placement now skips it, and
+	// the worker probes its own way back.
+	ErrWorkerUnreachable = errors.New("worker stopped answering")
 	// ErrPullTimeout: an image pull exceeded the pull timeout. Retryable: the
 	// next attempt may land on a worker that already holds the image.
 	ErrPullTimeout = errors.New("image pull timed out")
@@ -80,17 +81,17 @@ func (m *Manager) restartLimits() launchLimits {
 // launch brings an instance up on its daemon within limits: images, network,
 // containers. started reports whether the launch slot was taken, that is
 // whether the daemon may hold the instance's network or containers when err
-// is set: a launch that failed before its slot (worker down, image check or
+// is set: a launch that failed before its slot (worker unreachable, image check or
 // pull failed, no slot within the wait) left nothing on the daemon, so its
 // caller can clear the instance's records without a docker round trip,
 // which against a wedged daemon would cost another control timeout. A
-// failure that leaves the worker down (its hung call is what marked it) is
-// reported as ErrWorkerDown: the platform's retry is placed elsewhere.
+// failure that leaves the worker unreachable (its hung call is what ejected it) is
+// reported as ErrWorkerUnreachable: the platform's retry is placed elsewhere.
 func (m *Manager) launch(build *BuildMetadata, instance *InstanceMetadata, netOpts NetworkOptions,
 	opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string, limits launchLimits) (started bool, err error) {
 	started, err = m.launchStages(build, instance, netOpts, opts, envVars, revPortMap, limits)
-	if err != nil && !errors.Is(err, ErrWorkerDown) && instance.Worker != "" && m.workerIsDown(instance.Worker) {
-		err = fmt.Errorf("%w: worker %s, during the launch of instance %d: %v", ErrWorkerDown, instance.Worker, instance.Id, err)
+	if err != nil && !errors.Is(err, ErrWorkerUnreachable) && instance.Worker != "" && m.workerUnreachable(instance.Worker) {
+		err = fmt.Errorf("%w: worker %s, during the launch of instance %d: %v", ErrWorkerUnreachable, instance.Worker, instance.Id, err)
 	}
 	return started, err
 }
@@ -101,8 +102,8 @@ func (m *Manager) launchStages(build *BuildMetadata, instance *InstanceMetadata,
 	if err != nil {
 		return false, err
 	}
-	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
-		return false, fmt.Errorf("%w: worker %s, before the launch of instance %d", ErrWorkerDown, instance.Worker, instance.Id)
+	if instance.Worker != "" && m.workerUnreachable(instance.Worker) {
+		return false, fmt.Errorf("%w: worker %s, before the launch of instance %d", ErrWorkerUnreachable, instance.Worker, instance.Id)
 	}
 	if err := m.ensureImages(cli, build, instance, limits); err != nil {
 		return false, err
@@ -157,7 +158,7 @@ func (m *Manager) ensureImages(cli *client.Client, build *BuildMetadata, instanc
 // sole writer, so a present tag names the right content. The inspect runs
 // under the control timeout, and anything but a clean "not found" is a
 // failure: a hung or unreachable daemon is reported like any other control
-// call (marking a worker down) rather than answered with a pull that would
+// call (ejecting the worker) rather than answered with a pull that would
 // hang the same way.
 func (m *Manager) imagePresent(cli *client.Client, worker string, imageName string) (bool, error) {
 	ctx, cancel := m.controlCtx()
@@ -217,15 +218,15 @@ func (m *Manager) acquireLaunchSlot(q *daemonQueue, instance *InstanceMetadata, 
 
 // acquireSlot takes a slot on the instance's daemon, waiting at most wait
 // (as long as it takes when wait is zero), and refuses as soon as the
-// instance's worker is down, before, during or after the wait: the wait ends
-// on the worker's down channel as well as on a slot, so a queue behind a
+// instance's worker is unreachable, before, during or after the wait: the wait
+// ends on the worker's unreachable channel as well as on a slot, so a queue behind a
 // daemon that has just been given up on drains at once instead of holding
 // each launch for its full wait, and an unbounded teardown wait does not
 // hang on a daemon nothing will release a slot on. The returned release must
 // be called when the stage is over.
 func (m *Manager) acquireSlot(sem chan struct{}, instance *InstanceMetadata, what string, wait time.Duration) (release func(), err error) {
-	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
-		return nil, fmt.Errorf("%w: worker %s, before the %s stage of instance %d", ErrWorkerDown, instance.Worker, what, instance.Id)
+	if instance.Worker != "" && m.workerUnreachable(instance.Worker) {
+		return nil, fmt.Errorf("%w: worker %s, before the %s stage of instance %d", ErrWorkerUnreachable, instance.Worker, what, instance.Id)
 	}
 	var expired <-chan time.Time // nil, so never, when the wait is unbounded
 	if wait > 0 {
@@ -233,17 +234,17 @@ func (m *Manager) acquireSlot(sem chan struct{}, instance *InstanceMetadata, wha
 		defer timer.Stop()
 		expired = timer.C
 	}
-	down := m.workerDownCh(instance.Worker)
+	unreachable := m.workerUnreachableCh(instance.Worker)
 	select {
 	case sem <- struct{}{}:
-	case <-down:
-		return nil, fmt.Errorf("%w: worker %s, while instance %d waited for a %s slot", ErrWorkerDown, instance.Worker, instance.Id, what)
+	case <-unreachable:
+		return nil, fmt.Errorf("%w: worker %s, while instance %d waited for a %s slot", ErrWorkerUnreachable, instance.Worker, instance.Id, what)
 	case <-expired:
 		return nil, fmt.Errorf("%w: no %s slot on %s for instance %d within %s", ErrWorkerBusy, what, daemonLabel(instance), instance.Id, wait)
 	}
-	if instance.Worker != "" && m.workerIsDown(instance.Worker) {
+	if instance.Worker != "" && m.workerUnreachable(instance.Worker) {
 		<-sem
-		return nil, fmt.Errorf("%w: worker %s, while instance %d waited for a %s slot", ErrWorkerDown, instance.Worker, instance.Id, what)
+		return nil, fmt.Errorf("%w: worker %s, while instance %d waited for a %s slot", ErrWorkerUnreachable, instance.Worker, instance.Id, what)
 	}
 	return func() { <-sem }, nil
 }

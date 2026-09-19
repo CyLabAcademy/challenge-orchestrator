@@ -206,6 +206,7 @@ outer_ctl() { outer "/containers/$1/$2" -X POST -o /dev/null; } # outer_ctl <id>
 # Chaos state the EXIT trap undoes if the run dies mid-step, so the fleet is
 # usable (and the next run does not stall) after a failure.
 PAUSED_WORKER=""      # outer container id of a paused worker
+PAUSED_WORKER2=""     # and a second, for the step that freezes the whole fleet
 STOPPED_SIDECAR=""    # outer container id of a stopped telemetry sidecar
 DOWNED_WORKER=""      # a worker this run marked down and still owes a worker-add
 DRAINED_WORKER=""     # a worker purged or PATCHed down for a scale-in drain
@@ -275,6 +276,7 @@ cleanup() {
     MAKE_TAG_DELETED=""
   fi
   if [[ -n "$PAUSED_WORKER" ]]; then outer_ctl "$PAUSED_WORKER" unpause >/dev/null 2>&1 || true; fi
+  if [[ -n "$PAUSED_WORKER2" ]]; then outer_ctl "$PAUSED_WORKER2" unpause >/dev/null 2>&1 || true; fi
   for fake in "${!FAKES[@]}"; do
     outer_ctl "$fake" stop >/dev/null 2>&1 || true
     outer_ctl "${FAKES[$fake]}" start >/dev/null 2>&1 || true
@@ -395,25 +397,60 @@ telemetry_hangs() {
 }
 
 # down_worker <worker ip>: cork worker-down, verified at once. The PATCH
-# is handled synchronously and markWorkerDown swaps the health unconditionally,
-# so the very next read must say down: a poll already in flight cannot put the
-# worker back, because pollerSetHealth stores its verdict with a
-# compare-and-swap that refuses to leave down. This used to need a retry —
-# cork really did have that race — so a single call is the assertion.
+# is handled synchronously and setReachable stores down whatever else is in
+# flight, so the very next read must say down: a probe already running cannot
+# put the worker back, because down is asserted and setReachable refuses every
+# observation that would leave it. This used to need a retry — cork really did
+# have that race — so a single call is the assertion.
 down_worker() {
   cork worker-down "$1"
-  health_is "$1" down ||
-    fail "worker $1 is not down on the read right after worker-down: an in-flight telemetry poll overwrote it (the race fixed in ab72f5d)"
+  reachable_is "$1" down ||
+    fail "worker $1 is not down on the read right after worker-down: an in-flight probe overwrote it (the race fixed in ab72f5d)"
 }
 
-# readd <worker ip>: the recovery path for a down or purged worker.
+# readd <worker ip>: the recovery path for a worker an operator took down, and
+# the way to force an immediate reconnect rather than waiting out the recovery
+# backoff. A worker that is merely unresponsive does not need this — it comes
+# back on its own, which recovers_by_itself below is what proves.
 readd() {
   cork worker-add "$1" "${PUBLIC[$1]}"
-  retry 30 "worker $1 to come back ok" health_is "$1" ok
+  retry 30 "worker $1 to come back ok" reachable_is "$1" ok
 }
 
-worker_health() { api GET /workers | jq -r --arg ip "$1" '.[] | select(.ip==$ip) | .health'; }
+# A worker carries two states, and the difference is the point: `reachable`
+# comes from its docker daemon and decides whether a launch there could work,
+# `load` comes from its telemetry agent and decides whether one should be
+# added. `health` is the pair collapsed onto the old single-axis vocabulary and
+# is kept only for clients written against it; the scenario reads the axes.
+worker_field() { api GET /workers | jq -r --arg ip "$1" --arg f "$2" '.[] | select(.ip==$ip) | .[$f]'; }
+worker_health() { worker_field "$1" health; }
+worker_reachable() { worker_field "$1" reachable; }
+worker_load() { worker_field "$1" load; }
+worker_reason() { worker_field "$1" reason; }
+# health_is reads the derived, deprecated `health` string rather than either
+# axis, and is kept for the readiness gates that legitimately want "reachable
+# and not overloaded" in one question -- which also keeps the field cork-scaler
+# still reads under test. It must never be used to assert a RECOVERY: it reads
+# ok for an unknown load too, so it cannot tell a sidecar that came back from
+# one that died.
 health_is() { [[ "$(worker_health "$1")" == "$2" ]]; }
+reachable_is() { [[ "$(worker_reachable "$1")" == "$2" ]]; }
+load_is() { [[ "$(worker_load "$1")" == "$2" ]]; }
+# reason_has <worker ip> <substring>: for the waits whose start state is also
+# their target state. A worker that has never been admitted is already
+# unresponsive, so `retry ... reachable_is <ip> unresponsive` returns on its
+# first sample and proves nothing about the verdict it claims to be waiting
+# for. The reason is what only that verdict writes.
+reason_has() { [[ "$(worker_reason "$1")" == *"$2"* ]]; }
+
+# recovers_by_itself <worker ip>: the headline of the reversible-unreachability
+# work. Nothing is called here — no worker-add, no PATCH — so a worker that
+# comes back ok did it from its own probe: it reconnected, reconciled, and
+# rejoined placement. 60s is well past the recovery backoff this fleet runs
+# with (1s x ejections, capped at 5s) plus a reconcile pass.
+recovers_by_itself() {
+  retry 60 "worker $1 to recover on its own, with nothing calling worker-add" reachable_is "$1" ok
+}
 # worker_instances <worker ip>: the per-worker instance count from GET
 # /workers, which is the signal an autoscaling drain polls. Empty for a worker
 # that is not registered.
@@ -1071,7 +1108,10 @@ for ip in "${WORKER_IPS[@]}"; do
   cork worker-add "$ip" "${PUBLIC[$ip]}"
 done
 all_workers_ok() {
-  [[ "$(api GET /workers | jq -r 'map(select(.health == "ok")) | length')" == "$NWORKERS" ]]
+  # Written on the two axes rather than the derived `health` string, which is
+  # deprecated. Same meaning: health reads ok exactly when the worker is
+  # reachable and not reporting overloaded.
+  [[ "$(api GET /workers | jq -r 'map(select(.reachable == "ok" and .load != "overloaded")) | length')" == "$NWORKERS" ]]
 }
 retry 30 "every worker to report ok" all_workers_ok
 cork worker-list | sed 's/^/       /'
@@ -2113,8 +2153,8 @@ if (( FULL )); then
   # afterwards is for overloaded, which a big pull can cause and which clears
   # by itself.
   for ip in "${WORKER_IPS[@]}"; do
-    ! health_is "$ip" down ||
-      fail "worker $ip was marked down by the pull it had to perform: a pull failure that is not ErrPullTimeout is offered to noteWorkerTransportError (cork/launch.go:142-150), and one slow registry would walk the whole fleet down until an operator re-added every box"
+    reachable_is "$ip" ok ||
+      fail "worker $ip is '$(worker_reachable "$ip")' after the pull it had to perform: a pull failure that is not ErrPullTimeout is offered to noteWorkerTransportError (cork/launch.go), and one slow registry would eject the whole fleet"
   done
   retry 20 "both workers to report ok after the cold pulls" all_workers_ok
 
@@ -2379,13 +2419,16 @@ sleep 1 # every subshell reaches its poll; forking N of them is the slow part
 t=$(date +%s)
 touch "$burst_gate"
 wait
-# Read the health first, before anything else can spend time: refusing a
-# launch touches no daemon at all, so a saturated queue must never look like
-# a wedged one. down is sticky, so this single read is the whole assertion.
-burst_health=$(worker_health "$WB")
+# Read the state first, before anything else can spend time: refusing a launch
+# touches no daemon at all, so a saturated queue must never look like a wedged
+# one. Asked as "reachable ok" rather than "not down", because an ejected
+# worker reads unresponsive and would sail past a not-down check -- and read
+# at once, since an ejection here would probe its way back within seconds and
+# a retry would pass over the regression.
+burst_reachable=$(worker_reachable "$WB")
 note "$BURST_N launches fired at $WB, all answered in $(( $(date +%s) - t ))s"
-[[ "$burst_health" != down ]] ||
-  fail "worker $WB was marked down by a burst it merely refused: the launch queue is corkd's own (daemonQueue), and only two of its launches ever reach docker at once, so nothing here can reach a control timeout"
+[[ "$burst_reachable" == ok ]] ||
+  fail "worker $WB is '$burst_reachable' after a burst it merely refused: the launch queue is corkd's own (daemonQueue), and only two of its launches ever reach docker at once, so nothing here can reach a control timeout"
 
 burst_ids=()
 burst_503=0 burst_slot=0 burst_admit=0 burst_odd=0 burst_worst=0
@@ -2403,8 +2446,8 @@ for (( i = 30; i < 30 + BURST_N; i++ )); do
     503)
       burst_503=$(( burst_503 + 1 ))
       if (( took > burst_worst )); then burst_worst=$took; fi
-      if grep -q "worker went down" <<<"$body"; then
-        fail "the burst answered e2e-user-$i with a worker-down refusal after ${took}s: a busy daemon must be reported busy (ErrWorkerBusy), not given up on ($body)"
+      if grep -q "worker stopped answering" <<<"$body"; then
+        fail "the burst answered e2e-user-$i with an unreachable-worker refusal after ${took}s: a busy daemon must be reported busy (ErrWorkerBusy), not given up on ($body)"
       fi
       if grep -qE "no launch slot on worker $WB for instance [0-9]+ within" <<<"$body"; then
         burst_slot=$(( burst_slot + 1 ))       # acquireSlot's expired arm, launch.go:243
@@ -2676,8 +2719,8 @@ rm -rf "$burst"
 # surface as a confusing timeout later; overloaded clears itself, which the
 # retry absorbs.
 for ip in "$WA" "$WB"; do
-  if health_is "$ip" down; then
-    fail "worker $ip was marked down by a burst of $(( BURST_N + PROBE_N )) launches: a control call against it ran into CORK_WORKER_CONTROL_TIMEOUT, or its telemetry poll was starved for CORK_WORKER_MAX_MISSES"
+  if ! reachable_is "$ip" ok; then
+    fail "worker $ip is '$(worker_reachable "$ip")' after a burst of $(( BURST_N + PROBE_N )) launches: a control call against it ran into CORK_WORKER_CONTROL_TIMEOUT, or its docker probe was starved for CORK_WORKER_MAX_MISSES"
   fi
 done
 retry 30 "both workers to be ok again after the burst" all_workers_ok
@@ -2999,17 +3042,16 @@ if (( FULL )); then
   # Nothing was re-created on the way out, and the network was not recreated
   # by a stop that took "not found" for "make it so".
   assert_gone_from_worker "$w" "$id" "$inst"
-  # down is sticky and costs an operator a worker-add, so this is the
-  # assertion that would cost a production box: a NotFound offered to
-  # noteWorkerTransportError (cork/docker.go:1264, isTransportError at
-  # cork/workers.go:521-539) would walk a fleet down every time the reaper ran
-  # ahead of a stop. Read into a variable rather than negating health_is, so a
-  # /workers read that fails is a loud failure instead of a silent pass; and
-  # written as "not down" rather than "ok", because overloaded is a legitimate
-  # transient reading here while down is never one.
-  h=$(worker_health "$w")
-  [[ "$h" != down ]] ||
-    fail "worker $w was marked down by the stop of an instance the reaper had already cleared: a container that is not there is not a transport failure (cork/docker.go:1259-1262, cork/workers.go:521-539)"
+  # This is the assertion that would cost a production box: a NotFound offered
+  # to noteWorkerTransportError (isTransportError, cork/workers.go) would eject
+  # the whole fleet every time the reaper ran ahead of a stop. Read into a
+  # variable rather than negating a helper, so a /workers read that fails is a
+  # loud failure instead of a silent pass. The reachable axis is the one to
+  # ask: a busy box is overloaded on the load axis and still reachable, so
+  # this tolerates load without tolerating an ejection.
+  h=$(worker_reachable "$w")
+  [[ "$h" == ok ]] ||
+    fail "worker $w is '$h' after the stop of an instance the reaper had already cleared: a container that is not there is not a transport failure (cork/docker.go, isTransportError in cork/workers.go)"
   rows_after=$(worker_instances "$w")
   [[ "$rows_after" == "$(( rows_with - 1 ))" ]] ||
     fail "worker $w records $rows_after instance(s) after the reaped instance was stopped, expected $(( rows_with - 1 )): the row survived its own stop, and its port reservation with it (the port rows cascade with the instance, removeInstanceMetadata at cork/api.go:440)"
@@ -3118,7 +3160,7 @@ out=$(try_launch "$OD_BUILD" "e2e-user-27" "e2e-value-27")
 code=${out%%$'\n'*}
 body=${out#*$'\n'}
 # (a) 500, not 503. A leftover network is not something a retry fixes, and the
-# retryable classes are a closed set (ErrWorkerBusy, ErrWorkerDown,
+# retryable classes are a closed set (ErrWorkerBusy, ErrWorkerUnreachable,
 # ErrPullTimeout, ErrAllWorkersOverloaded, ErrDatabaseBusy at
 # cmd/corkd/main.go): dressing this up as one would have the platform's celery
 # worker re-place the same launch onto the same undeletable network forever.
@@ -3152,8 +3194,8 @@ done
 # overloaded can be a telemetry blip on a busy box, which is why the ok check
 # below is a separate, retried one.
 for ip in "${WORKER_IPS[@]}"; do
-  if health_is "$ip" down; then
-    fail "worker $ip was marked down by a launch that failed on a name conflict: a docker API error arrived over a working connection and says nothing about the daemon's health (isTransportError, cork/workers.go)"
+  if ! reachable_is "$ip" ok; then
+    fail "worker $ip is '$(worker_reachable "$ip")' after a launch that failed on a name conflict: a docker API error arrived over a working connection and says nothing about the daemon's health (isTransportError, cork/workers.go)"
   fi
 done
 retry 20 "both workers to report ok after the refused launch" all_workers_ok
@@ -3579,14 +3621,14 @@ if (( FULL )); then
   # The negative control, and the assertion that costs a production box when it
   # regresses: a registry that cannot serve a manifest is a docker API error
   # that arrived over a working connection, not a transport failure
-  # (isTransportError, cork/workers.go:514-539), so the worker must still be
+  # (isTransportError), so the worker must still be
   # taking placements. down is sticky and only a worker-add clears it, so this
   # single read is the whole assertion -- one broken tag would otherwise walk
   # the fleet down. overloaded is not a failure here (it clears itself), which
   # is why this asks about down and then waits for ok.
-  ! health_is "$COLD_WORKER" down ||
-    fail "worker $COLD_WORKER was marked down by a pull the registry refused: the failure was charged to the daemon (the noteWorkerTransportError call in ensureImages, cork/launch.go:142-150), and every worker that tried this tag would leave the fleet until an operator re-added it"
-  retry 20 "worker $COLD_WORKER to report ok after the refused pull" health_is "$COLD_WORKER" ok
+  reachable_is "$COLD_WORKER" ok ||
+    fail "worker $COLD_WORKER is '$(worker_reachable "$COLD_WORKER")' after a pull the registry refused: the failure was charged to the daemon (the noteWorkerTransportError call in ensureImages, cork/launch.go), and every worker that tried this tag would leave the fleet"
+  retry 20 "worker $COLD_WORKER to report ok after the refused pull" reachable_is "$COLD_WORKER" ok
   if has_line "$MK_REF" worker_tags "$COLD_WORKER"; then
     fail "worker $COLD_WORKER holds $MK_REF although the tag is not in the registry: the launch did not fail for the reason this step arranged"
   fi
@@ -4030,10 +4072,10 @@ step "a leftover the daemon refuses to remove: the pass is incomplete, not unrea
 #                  its NetworkRemove comes back 403 for as long as it runs.
 #   cmgr-998       a plain DB-only-stop leftover, exactly what plant_orphan
 #                  makes; the pass must still clear it.
-# A 403 is not isTransportError (workers.go:521-539), so reconcileFailed
+# A 403 is not isTransportError, so reconcileFailed
 # calls the pass incomplete rather than unreachable (worker_reconcile.go:179-186)
 # and reconcileWithRetries then lets the box into placement with an error
-# logged instead of marking it down (workers.go:341-348). No other step in
+# logged instead of ejecting it (reconcileWithRetries). No other step in
 # this scenario ever produces an incomplete pass, so this is the only cover
 # that classification has.
 BLOCKER_WORKER=$WB # armed before the create: a 409 below means a killed run left one, and the trap should still take it
@@ -4068,15 +4110,15 @@ fi
 planted=$(plant_orphan "$WB" 998)
 note "planted $BLOCKER_NET, held open by the label-invisible container $BLOCKER_NAME, and a removable orphan (cmgr-998) on $WB"
 
-# worker-add rebuilds the conn, which starts overloaded (workers.go:298) and
-# only turns ok once runWorker's reconcile has given up and started the
+# worker-add rebuilds the conn, which starts unresponsive (newWorkerConn)
+# and only turns ok once runWorker's reconcile has given up and started the
 # poller: the wall clock from here to ok is how long the pass was retried.
 # Spelled out rather than calling readd so the timeout message can name the
 # behaviour under test.
 t=$(date +%s)
 cork worker-add "$WB" "${PUBLIC[$WB]}"
-retry 40 "worker $WB to rejoin placement with $BLOCKER_NET still on it (a refused removal must leave the pass incomplete, not unreachable: reconcileWithRetries marks the worker down only for the unreachable verdict, workers.go:341-348)" \
-  health_is "$WB" ok
+retry 40 "worker $WB to rejoin placement with $BLOCKER_NET still on it (a refused removal must leave the pass incomplete, not unreachable: reconcileWithRetries ejects the worker only for the unreachable verdict, and admits it for the incomplete one)" \
+  reachable_is "$WB" ok
 took=$(( $(date +%s) - t ))
 
 # The sharp assertion is the lower bound, not an upper one. reconcileWithRetries
@@ -4087,7 +4129,7 @@ took=$(( $(date +%s) - t ))
 # incomplete. Half the budget, so only the budget itself shrinking can fire
 # this, never a slow box.
 (( took >= 5 )) ||
-  fail "worker $WB was ok ${took}s after worker-add although $BLOCKER_NET could not be removed: the pass was accepted as done instead of being retried for its 10s budget (worker_reconcile.go:137-173, workers.go:328-355)"
+  fail "worker $WB was ok ${took}s after worker-add although $BLOCKER_NET could not be removed: the pass was accepted as done instead of being retried for its 10s budget (removeOrphans, reconcileWithRetries)"
 
 # The negative control. Without it every assertion below would pass just as
 # well if dockerd had quietly removed the network: nothing would have been
@@ -4105,8 +4147,8 @@ orphan_gone "$WB" 998 "{\"containers\":[\"$planted\"]}" ||
 
 # Really in placement, not merely reported ok, and while the leftover is still
 # sitting on the box -- that is the whole point of the incomplete verdict.
-# Round robin over two ok workers needs at most two launches (selectWorker,
-# workers.go:699), as ensure_instance_on relies on too.
+# Round robin over two ok workers needs at most two launches (selectWorker),
+# as ensure_instance_on relies on too.
 mine=()
 placed=""
 for i in 23 24; do
@@ -4156,7 +4198,7 @@ ok "the refused removal of $BLOCKER_NET left the pass incomplete: $WB retried fo
 
 # ------------------------------------------------ 11. telemetry silence
 
-step "telemetry silence: a worker whose agent goes quiet is marked down after 30s and stays down until re-added"
+step "telemetry silence: a worker whose agent goes quiet keeps its place in the fleet, because the agent is not what serves challenges"
 if (( OUTER )); then
   sidecar=$(compose_container "${PUBLIC[$WB]}-telemetry")
   [[ -n "$sidecar" ]] || fail "no container for compose service ${PUBLIC[$WB]}-telemetry"
@@ -4164,17 +4206,45 @@ if (( OUTER )); then
   id=$(instance_on "$WB")
   STOPPED_SIDECAR=$sidecar
   outer_ctl "$sidecar" stop
-  note "stopped ${PUBLIC[$WB]}-telemetry; corkd tolerates 10s of silence here (CORK_WORKER_MAX_MISSES=20 at 500ms)"
-  retry 20 "worker $WB to be marked down" health_is "$WB" down
+  note "stopped ${PUBLIC[$WB]}-telemetry; corkd tolerates 5s of silence on the load axis here (CORK_WORKER_LOAD_MISSES=10 at 500ms)"
+  # The load axis goes unknown, and that is the whole effect. This is the
+  # failure the two axes exist for: telemetry is a stateless sidecar reading
+  # /proc, dockerd is what actually serves challenges, and fusing them meant a
+  # sidecar restart during a deploy cost a healthy box its place in the fleet
+  # until an operator ran worker-add.
+  retry 20 "worker $WB to report an unknown load" load_is "$WB" unknown
+  reachable_is "$WB" ok ||
+    fail "worker $WB is '$(worker_reachable "$WB")' after its telemetry agent stopped: a silent agent says nothing about whether its dockerd can serve a launch, and must not take the box out of the fleet"
   assert_on_worker "$WB" "${INST_META[$id]}"
-  ok "worker $WB went down on telemetry silence; instance $id keeps running on it"
+
+  # And it still takes work. An unknown load places deliberately -- a box whose
+  # agent died is almost always still serving, and on a two-worker fleet
+  # holding it out costs more than placing on it blind.
+  #
+  # A NEW instance, launched the long way round on purpose. ensure_instance_on
+  # returns without launching anything when the worker already holds a tracked
+  # instance, and this step placed one eighteen lines up -- so calling it here
+  # would launch nothing, `blind` would be the instance already running, and
+  # the only coverage this behaviour has anywhere would assert nothing at all.
+  # Placement is round robin over two workers, so a handful of launches always
+  # reaches $WB.
+  blind=""
+  for i in 60 61 62 63; do
+    inst=$(launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i")
+    track "$inst" "$i"
+    if [[ "$(jq -r .worker <<<"$inst")" == "$WB" ]]; then blind=$(jq -r .id <<<"$inst"); break; fi
+  done
+  [[ -n "$blind" ]] ||
+    fail "worker $WB took no new placement in four launches while its load was unknown: unknown must place, or a dead sidecar halves the fleet"
+  [[ "$blind" != "$id" ]] ||
+    fail "the placement assertion matched the instance this step already had, so it proved nothing"
+  ok "worker $WB kept serving instance $id and took a NEW instance $blind while its agent was down; load unknown, reachable ok"
+
   outer_ctl "$sidecar" start
   STOPPED_SIDECAR=""
   retry 30 "telemetry on $WB" quiet curl -sSf --max-time 3 "http://$WB:2136/health"
-  sleep 3
-  health_is "$WB" down || fail "worker $WB recovered on its own; down must be sticky"
-  readd "$WB"
-  ok "down stayed sticky with telemetry back; worker-add rebuilt the connection and $WB is ok"
+  retry 20 "worker $WB to report a known load again" load_is "$WB" ok
+  ok "the load axis recovered on its own once the agent was back; nothing called worker-add"
 else
   skip "needs the outer docker socket"
 fi
@@ -4187,18 +4257,24 @@ fi
 
 if (( FULL )); then
   if (( OUTER )); then
-    step "wedged telemetry: an agent that accepts every poll and answers none is bounded by the poll timeout, so its worker still goes down"
+    step "wedged telemetry: an agent that accepts every poll and answers none is bounded by the poll timeout, so the docker probe behind it still runs"
     # The silence step above STOPS the sidecar, so every poll is refused in
     # microseconds and misses accumulate whatever the per-poll timeout is:
     # nothing else in this scenario makes a poll hang, and pollWorker's
     # `&http.Client{Timeout: timing.pollTimeout}` (cork/workers.go) does no
     # work today. An agent that completes the handshake and then never writes
     # is the failure that timeout exists for -- a wedged agent, or a box
-    # thrashing so hard it never gets to answer. Without the timeout the
-    # worker's single poll goroutine blocks in that one Get forever, `misses`
-    # never increments, and the box sits at ok taking placements its dockerd
-    # may no longer be able to serve. The minPollInterval floor and the
-    # half-interval clamp (cork/workers.go) exist so this timeout can never be
+    # thrashing so hard it never gets to answer.
+    #
+    # What the timeout protects is no longer the load verdict but the probe
+    # tick itself. One goroutine per worker runs the telemetry poll and then
+    # the docker probes, in that order (pollWorker, cork/workers.go). An
+    # unbounded poll blocks that goroutine in a single Get forever, so the
+    # ping and the container list behind it never run again -- and reachability
+    # is what decides placement. A wedged sidecar would then freeze cork's view
+    # of the daemon at whatever it last was, and a box whose dockerd died
+    # afterwards would go on taking launches indefinitely. The minPollInterval
+    # floor and the half-interval clamp exist so this timeout can never be
     # configured to zero, i.e. to unbounded.
     ensure_instance_on "$WB" 28
     id=$(instance_on "$WB")
@@ -4221,38 +4297,71 @@ if (( FULL )); then
     # against $WB's dockerd, which is healthy, so it costs one fast pass.
     cork worker-add "$WB" "${PUBLIC[$WB]}"
     t=$(date +%s)
-    wedged_by=""
     seen=""
-    # One reader per sample rather than a bare retry, because "never ok" is
-    # half the assertion: a fresh conn starts overloaded and only a poll that
-    # COMPLETED can move it to ok, so an ok here means the agent answered
-    # something and the step is not exercising a hung poll at all. 25s is well
-    # past the 10s budget (CORK_WORKER_MAX_MISSES=20 at the 500ms default) and
-    # well short of the 20s a doubled budget would take.
-    wedged_deadline=$(( t + 25 ))
+    # A fresh conn starts with its load already unknown, so waiting for unknown
+    # would measure nothing -- it is true on the first sample. What a hung poll
+    # cannot do is produce a KNOWN load, because only a poll that COMPLETED
+    # moves the axis off unknown. So the assertion is one-sided: sample for 15s
+    # (well past the 5s load budget, CORK_WORKER_LOAD_MISSES=10 at the 500ms
+    # interval) and fail the moment a reading appears that a wedged agent could
+    # not have produced.
+    wedged_deadline=$(( t + 15 ))
     while (( $(date +%s) < wedged_deadline )); do
-      seen=$(worker_health "$WB")
-      [[ "$seen" != ok ]] ||
-        fail "worker $WB read ok while its agent accepts every poll and answers none: a poll completed, so either the responder is not wedged or a verdict was stored for a request that never returned (pollTelemetry, cork/workers.go)"
-      if [[ "$seen" == down ]]; then wedged_by=$(( $(date +%s) - t )); break; fi
+      seen=$(worker_load "$WB")
+      [[ "$seen" == unknown ]] ||
+        fail "worker $WB read load '$seen' while its agent accepts every poll and answers none: a poll completed, so either the responder is not wedged or a verdict was stored for a request that never returned (pollTelemetry, cork/workers.go)"
       sleep 1
     done
-    [[ -n "$wedged_by" ]] ||
-      fail "worker $WB was still '$seen' 25s after the worker-add that restarted its poller: with the per-poll timeout gone the first poll blocks forever, misses never increment, and a box whose agent has wedged keeps taking placements (httpClient Timeout: timing.pollTimeout, cork/workers.go)"
+    wedged_for=$(( $(date +%s) - t ))
     # The same control again now that the verdict is in: the agent was still
-    # accepting and hanging at the end, so the misses that downed $WB were
-    # polls the client timeout ended, not connections the agent refused.
+    # accepting and hanging at the end, so the misses were polls the client
+    # timeout ended, not connections the agent refused.
     telemetry_hangs "$WB" ||
-      fail "the wedged agent on $WB stopped accepting connections before the worker went down: the misses that downed it may have been ordinary refusals, which the telemetry-silence step already covers"
-    # Its instances keep running, exactly as under silence: down is a placement
-    # and control-plane verdict, not a teardown.
+      fail "the wedged agent on $WB stopped accepting connections before its load went unknown: the misses may have been ordinary refusals, which the telemetry-silence step already covers"
+    # And here is what the timeout is really protecting. The docker probes run
+    # on the same goroutine, after the telemetry poll; if that poll were
+    # unbounded they would never run again and the worker would be frozen at
+    # whatever it last read. It is still ok, which means the tick is still
+    # turning with the agent wedged.
+    reachable_is "$WB" ok ||
+      fail "worker $WB is '$(worker_reachable "$WB")' with only its telemetry agent wedged: the docker probes share that goroutine, so either the hung poll is not bounded or the daemon really did fail"
     assert_on_worker "$WB" "${INST_META[$id]}"
-    note "worker $WB was down ${wedged_by}s after its poller was restarted: 20 misses at the 500ms cadence, each poll ended by the 250ms poll timeout"
+    note "worker $WB held an unknown load for the whole ${wedged_for}s its agent was wedged, its dockerd reachable throughout"
+    # And now the assertion that actually discriminates. Everything above is
+    # equally true of a poller parked forever in the hung Get: a frozen tick
+    # leaves the load at the unknown a fresh conn starts with and reachability
+    # at whatever it last read, which is precisely what has been asserted so
+    # far. Restoring the sidecar does not separate them either -- stopping the
+    # wedged responder resets the connection the poll is parked in, which
+    # wakes an unbounded Get just as well as a bounded one ever returned.
+    #
+    # So break the thing the tick is supposed to be watching, while the agent
+    # is still wedged, and see whether cork notices. The docker probes run
+    # behind the telemetry poll on one goroutine: if that poll were unbounded
+    # they would never run again and this worker would sit at ok with its
+    # daemon frozen solid.
+    wbc=$(compose_container "${PUBLIC[$WB]}")
+    [[ -n "$wbc" ]] || fail "compose container for ${PUBLIC[$WB]} not found"
+    PAUSED_WORKER=$wbc
+    outer_ctl "$wbc" pause
+    retry 40 "worker $WB to be ejected with its telemetry agent still wedged, which only a turning probe tick can do" \
+      reachable_is "$WB" unresponsive
+    telemetry_hangs "$WB" ||
+      fail "the wedged agent on $WB stopped hanging before its dockerd was noticed: the ejection may have come from a poll that completed"
+    outer_ctl "$wbc" unpause
+    PAUSED_WORKER=""
+    recovers_by_itself "$WB"
+    note "with the agent still wedged, freezing $WB's dockerd was noticed in time and the box came back on its own: the probe tick kept turning behind the hung poll"
     unfake_overload "$fake"
     retry 30 "telemetry on $WB" quiet curl -sSf --max-time 3 "http://$WB:2136/health"
-    readd "$WB"
+    # This is the assertion that actually proves the poll was bounded. An
+    # unbounded poll leaves the worker's one goroutine parked in the Get it
+    # issued against the wedged responder; restoring the real sidecar does not
+    # wake it, so the load could never come back. That it does means the tick
+    # kept turning through all of the above.
+    retry 20 "worker $WB to report a known load again, which only a turning probe tick can produce" load_is "$WB" ok
     DOWNED_WORKER=""
-    ok "an agent that accepted every poll and answered none still cost $WB its place in the fleet after ${wedged_by}s, never once reading ok; instance $id kept running on it, and worker-add brought it back once the real sidecar was restored"
+    ok "an agent that accepted every poll and answered none cost $WB only its load reading, never once producing a known one across ${wedged_for}s; its dockerd went on being probed behind the hung poll -- proved by freezing it and being ejected for it -- instance $id kept running, and the load came back on its own once the real sidecar was restored"
   else
     skip "wedged telemetry needs the outer docker socket"
   fi
@@ -4267,7 +4376,7 @@ if (( OUTER )); then
   ensure_instance_on "$WB" 17
   fake_overload "$WB"
   fake=$LAST_FAKE
-  retry 30 "worker $WB to report overloaded" health_is "$WB" overloaded
+  retry 30 "worker $WB to report overloaded" load_is "$WB" overloaded
   for i in 13 14; do
     inst=$(launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i")
     track "$inst" "$i"
@@ -4279,21 +4388,27 @@ if (( OUTER )); then
   forget "$id"
   note "launches avoided $WB; stopping instance $id on it still tore it down over docker"
   unfake_overload "$fake"
-  retry 30 "worker $WB to recover to ok on its own" health_is "$WB" ok
-  ok "overloaded is not sticky: $WB is ok again without a worker-add"
+  # The load axis, not the derived health string. `health` reads ok whenever
+  # the worker is reachable and not overloaded -- which includes the unknown a
+  # dead agent produces -- so asserting on it here would pass just as happily
+  # if the real sidecar never came back, which is the opposite of recovery.
+  retry 30 "worker $WB to report a known, unoverloaded load on its own" load_is "$WB" ok
+  reachable_is "$WB" ok ||
+    fail "worker $WB is '$(worker_reachable "$WB")' after its fake overload was removed: an overloaded box must never have left the fleet"
+  ok "overloaded is not sticky: $WB reports a known, unoverloaded load again without a worker-add"
 else
   skip "needs the outer docker socket"
 fi
 
 # ------------------------------------- 13. every worker unavailable
 
-step "every worker unavailable: all overloaded is a 503 with Retry-After, all down is a 500"
+step "every worker unavailable: all overloaded is a 503 with Retry-After, all taken down is a 500"
 if (( OUTER )); then
   fake_overload "$WA"
   fake_a=$LAST_FAKE
   fake_overload "$WB"
   fake_b=$LAST_FAKE
-  both_overloaded() { health_is "$WA" overloaded && health_is "$WB" overloaded; }
+  both_overloaded() { load_is "$WA" overloaded && load_is "$WB" overloaded; }
   retry 30 "both workers to report overloaded" both_overloaded
   [[ "$(api_status POST "/builds/$OD_BUILD")" == 503 ]] || fail "launch with every worker overloaded was not a 503"
   headers=$(api_headers POST "/builds/$OD_BUILD")
@@ -4305,16 +4420,48 @@ if (( OUTER )); then
 else
   skip "all-overloaded needs the outer docker socket"
 fi
+# An unresponsive fleet first, which is the case this branch created and the
+# one the platform actually meets: both boxes rebooting, or a switch blipping.
+# It is retryable, and the distinction from the down case below is the whole
+# reason both sentinels exist.
+if (( OUTER )); then
+  wa_c=$(compose_container "${PUBLIC[$WA]}")
+  wb_c=$(compose_container "${PUBLIC[$WB]}")
+  [[ -n "$wa_c" && -n "$wb_c" ]] || fail "compose containers for the workers not found"
+  PAUSED_WORKER=$wa_c
+  PAUSED_WORKER2=$wb_c
+  outer_ctl "$wa_c" pause
+  outer_ctl "$wb_c" pause
+  both_unresponsive() { reachable_is "$WA" unresponsive && reachable_is "$WB" unresponsive; }
+  retry 40 "both workers to be ejected as unresponsive" both_unresponsive
+  [[ "$(api_status POST "/builds/$OD_BUILD")" == 503 ]] ||
+    fail "launch with every worker unresponsive was not a 503: a fleet that is merely rebooting must be retryable, or the platform reports the launch failed seconds before the boxes come back"
+  headers=$(api_headers POST "/builds/$OD_BUILD")
+  grep -qi '^Retry-After: 1' <<<"$headers" || fail "the all-unresponsive 503 carried no Retry-After: 1"
+  outer_ctl "$wa_c" unpause
+  outer_ctl "$wb_c" unpause
+  PAUSED_WORKER=""
+  PAUSED_WORKER2=""
+  recovers_by_itself "$WA"
+  recovers_by_itself "$WB"
+  retry 30 "both workers to report ok again" all_workers_ok
+  ok "all unresponsive: 503 + Retry-After, and both workers rejoined on their own with nothing calling worker-add"
+else
+  skip "all-unresponsive needs the outer docker socket"
+fi
 down_worker "$WA"
 down_worker "$WB"
-[[ "$(api_status POST "/builds/$OD_BUILD")" == 500 ]] || fail "launch with every worker down was not a 500"
+# 500 and not 503, and that distinction is the reason down is worth asserting
+# by hand: a fleet an operator took down is not going to resolve itself, where
+# an unresponsive one probes its way back and is told to retry.
+[[ "$(api_status POST "/builds/$OD_BUILD")" == 500 ]] || fail "launch with every worker taken down was not a 500"
 readd "$WA"
 readd "$WB"
-ok "all down: 500; worker-add restored both"
+ok "all taken down: 500 (not the retryable 503 an unresponsive fleet gets); worker-add restored both"
 
 # ------------------------------------------ 14. hung docker daemon
 
-step "hung dockerd: a stop that hangs marks the worker down and still clears the records; a launch placed there fails fast as retryable"
+step "hung dockerd: a stop that hangs ejects the worker and still clears the records; a launch placed there fails fast as retryable; the box rejoins by itself once unpaused"
 if (( OUTER )); then
   ensure_instance_on "$WB" 18
   id=$(instance_on "$WB")
@@ -4324,7 +4471,7 @@ if (( OUTER )); then
   outer_ctl "$wb" pause
   note "paused ${PUBLIC[$WB]}'s dockerd (telemetry keeps answering); stopping instance $id, expect one 10s control timeout"
   t=$(date +%s)
-  cork stop "$id" >/dev/null 2>&1 || fail "the stop of instance $id did not succeed once its hung worker was declared down"
+  cork stop "$id" >/dev/null 2>&1 || fail "the stop of instance $id did not succeed once its hung worker was ejected"
   took=$(( $(date +%s) - t ))
   note "stop returned success after ${took}s"
   # One timeout, not two: teardown returns a transport failure from
@@ -4332,15 +4479,21 @@ if (( OUTER )); then
   # CORK_WORKER_CONTROL_TIMEOUT on a network removal against the same
   # unreachable daemon. 25s passed either way; a single-timeout stop is ~10s.
   (( took < 15 )) || fail "the stop spent more than one control timeout (${took}s): teardown attempted the network removal against the unreachable daemon"
-  health_is "$WB" down || fail "worker $WB was not marked down after the hung call"
+  reachable_is "$WB" unresponsive ||
+    fail "worker $WB is '$(worker_reachable "$WB")' after the hung call, want unresponsive"
+  # Unresponsive and not down: the operator asserted nothing here, cork
+  # observed it, so nobody owes this box a worker-add.
   [[ "$(api_status GET "/instances/$id")" == 404 ]] || fail "instance $id still known after the stop"
   outer_ctl "$wb" unpause
   PAUSED_WORKER=""
   retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
-  readd "$WB"
-  retry 30 "worker-add to remove the leftovers of instance $id from $WB" orphan_gone "$WB" "$id" "${INST_META[$id]}"
+  # Nothing is called. The worker's own probe finds the daemon answering,
+  # rebuilds the conn and reconciles it before letting it back in, which is
+  # what clears the leftovers the records-only stop left behind.
+  recovers_by_itself "$WB"
+  retry 30 "the recovery to remove the leftovers of instance $id from $WB" orphan_gone "$WB" "$id" "${INST_META[$id]}"
   forget "$id"
-  ok "hung stop -> $WB down (sticky) and the records cleared in the same call; worker-add after unpause recovered it and removed the leftovers"
+  ok "hung stop -> $WB unresponsive and the records cleared in the same call; once unpaused it rejoined the fleet on its own and its reconcile removed the leftovers, with no worker-add"
 
   # The launch side: pause it again while it is ok, so round robin places a
   # launch there. That launch must fail within one control timeout, as a
@@ -4366,7 +4519,8 @@ if (( OUTER )); then
       503)
         refused=$((refused + 1))
         (( took < 25 )) || fail "the launch on the hung worker took ${took}s to fail; expected one control timeout"
-        health_is "$WB" down || fail "worker $WB is not down after the failed launch"
+        reachable_is "$WB" unresponsive ||
+          fail "worker $WB is '$(worker_reachable "$WB")' after the failed launch, want unresponsive"
         note "launch $i placed on $WB failed fast: 503 after ${took}s ($(head -c 120 <<<"$body"))"
         ;;
       *) fail "launch $i returned HTTP $code: $(head -c 200 <<<"$body")" ;;
@@ -4379,8 +4533,8 @@ if (( OUTER )); then
   outer_ctl "$wb" unpause
   PAUSED_WORKER=""
   retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
-  readd "$WB"
-  ok "a launch placed on the hung worker failed fast as retryable and took the worker down; the other landed on $WA; worker-add recovered $WB"
+  recovers_by_itself "$WB"
+  ok "a launch placed on the hung worker failed fast as retryable and ejected the worker; the other landed on $WA; $WB rejoined by itself once unpaused"
 else
   skip "needs the outer docker socket"
 fi
@@ -4546,10 +4700,12 @@ if (( FULL )); then
   # $PERSISTENT_SRC alone), so a relaunch off a stale image fails here.
   retry 30 "the relaunched persistent instance at $npub:$nport" tcp_says "$npub" "$nport" '' 'e2e-generation-2'
   # A launch the converge issues is a launch like any other as far as the box
-  # is concerned: nothing about it may take the worker out of the fleet, and
-  # down is sticky, so this single read is the whole assertion.
-  if health_is "$WA" down; then
-    fail "worker $WA is down after the converge relaunched the persistent instance on it: a relaunch that succeeded and serves must leave its worker in placement"
+  # is concerned: nothing about it may take the worker out of the fleet. Read
+  # at once rather than retried -- an ejection here would probe its way back
+  # within seconds on this fleet's backoff, and a retry would pass straight
+  # over the regression.
+  if ! reachable_is "$WA" ok; then
+    fail "worker $WA is '$(worker_reachable "$WA")' after the converge relaunched the persistent instance on it: a relaunch that succeeded and serves must leave its worker in placement"
   fi
   (( $(worker_instances "$WA") == wa_rows )) ||
     fail "worker $WA records $(worker_instances "$WA") instance(s) after the stop and relaunch, expected the $wa_rows it started with: the stopped instance's record outlived it, or the relaunch left a second one"
@@ -4627,9 +4783,9 @@ note "phantom worker $phantom_ip: telemetry answers healthy, nothing listens on 
 # so sampling at the step's own pace cannot miss it.
 PHANTOM_SEEN=""
 phantom_sample() {
-  PHANTOM_SEEN=$(worker_health "$PHANTOM_IP" || true)
+  PHANTOM_SEEN=$(worker_reachable "$PHANTOM_IP" || true)
   [[ "$PHANTOM_SEEN" != ok ]] ||
-    fail "phantom worker $PHANTOM_IP reports ok although its dockerd refuses every connection: the refusal was not treated as a transport error (client.IsErrConnectionFailed in isTransportError, cork/workers.go), so its reconcile did not report it unreachable and it was handed to the poller"
+    fail "phantom worker $PHANTOM_IP reports reachable ok although its dockerd refuses every connection: the refusal was not treated as a transport error (client.IsErrConnectionFailed in isTransportError, cork/workers.go), so its reconcile did not report it unreachable and it was admitted. Reachability comes from dockerd alone -- healthy telemetry must never be able to admit a box whose daemon is not listening"
 }
 
 t=$(date +%s)
@@ -4639,10 +4795,10 @@ phantom_sample
 note "the phantom reads '$PHANTOM_SEEN' the moment it is added"
 
 # Free coverage inside the 10s the reconcile budget costs anyway: a worker
-# whose first pass has not finished sits at overloaded, because newWorkerConn
-# fails closed for placement until the first successful poll, so a launch now
-# must land on a real worker. Step 12's overloaded worker got there through
-# telemetry; this window is the only place that initial state is exercised.
+# whose first pass has not finished sits at unresponsive, because newWorkerConn
+# fails closed for placement until its daemon has proved itself, so a launch
+# now must land on a real worker. This window is the only place that initial
+# state is exercised.
 out=$(try_launch "$OD_BUILD" e2e-user-23 e2e-value-23)
 code=${out%%$'\n'*}
 body=${out#*$'\n'}
@@ -4662,21 +4818,38 @@ forget "$id"
 phantom_sample
 
 # The reconcile retries the refusal for maxMisses * pollInterval (10s here:
-# CORK_WORKER_MAX_MISSES=20 at the 500ms default poll interval) and then marks
-# the worker down. 18s is well past that and well short of the 20s a doubled
-# budget would take, so this bounds the budget without racing it -- and
-# without depending on how long the launch above took, since the deadline runs
-# from the worker-add.
-phantom_down_by=""
+# CORK_WORKER_MAX_MISSES=20 at the pinned 500ms interval) and then ejects the
+# worker. 18s is well past that and well short of the 20s a doubled budget
+# would take, so this bounds the budget without racing it -- and without
+# depending on how long the launch above took, since the deadline runs from the
+# worker-add.
+#
+# Ejected and not down, and the difference is the whole point: this box is
+# unreachable because cork cannot reach it, not because anyone said so, and it
+# will keep being probed for as long as it is registered. Its reachable state
+# is "unresponsive" both before and after the budget is spent, so the reason is
+# what separates "still retrying" from "gave up" -- there is no state change to
+# wait on, which is exactly right for a box that was never admitted.
+phantom_ejected_by=""
 phantom_deadline=$(( t + 18 ))
 while (( $(date +%s) < phantom_deadline )); do
   phantom_sample
-  if [[ "$PHANTOM_SEEN" == down ]]; then phantom_down_by=$(( $(date +%s) - t )); break; fi
+  if [[ "$(worker_reason "$PHANTOM_IP")" == *"reconciled"* ]]; then
+    phantom_ejected_by=$(( $(date +%s) - t ))
+    break
+  fi
   sleep 1
 done
-[[ -n "$phantom_down_by" ]] ||
-  fail "phantom worker $phantom_ip was still '$PHANTOM_SEEN' 18s after worker-add: a daemon that stays unreachable must end at down once its reconcile budget is spent (reconcileUnreachable in reconcileWithRetries, cork/workers.go), not sit out of placement forever"
-note "the phantom was down within ${phantom_down_by}s of worker-add, never once reading ok"
+[[ -n "$phantom_ejected_by" ]] ||
+  fail "phantom worker $phantom_ip was still '$PHANTOM_SEEN' with reason '$(worker_reason "$PHANTOM_IP")' 18s after worker-add: a daemon that stays unreachable must be ejected once its reconcile budget is spent (reconcileUnreachable in reconcileWithRetries, cork/workers.go), not retried forever"
+# And it stays out: nothing about a refused connection is going to change on
+# its own, so the probe must keep finding it unresponsive rather than letting
+# a healthy telemetry reading admit it.
+sleep 3
+phantom_sample
+[[ "$PHANTOM_SEEN" == unresponsive ]] ||
+  fail "phantom worker $phantom_ip read '$PHANTOM_SEEN' three seconds after it was ejected, with its dockerd still refusing every connection"
+note "the phantom was ejected within ${phantom_ejected_by}s of worker-add, never once reading ok, and stayed unresponsive with its telemetry answering healthy"
 
 cork worker-remove "$phantom_ip"
 kill "$PHANTOM_RESPONDER" >/dev/null 2>&1 || true
@@ -4692,7 +4865,7 @@ wlist=$(api GET /workers)
 [[ "$(jq -r length <<<"$wlist")" == "$NWORKERS" ]] ||
   fail "corkd holds $(jq -r length <<<"$wlist") worker(s) after the phantom was removed, expected $NWORKERS"
 all_workers_ok || fail "worker $WA or $WB is not ok after the phantom was registered and removed"
-ok "worker $phantom_ip, telemetry healthy and dockerd refusing connections, never read ok, took no placement while it reconciled, went down within ${phantom_down_by}s, and left $WA/$WB serving launches"
+ok "worker $phantom_ip, telemetry healthy and dockerd refusing connections, never read ok, took no placement while it reconciled, was ejected within ${phantom_ejected_by}s and stayed unresponsive, and left $WA/$WB serving launches"
 
 ########################################################################
 # BLOCK 2 of 4 — after the "refused dockerd" step (see insertAfter)
@@ -4702,7 +4875,7 @@ ok "worker $phantom_ip, telemetry healthy and dockerd refusing connections, neve
 
 if (( FULL )); then
   if (( OUTER )); then
-    step "worker-add on a box whose dockerd is wedged: the worker stays out of placement while its reconcile retries, and is marked down when the budget is spent"
+    step "worker-add on a box whose dockerd is wedged: the worker stays out of placement while its reconcile retries, is ejected when the budget is spent, and rejoins by itself when the daemon comes back"
     # The refused-dockerd step above covers one branch of isTransportError
     # (client.IsErrConnectionFailed): nothing listening, every reconcile
     # attempt failing in milliseconds, the 10s budget spent over ~20 of them.
@@ -4714,10 +4887,10 @@ if (( FULL )); then
     # budget (CORK_WORKER_MAX_MISSES 20 x the 500ms poll interval), so one or
     # two attempts spend it and the down verdict must still arrive. A
     # reconcileWithRetries that counted attempts instead of holding a deadline
-    # (cork/workers.go:328-356) would hold a wedged box out of the fleet for
-    # 20 x 10s and mark it down only then. It is also the only worker-add in
+    # (reconcileWithRetries) would hold a wedged box out of the fleet for
+    # 20 x 10s and eject it only then. It is also the only worker-add in
     # this scenario that lands on a worker cork already has, taking
-    # AddWorker's replace branch (workers.go:589-595) rather than adding a row.
+    # AddWorker's replace branch rather than adding a row.
     wb=$(compose_container "${PUBLIC[$WB]}")
     [[ -n "$wb" ]] || fail "compose container for ${PUBLIC[$WB]} not found"
     # Planted while the daemon still answers: this is what the worker-add at
@@ -4733,11 +4906,11 @@ if (( FULL )); then
     cork worker-add "$WB" "${PUBLIC[$WB]}"
     add_took=$(( $(date +%s) - t ))
     # (a) The operator's call does not wait for the box. AddWorker builds the
-    # client and hands the worker to runWorker's goroutine (workers.go:299,
-    # 585-595) without a single docker call of its own, so a worker-add on a
+    # client and hands the worker to runWorker's goroutine (newWorkerConn,
+    # pollWorker) without a single docker call of its own, so a worker-add on a
     # daemon that is merely still starting costs the operator nothing.
     (( add_took < 5 )) ||
-      fail "cork worker-add on the wedged $WB blocked for ${add_took}s: the reconcile must run in runWorker's goroutine, not in the operator's request (cork/workers.go:299)"
+      fail "cork worker-add on the wedged $WB blocked for ${add_took}s: the reconcile must run in runWorker's goroutine, not in the operator's request (newWorkerConn)"
     # The negative control for everything below, and the reason a paused
     # daemon is the sharp injection: the telemetry sidecar is a separate
     # container sharing the worker's network namespace (compose.yaml
@@ -4759,21 +4932,19 @@ if (( FULL )); then
       *) fail "a launch $(( $(date +%s) - t ))s into $WB's reconcile of its frozen daemon answered HTTP $code with $WA reading '$(worker_health "$WA")': $(head -c 200 <<<"$body")" ;;
     esac
     [[ "$(jq -r .worker <<<"$body")" == "$WA" ]] ||
-      fail "instance $(jq -r .id <<<"$body") was placed on $WB, whose reconcile has not finished against a frozen dockerd: selectWorker takes only workerOk (cork/workers.go:712-715), and newWorkerConn fails a fresh conn closed as overloaded until its pass is done"
+      fail "instance $(jq -r .id <<<"$body") was placed on $WB, whose reconcile has not finished against a frozen dockerd: selectWorker takes only a reachable worker, and newWorkerConn fails a fresh conn closed as unresponsive until its pass is done"
     track "$body" 26
     id=$(jq -r .id <<<"$body")
     cork stop "$id"
     assert_gone "$id" "$WA" "${INST_META[$id]}"
     forget "$id"
     # (c) And never ok while the budget runs. One-sided by construction --
-    # newWorkerConn stores overloaded (workers.go:297) and only
-    # reconcileWithRetries returning true starts the poller, so with the
-    # ordering intact every sample here is "overloaded" and this cannot flake
-    # false. It samples to 9s, inside the 10s budget, so a legitimate early
-    # down verdict cannot fire it either (down is not ok).
+    # newWorkerConn stores unresponsive and only a reconcile that finished
+    # admits the worker (runWorker), so with the ordering intact every sample
+    # here is "unresponsive" and this cannot flake false.
     seen=""
     while (( $(date +%s) - t < 9 )); do
-      seen=$(worker_health "$WB" || true)
+      seen=$(worker_reachable "$WB" || true)
       [[ -n "$seen" ]] || fail "worker $WB is not listed at all $(( $(date +%s) - t ))s after its worker-add"
       [[ "$seen" != ok ]] ||
         fail "worker $WB read ok $(( $(date +%s) - t ))s into a worker-add its dockerd cannot answer: the poller was started before the reconcile pass finished (runWorker), so a box that can serve no launch is back in placement"
@@ -4787,36 +4958,36 @@ if (( FULL )); then
     # outside the budget decides between one attempt (~10s) and two (~21s),
     # and neither is a regression. Both are far short of the 200s an
     # attempt-counting loop would take, which is what this bounds.
-    down_took=""
-    down_deadline=$(( t + 30 ))
-    while (( $(date +%s) < down_deadline )); do
-      seen=$(worker_health "$WB" || true)
+    ejected_took=""
+    ejected_deadline=$(( t + 30 ))
+    while (( $(date +%s) < ejected_deadline )); do
+      seen=$(worker_reachable "$WB" || true)
       [[ "$seen" != ok ]] ||
         fail "worker $WB read ok while its dockerd was still frozen: its reconcile cannot have finished (runWorker)"
-      if [[ "$seen" == down ]]; then down_took=$(( $(date +%s) - t )); break; fi
+      # unresponsive is where it starts AND where a spent budget leaves it, so
+      # the reason is what separates "still trying" from "gave up".
+      if [[ "$(worker_reason "$WB")" == *"reconciled"* ]]; then ejected_took=$(( $(date +%s) - t )); break; fi
       sleep 1
     done
-    [[ -n "$down_took" ]] ||
-      fail "worker $WB was still '$seen' 30s after a worker-add onto its frozen dockerd: a daemon that stays unreachable must end at down once the reconcile budget is spent (reconcileWithRetries, cork/workers.go:343-345), not sit out of placement forever"
-    # (e) And it is terminal: reconcileWithRetries returned false, so
-    # pollWorker never ran and nothing reads this box's telemetry any more. A
-    # daemon that comes back does not bring the worker back with it.
+    [[ -n "$ejected_took" ]] ||
+      fail "worker $WB was still '$seen' with reason '$(worker_reason "$WB")' 30s after a worker-add onto its frozen dockerd: a daemon that stays unreachable must be ejected once the reconcile budget is spent (reconcileWithRetries), not retried forever"
+    # (e) And the ejection is reversible, which is the whole point of the
+    # unresponsive state: reconcileWithRetries hands the worker to pollWorker
+    # rather than abandoning it, so the box that comes back brings the worker
+    # with it. Nothing below calls worker-add.
     outer_ctl "$wb" unpause
     PAUSED_WORKER=""
     retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
-    sleep 3 # six poll intervals, as in the telemetry-silence step
-    health_is "$WB" down ||
-      fail "worker $WB recovered to '$(worker_health "$WB")' by itself once its dockerd was unpaused: a worker its own reconcile gave up on must stay down until a worker-add rebuilds the conn"
-    readd "$WB"
+    recovers_by_itself "$WB"
     DOWNED_WORKER=""
-    # readd returns at ok, and reconcileWorker runs before the poller
-    # (runWorker), so the orphan must already be gone: asserted once, never
+    # The recovery reconciles before it admits the worker (runWorker), so the
+    # orphan must already be gone the moment it reads ok: asserted once, never
     # retried -- a retry here could only hide a poller started too early.
     orphan_gone "$WB" 996 "{\"containers\":[\"$planted\"]}" ||
-      fail "worker $WB reported ok after its worker-add with the orphan cmgr-996 still on it: the reconcile did not finish before the poller started"
+      fail "worker $WB reported ok after recovering with the orphan cmgr-996 still on it: the reconcile did not finish before the worker rejoined placement"
     ORPHAN_WORKER=""; ORPHAN_NET=""; ORPHAN_CID=""
-    all_workers_ok || fail "worker $WA or $WB is not ok after $WB was wedged and re-added"
-    ok "a worker-add onto a frozen dockerd answered in ${add_took}s, never read ok while its reconcile retried (telemetry answering throughout), took no placement, went down after ${down_took}s, stayed down when its daemon came back, and cleared cmgr-996 on the worker-add that recovered it"
+    all_workers_ok || fail "worker $WA or $WB is not ok after $WB was wedged and recovered"
+    ok "a worker-add onto a frozen dockerd answered in ${add_took}s, never read ok while its reconcile retried (telemetry answering throughout), took no placement, was ejected after ${ejected_took}s, and then rejoined the fleet on its own when its daemon came back -- clearing cmgr-996 on the way in, with no second worker-add"
   else
     skip "worker-add against a wedged dockerd needs the outer docker socket"
   fi
@@ -4832,16 +5003,16 @@ fi
 
 if (( FULL )); then
   if (( OUTER )); then
-    step "corkd restart with a wedged worker: startup is not blocked, the healthy worker takes every launch, and the wedged one is downed by its own reconcile"
+    step "corkd restart with a wedged worker: startup is not blocked, the healthy worker takes every launch, and the wedged one is ejected by its own reconcile and rejoins by itself"
     # The restart step earlier in this run brings corkd back with a healthy
     # fleet. This is the production morning after: one box wedged (dockerd
     # frozen, telemetry still answering) when cork itself is restarted. Three
     # separate promises, none of them covered anywhere else -- startup does
     # not block on the wedged box (initWorkers spawns a goroutine per worker
-    # and returns, cork/workers.go:202-227 with :299), the healthy box
+    # and returns, initWorkers with newWorkerConn), the healthy box
     # reconciles and takes every placement while the other is still being
-    # retried, and the wedged one ends at down through reconcileWithRetries'
-    # unreachable verdict (workers.go:343-345) rather than through telemetry,
+    # retried, and the wedged one ends unresponsive through reconcileWithRetries'
+    # unreachable verdict rather than through telemetry,
     # which never stops.
     cork=$(compose_container cork)
     [[ -n "$cork" ]] || fail "cork container not found via the outer docker API"
@@ -4867,17 +5038,17 @@ if (( FULL )); then
     # would see is a worker already down. Anything else means corkd was
     # serving while that pass was still running. The duration below is only
     # the guard that keeps that reading meaningful.
-    restart_health=$(worker_health "$WB" || true)
+    restart_health=$(worker_reachable "$WB" || true)
     [[ -n "$restart_health" ]] || fail "worker $WB is not listed after the restart: corkd did not reload its worker rows (initWorkers)"
-    [[ "$restart_health" != down ]] ||
-      fail "corkd answered its first request ${up_took}s after its container started with $WB already down: startup ran the wedged worker's whole reconcile budget before it began listening (initWorkers must hand each worker to a goroutine, cork/workers.go:299)"
+    [[ "$(worker_reason "$WB")" != *"reconciled"* ]] ||
+      fail "corkd answered its first request ${up_took}s after its container started with $WB already ejected by its reconcile: startup ran the wedged worker's whole reconcile budget before it began listening (initWorkers must hand each worker to a goroutine, cork/workers.go)"
     (( up_took < 20 )) ||
       fail "corkd took ${up_took}s from container start to answer, longer than the ~10s a startup blocked behind the wedged $WB would take: the reading above can no longer tell the two apart"
     note "corkd answered ${up_took}s after its container started, with $WB reading '$restart_health'"
     # (b) The healthy box is not held up by the wedged one either: its own
     # reconcile is fast and its poller starts on schedule.
-    retry 20 "worker $WA to report ok after the restart" health_is "$WA" ok
-    if health_is "$WB" ok; then
+    retry 20 "worker $WA to report ok after the restart" reachable_is "$WA" ok
+    if reachable_is "$WB" ok; then
       fail "worker $WB reads ok after the restart although its dockerd is frozen: either the pause did not take (so this step is testing nothing) or its reconcile pass was skipped and its poller started anyway (runWorker)"
     fi
     # (c) And $WA takes every launch. Two of them: with one eligible worker
@@ -4913,22 +5084,37 @@ if (( FULL )); then
     # daemon. 30s from here, not from the restart, because the launches above
     # already spent part of the budget -- what is bounded is that the verdict
     # arrives at all, against the 200s an attempt-counting loop would need.
-    retry 30 "worker $WB to be marked down by its startup reconcile" health_is "$WB" down
+    # On the reason, not on the state. A conn built at startup begins
+    # unresponsive, so `reachable_is "$WB" unresponsive` is already true on the
+    # first sample and would return without waiting for -- or witnessing -- the
+    # verdict this step exists to observe. Only the reconcile giving up writes
+    # this reason.
+    retry 30 "worker $WB to be ejected by its startup reconcile" reason_has "$WB" "reconciled"
+    reachable_is "$WB" unresponsive ||
+      fail "worker $WB is '$(worker_reachable "$WB")' after its startup reconcile gave up on its daemon"
     quiet curl -sSf --max-time 3 "http://$WB:2136/health" ||
-      fail "the telemetry of $WB stopped answering during this step: $WB must be marked down here by its reconcile, not by telemetry silence, or the assertion above proves nothing"
+      fail "the telemetry of $WB stopped answering during this step: $WB must be ejected here by its reconcile, not by a silent agent -- and a silent agent no longer ejects anything, so this would be testing nothing"
+    # The load axis proves which signal did it: telemetry answered throughout,
+    # so once the axis is being fed at all it reads a known load, and the
+    # ejection can only have come from the frozen dockerd.
+    #
+    # Retried rather than read at once, and the reason is the ordering this
+    # step exists to pin: nothing polls telemetry until the reconcile pass is
+    # over (runWorker hands the worker to pollWorker only then), so for the
+    # whole budget the load sits at the unknown a fresh conn starts with. The
+    # read above returns the moment the ejection lands, which is a hair before
+    # the poller's first probe.
+    retry 20 "worker $WB to report a known load, which only its poller can produce" load_is "$WB" ok
     outer_ctl "$wb" unpause
     PAUSED_WORKER=""
     retry 30 "dockerd on $WB" quiet worker_api "$WB" /_ping
-    sleep 3
-    health_is "$WB" down ||
-      fail "worker $WB came back to '$(worker_health "$WB")' on its own once its dockerd was unpaused: a worker downed by its startup reconcile takes a worker-add, or an operator would never know a box had been out"
-    readd "$WB"
+    recovers_by_itself "$WB"
     DOWNED_WORKER=""
     orphan_gone "$WB" 995 "{\"containers\":[\"$planted\"]}" ||
-      fail "worker $WB reported ok after its worker-add with the orphan cmgr-995 still on it: the reconcile did not finish before the poller started"
+      fail "worker $WB reported ok after recovering with the orphan cmgr-995 still on it: the reconcile did not finish before the worker rejoined placement"
     ORPHAN_WORKER=""; ORPHAN_NET=""; ORPHAN_CID=""
     all_workers_ok || fail "worker $WA or $WB is not ok after the restart with a wedged worker"
-    ok "corkd served ${up_took}s after its container restarted with $WB frozen ($WB reading '$restart_health'), $WA reconciled and took both launches, $WB was marked down by its own startup reconcile with its telemetry still answering, stayed down through its daemon's return, and was recovered by a worker-add that cleared cmgr-995"
+    ok "corkd served ${up_took}s after its container restarted with $WB frozen ($WB reading '$restart_health'), $WA reconciled and took both launches, $WB was ejected by its own startup reconcile with its telemetry still answering, and rejoined on its own once its daemon came back -- clearing cmgr-995 on the way in"
   else
     skip "a corkd restart with a wedged worker needs the outer docker socket"
   fi
@@ -4982,21 +5168,22 @@ DRAINED_WORKER=$WB # the EXIT trap re-adds $WB if anything below fails
 # Scale-out: the platform's registration, and what the very next call sees.
 [[ "$(api_status POST /workers "$(jq -cn --arg ip "$WB" --arg p "${PUBLIC[$WB]}" '{ip: $ip, public: $p}')")" == 201 ]] ||
   fail "POST /workers for $WB was not a 201"
-joined=$(worker_health "$WB")
+joined=$(worker_reachable "$WB")
 # Registration is synchronous: the box is in the fleet on the read after its
-# own 201. It is also out of placement until its reconcile and first poll have
-# run — newWorkerConn stores overloaded and runWorker polls only once
+# own 201. It is also out of placement until its reconcile has run —
+# newWorkerConn stores unresponsive and runWorker admits the worker only once
 # reconcileWorker is done — but which of the two states this read catches is a
 # race whose window is one reconcile, so only "down" is a failure here: a box
-# that joined down would never take a placement, down being sticky. The
-# ordering itself is asserted deterministically at the end of this step, where
-# $WB rejoins with leftovers on it.
+# that joined down would never take a placement by itself, down being the one
+# state a probe will not lift. The ordering itself is asserted
+# deterministically at the end of this step, where $WB rejoins with leftovers
+# on it.
 [[ -n "$joined" ]] ||
   fail "worker $WB is absent from GET /workers on the read right after its own 201: registration is not visible to the next call"
 [[ "$joined" != down ]] ||
-  fail "worker $WB joined the fleet down: newWorkerConn must fail a fresh box closed as overloaded, which recovers on its first poll, not down, which only a worker-add clears"
+  fail "worker $WB joined the fleet down: newWorkerConn must fail a fresh box closed as unresponsive, which its own reconcile clears, not as down, which only a worker-add clears"
 t=$(date +%s)
-retry 30 "worker $WB to finish provisioning and report ok" health_is "$WB" ok
+retry 30 "worker $WB to finish provisioning and report ok" reachable_is "$WB" ok
 note "scale-out: 201, '$joined' on the read right after it, eligible after $(( $(date +%s) - t ))s"
 
 # Two launches over two ok workers are one each whatever the round-robin
@@ -5039,7 +5226,7 @@ done
   fail "PATCH /workers/$WB {\"health\":\"down\"} was not a 204"
 # Synchronous, exactly as cork worker-down is (see down_worker): a poll
 # already in flight cannot put it back.
-health_is "$WB" down ||
+reachable_is "$WB" down ||
   fail "worker $WB is not down on the read right after the PATCH: an in-flight telemetry poll overwrote it (the race fixed in ab72f5d)"
 wait
 refused=0 woken=0 busy=0
@@ -5057,14 +5244,14 @@ for i in 32 33 34 35 36 37; do
       if [[ "$(jq -r .worker <<<"$body")" == "$WB" ]]; then wb_ids+=("$id"); else wa_ids+=("$id"); fi
       ;;
     503)
-      if grep -q "worker went down" <<<"$body"; then
+      if grep -q "worker stopped answering" <<<"$body"; then
         refused=$(( refused + 1 ))
         grep -qF "$WB" <<<"$body" ||
-          fail "launch $i was refused as worker-down but names no worker $WB: $(head -c 200 <<<"$body")"
+          fail "launch $i was refused as unreachable but names no worker $WB: $(head -c 200 <<<"$body")"
         # The sharp one, and the reason it reads the message rather than the
-        # clock: without the down-channel wake in acquireSlot the queued launch
+        # clock: without the unreachable-channel wake in acquireSlot the queued launch
         # waits out CORK_WORKER_LAUNCH_WAIT and comes back with the slot
-        # timeout, which launch() re-wraps in the same ErrWorkerDown and corkd
+        # timeout, which launch() re-wraps in the same ErrWorkerUnreachable and corkd
         # answers with the same 503. Only the inner message tells them apart.
         if grep -q "no launch slot" <<<"$body"; then
           fail "the launch aimed at $WB waited out its launch wait before being refused ($(head -c 200 <<<"$body")): acquireSlot no longer wakes waiters on the worker's down channel"
@@ -5105,10 +5292,11 @@ done
 # Its telemetry never stopped: the box is healthy and answers every poll, which
 # is what down has to be sticky against, or a box inside its termination window
 # drifts back into placement. Two poll intervals on top of the serving checks
-# above are plenty (pollerSetHealth must refuse to leave down).
+# above are plenty (setReachable must refuse every observation that would
+# leave down).
 sleep 1
-health_is "$WB" down ||
-  fail "worker $WB left down on its own while its telemetry kept answering: down is not sticky (pollerSetHealth)"
+reachable_is "$WB" down ||
+  fail "worker $WB left down on its own while its telemetry kept answering and its dockerd was reachable: down is asserted, and setReachable must refuse every observation that would leave it"
 note "$WB is out of placement with ${#wb_ids[@]} instance(s) still serving on it"
 
 # The drain. Every stop on a down worker takes the DB-only path: the record
@@ -5390,7 +5578,7 @@ if (( FULL )); then
     # imagePresent (cork/launch.go:163-178): a tag the daemon already holds is
     # never pulled, so a launch onto a warm worker does not touch the registry
     # at all. Nothing else in this scenario reaches pullImage's timeout.
-    PULL_TIMEOUT=30 # cork sets no CORK_WORKER_PULL_TIMEOUT, so the default (cork/workers.go:76)
+    PULL_TIMEOUT=30 # cork sets no CORK_WORKER_PULL_TIMEOUT, so the default (defaultWorkerTiming)
     PROBE_SEED=99   # outside schema.yaml's seeds (1, 3, 5, 7): this build is nobody else's
 
     # A run killed before its EXIT trap leaves its probe build behind, and a
@@ -5566,12 +5754,12 @@ if (( FULL )); then
     grep -q "on the daemon's own registry timeout" <<<"$body" ||
       fail "the 503 names a pull timeout but not the daemon's own registry timeout, so corkd's context deadline is what expired: registryTimedOut no longer classifies what the daemon reports, and a pull that hung would be a 500 again on any deployment where the daemon gives up first ($(head -c 250 <<<"$body"))"
     # The regression's fingerprint, visible in the body before any health
-    # read: noteWorkerTransportError on a timed-out pull marks the worker
-    # down, and launch (cork/launch.go:91-96) then re-wraps that very error as
-    # ErrWorkerDown -- still a 503, still naming the pull timeout, with
-    # "worker went down" in front of it.
-    if grep -q "worker went down" <<<"$body"; then
-      fail "the timed-out pull came back as a worker-down failure ($(head -c 200 <<<"$body")): ensureImages offered ErrPullTimeout to noteWorkerTransportError (cork/launch.go:142-150), so one slow registry now takes boxes out of the fleet"
+    # read: noteWorkerTransportError on a timed-out pull would eject the
+    # worker, and launch (cork/launch.go) then re-wraps that very error as
+    # ErrWorkerUnreachable -- still a 503, still naming the pull timeout, with
+    # "worker stopped answering" in front of it.
+    if grep -q "worker stopped answering" <<<"$body"; then
+      fail "the timed-out pull came back as an unreachable-worker failure ($(head -c 200 <<<"$body")): ensureImages offered ErrPullTimeout to noteWorkerTransportError (cork/launch.go), so one slow registry now takes boxes out of the fleet"
     fi
     grep -qi '^Retry-After: 1' "$pull_dir/pull.head" ||
       fail "the 503 of the timed-out pull carried no Retry-After, so the platform will not place the retry: $(tr -d '\r' <"$pull_dir/pull.head" | head -1)"
@@ -5590,11 +5778,13 @@ if (( FULL )); then
       fail "the launch was refused after only ${took_ms}ms: it never waited for a pull at all, so what failed was not a timeout of either kind"
     (( took_ms <= (PULL_TIMEOUT + 15) * 1000 )) ||
       fail "the launch took ${took_ms}ms to give up, past corkd's ${PULL_TIMEOUT}s pull timeout: the pull is bounded by something else (restartLimits' five-minute ceiling leaking into a request launch, or the transport timeout)"
-    # down is sticky, so these single reads are the whole assertion, and they
-    # are the ones that cost a production box if the exemption ever goes.
+    # Read immediately, before any recovery could paper over an ejection: a
+    # worker ejected here would rejoin within a second or two on this fleet's
+    # backoff, and the retry below would then pass over the very regression
+    # this is guarding.
     for ip in "${WORKER_IPS[@]}"; do
-      if health_is "$ip" down; then
-        fail "worker $ip was marked down by a launch whose image pull timed out: the pull timeout indicts the registry, not the box, and a worker downed here takes no further placement until an operator's worker-add (cork/launch.go:142-150)"
+      if ! reachable_is "$ip" ok; then
+        fail "worker $ip is '$(worker_reachable "$ip")' after a launch whose image pull timed out: the pull timeout indicts the registry, not the box, and ejecting a worker here would cost it every placement until it probed its way back (cork/launch.go)"
       fi
     done
     retry 20 "both workers to report ok after the stalled launch" all_workers_ok
