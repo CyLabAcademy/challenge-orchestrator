@@ -16,9 +16,10 @@ type WorkerAddRequest struct {
 }
 
 // workersHandler serves the worker collection: GET lists all configured
-// workers (with public address, health, and instance counts), POST adds one
-// or rebuilds an existing one's connection (the recovery path for a worker
-// marked down).
+// workers (public address, both health axes, how long the reachable one has
+// held and why, and instance counts), POST adds one or rebuilds an existing
+// one's connection -- which is how a worker an operator took down comes back,
+// an unresponsive one having recovered on its own.
 func (s state) workersHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
@@ -54,7 +55,9 @@ func (s state) workersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // WorkerUpdateRequest is the body of PATCH /workers/<ip>. Only "down" may be
-// set; the other health states are telemetry-derived.
+// set; every other state is something cork observed rather than something an
+// operator can assert, and asserting one would be overwritten by the next
+// probe.
 type WorkerUpdateRequest struct {
 	Health string `json:"health"`
 }
@@ -63,7 +66,11 @@ type WorkerUpdateRequest struct {
 // registry entry and all of its instance records are deleted; containers
 // still running on a live worker are left for docker-reaper/manual cleanup.
 // PATCH /workers/<ip> with {"health": "down"} takes it out of placement while
-// keeping both, for a box that is about to be terminated.
+// keeping both, for a box that is about to be rebooted or terminated.
+//
+// Down is the state no probe will lift, which is what makes it worth setting
+// by hand: an operator taking a box out of service knows something the probes
+// do not, so a worker that goes on answering stays down until worker-add.
 func (s state) workerHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "DELETE" && r.Method != "PATCH" {
 		w.WriteHeader(http.StatusMethodNotAllowed)

@@ -1324,7 +1324,7 @@ func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
 // teardown removes an instance's containers and network from its daemon
 // under a teardown slot (daemonQueue), waiting for one as long as it takes: a
 // stop must go through, and the queue is corkd's own. It is refused with
-// ErrWorkerDown once the instance's worker is down, which the callers treat
+// ErrWorkerUnreachable once the instance's worker is down, which the callers treat
 // as the DB-only case.
 //
 // The network goes even when the containers did not go cleanly, since by then

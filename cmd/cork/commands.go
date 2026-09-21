@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -45,10 +46,13 @@ type ChallengeListElement struct {
 }
 
 type WorkerInfo struct {
-	IP        string `json:"ip"`
-	Public    string `json:"public"`
-	Health    string `json:"health"`
-	Instances int    `json:"instances"`
+	IP        string    `json:"ip"`
+	Public    string    `json:"public"`
+	Reachable string    `json:"reachable"`
+	Load      string    `json:"load"`
+	Since     time.Time `json:"since"`
+	Reason    string    `json:"reason"`
+	Instances int       `json:"instances"`
 }
 
 func runtimeError(err error) int {
@@ -421,8 +425,18 @@ func workerListCommand(c *client, args []string) int {
 		if public == "" {
 			public = worker.IP
 		}
-		fmt.Printf("%-15s  public=%-30s  %-10s  %d instances\n",
-			worker.IP, public, worker.Health, worker.Instances)
+		// How long it has been in this state matters as much as the state: a
+		// worker unresponsive for eight seconds is a daemon restarting, one
+		// unresponsive for an hour is a box nobody has looked at.
+		state := worker.Reachable
+		if !worker.Since.IsZero() {
+			state += fmt.Sprintf(" %s", time.Since(worker.Since).Round(time.Second))
+		}
+		fmt.Printf("%-15s  public=%-30s  %-22s  load=%-10s  %d instances\n",
+			worker.IP, public, state, worker.Load, worker.Instances)
+		if worker.Reason != "" {
+			fmt.Printf("%-15s  %s\n", "", worker.Reason)
+		}
 	}
 	return NO_ERROR
 }

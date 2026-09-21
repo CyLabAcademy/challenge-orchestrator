@@ -156,21 +156,31 @@ Workers:
       register a worker, or bring a down one back once it is rebooted or
       repaired (its instances come back with it: their containers restart on
       their own); the optional public address is what players are given for
-      its instances; containers and networks cork created on it for instances
-      it no longer records are removed first (as for every worker at corkd
-      start). A daemon that stays unreachable while that runs is marked down
-      and takes nothing until another worker-add; one that answers but leaves
-      the cleanup unfinished takes placements anyway, with an error in the
-      log, since what is left costs a launch here and there rather than the
-      whole box
+      its instances, and leaving it off keeps the address already stored
+      rather than clearing it; containers and networks cork created on it for
+      instances it no longer records are removed first (as for every worker at
+      corkd start). A daemon that stays unreachable while that runs leaves the
+      worker unresponsive -- still probed, and still able to come back by
+      itself; one that answers but leaves the cleanup unfinished takes
+      placements anyway, with an error in the log, since what is left costs a
+      launch here and there rather than the whole box.
+      Running it on a worker that is already registered is the way to force an
+      immediate reconnect and reconcile instead of waiting out the backoff
   worker-remove <ip>
       purge the worker and all of its instance records, for a box that is
       terminated and recreated rather than rebooted (nothing on the worker
       itself is touched; re-adding it cleans up); a persistent instance it
       hosted is only relaunched by the next update-schema
   worker-down <ip>
-      mark the worker down, taking it out of placement but keeping its records
+      take the worker out of placement while keeping its records. This is the
+      one state no probe will lift, so it is for a box you are about to
+      terminate; a reboot needs nothing, since a worker that stops answering
+      is ejected and rejoins on its own once its daemon is back. Undone by
+      worker-add
   worker-list
+      the fleet, each worker's two health axes (reachable, from its docker
+      daemon; load, from its telemetry agent), how long it has been in that
+      state, why, and how many instances it holds
 
 Base image pins:
   pin-list

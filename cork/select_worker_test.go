@@ -21,11 +21,30 @@ func managerWithWorkers(t *testing.T, workers ...*workerConn) *Manager {
 	return m
 }
 
-func workerAt(ip string, h workerHealth) *workerConn {
+// workerAt builds a worker fixture on both health axes. The three shorthands
+// below cover what most placement tests care about.
+func workerAt(ip string, r workerReachable, l workerLoad) *workerConn {
 	w := &workerConn{ip: ip}
-	w.health.Store(int32(h))
+	w.reachable.Store(int32(r))
+	w.load.Store(int32(l))
 	return w
 }
+
+func okWorker(ip string) *workerConn { return workerAt(ip, workerReachableOk, workerLoadOk) }
+
+// overloadedWorker is reachable -- its daemon answers, its telemetry says the
+// box is over its high-water mark.
+func overloadedWorker(ip string) *workerConn {
+	return workerAt(ip, workerReachableOk, workerOverloaded)
+}
+
+// unresponsiveWorker had its daemon stop answering; its last known load is
+// irrelevant, since reachability alone keeps it out of placement.
+func unresponsiveWorker(ip string) *workerConn {
+	return workerAt(ip, workerUnresponsive, workerLoadOk)
+}
+
+func downWorker(ip string) *workerConn { return workerAt(ip, workerDown, workerLoadOk) }
 
 // No workers configured is not a failure: it means place the instance on the
 // local daemon, which the caller reads as an empty ip with no error.
@@ -45,9 +64,9 @@ func TestSelectWorkerWithNoneConfigured(t *testing.T) {
 // shares the load instead of stacking every instance on the first box.
 func TestSelectWorkerRoundRobins(t *testing.T) {
 	m := managerWithWorkers(t,
-		workerAt("10.0.0.1", workerOk),
-		workerAt("10.0.0.2", workerOk),
-		workerAt("10.0.0.3", workerOk),
+		okWorker("10.0.0.1"),
+		okWorker("10.0.0.2"),
+		okWorker("10.0.0.3"),
 	)
 
 	want := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.1", "10.0.0.2"}
@@ -67,9 +86,10 @@ func TestSelectWorkerRoundRobins(t *testing.T) {
 // dead prefix on every placement.
 func TestSelectWorkerSkipsUnhealthy(t *testing.T) {
 	m := managerWithWorkers(t,
-		workerAt("10.0.0.1", workerDown),
-		workerAt("10.0.0.2", workerOverloaded),
-		workerAt("10.0.0.3", workerOk),
+		downWorker("10.0.0.1"),
+		overloadedWorker("10.0.0.2"),
+		unresponsiveWorker("10.0.0.4"),
+		okWorker("10.0.0.3"),
 	)
 
 	for i := 0; i < 3; i++ {
@@ -83,9 +103,11 @@ func TestSelectWorkerSkipsUnhealthy(t *testing.T) {
 	}
 }
 
-// The two exhaustion errors mean opposite things to the caller: overloaded
-// somewhere is retryable (503), everything down is a real failure (500). See
-// errorResponse in cmd/corkd, which maps exactly this distinction.
+// The three exhaustion errors mean different things to the caller. Overloaded
+// and unresponsive are both states a worker leaves on its own, so they are
+// retryable (503); every worker having been taken down by an operator is not
+// going to resolve itself (500). See errorResponse in cmd/corkd, which maps
+// exactly this distinction.
 func TestSelectWorkerExhaustionErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -94,20 +116,32 @@ func TestSelectWorkerExhaustionErrors(t *testing.T) {
 	}{
 		{
 			name:    "every worker overloaded",
-			workers: []*workerConn{workerAt("10.0.0.1", workerOverloaded), workerAt("10.0.0.2", workerOverloaded)},
+			workers: []*workerConn{overloadedWorker("10.0.0.1"), overloadedWorker("10.0.0.2")},
 			want:    ErrAllWorkersOverloaded,
 		},
 		{
-			name:    "every worker down",
-			workers: []*workerConn{workerAt("10.0.0.1", workerDown), workerAt("10.0.0.2", workerDown)},
+			name:    "every worker unresponsive",
+			workers: []*workerConn{unresponsiveWorker("10.0.0.1"), unresponsiveWorker("10.0.0.2")},
+			want:    ErrAllWorkersUnresponsive,
+		},
+		{
+			name:    "every worker taken down",
+			workers: []*workerConn{downWorker("10.0.0.1"), downWorker("10.0.0.2")},
 			want:    ErrAllWorkersDown,
+		},
+		{
+			// Unresponsive is a state a worker leaves on its own, so one
+			// among the taken-down keeps the placement retryable.
+			name:    "one unresponsive among the taken-down",
+			workers: []*workerConn{downWorker("10.0.0.1"), unresponsiveWorker("10.0.0.2")},
+			want:    ErrAllWorkersUnresponsive,
 		},
 		{
 			// One overloaded among the dead is enough to make the whole
 			// placement retryable: that box may come back on its own, where a
 			// fleet that is entirely down needs someone to intervene.
 			name:    "one overloaded among the down",
-			workers: []*workerConn{workerAt("10.0.0.1", workerDown), workerAt("10.0.0.2", workerOverloaded)},
+			workers: []*workerConn{downWorker("10.0.0.1"), overloadedWorker("10.0.0.2")},
 			want:    ErrAllWorkersOverloaded,
 		},
 	}
@@ -131,8 +165,8 @@ func TestSelectWorkerExhaustionErrors(t *testing.T) {
 // the order is always found however far round it sits. A fleet only refuses a
 // placement when nothing is eligible.
 func TestSelectWorkerWrapsToReachAHealthyWorker(t *testing.T) {
-	first := workerAt("10.0.0.1", workerOk)
-	m := managerWithWorkers(t, first, workerAt("10.0.0.2", workerOverloaded))
+	first := okWorker("10.0.0.1")
+	m := managerWithWorkers(t, first, overloadedWorker("10.0.0.2"))
 
 	// Leaves the cursor on the overloaded worker.
 	if got, err := m.selectWorker(); err != nil || got != "10.0.0.1" {
@@ -150,7 +184,7 @@ func TestSelectWorkerWrapsToReachAHealthyWorker(t *testing.T) {
 // where everything is overloaded would walk the order while nothing is being
 // placed, and resume somewhere arbitrary once it recovers.
 func TestSelectWorkerCursorSurvivesExhaustion(t *testing.T) {
-	one, two := workerAt("10.0.0.1", workerOk), workerAt("10.0.0.2", workerOk)
+	one, two := okWorker("10.0.0.1"), okWorker("10.0.0.2")
 	m := managerWithWorkers(t, one, two)
 
 	// Takes the first worker and leaves the cursor on the second.
@@ -158,8 +192,8 @@ func TestSelectWorkerCursorSurvivesExhaustion(t *testing.T) {
 		t.Fatalf("first placement: got (%q, %v), want (10.0.0.1, nil)", got, err)
 	}
 
-	one.health.Store(int32(workerOverloaded))
-	two.health.Store(int32(workerOverloaded))
+	one.load.Store(int32(workerOverloaded))
+	two.load.Store(int32(workerOverloaded))
 	for i := 0; i < 3; i++ {
 		if _, err := m.selectWorker(); !errors.Is(err, ErrAllWorkersOverloaded) {
 			t.Fatalf("refused placement %d: got %v, want ErrAllWorkersOverloaded", i, err)
@@ -168,8 +202,8 @@ func TestSelectWorkerCursorSurvivesExhaustion(t *testing.T) {
 
 	// Recovered: the cursor is where the last successful placement left it, so
 	// the second worker is next rather than the first one over again.
-	one.health.Store(int32(workerOk))
-	two.health.Store(int32(workerOk))
+	one.load.Store(int32(workerLoadOk))
+	two.load.Store(int32(workerLoadOk))
 	if got, err := m.selectWorker(); err != nil || got != "10.0.0.2" {
 		t.Fatalf("after recovery: got (%q, %v), want (10.0.0.2, nil)", got, err)
 	}
@@ -178,9 +212,9 @@ func TestSelectWorkerCursorSurvivesExhaustion(t *testing.T) {
 // The address handed to a player: the configured public one, else the private
 // ip, and "" for a worker that has been removed since the instance was placed.
 func TestWorkerPublicAddr(t *testing.T) {
-	withPublic := workerAt("10.0.0.1", workerOk)
+	withPublic := okWorker("10.0.0.1")
 	withPublic.public = "ctf.example.org"
-	m := managerWithWorkers(t, withPublic, workerAt("10.0.0.2", workerOk))
+	m := managerWithWorkers(t, withPublic, okWorker("10.0.0.2"))
 
 	tests := []struct{ ip, want string }{
 		{"10.0.0.1", "ctf.example.org"},
