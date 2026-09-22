@@ -505,13 +505,18 @@ challenge still costs a tag resolution on every build of it. Pin all of them.
   fails the update. There is no gate for this inside cork; it is the platform's
   to close, by not asking for launches during the pass.
 - **Commit the pin file to the challenge repository**, at the corpus root, and
-  point `CORK_BASE_PINS` at it. corkd's own default is
-  `<CORK_DIR>/.base-pins.json` — a dotfile, which nobody commits and a
-  `git clean -xdf` erases. A committed `base-pins.json` is versioned with the
-  corpus it pins, restored by a fresh clone, and reviewable as a diff: the pin
-  bump becomes a commit rather than an untracked file on one machine. It sits
-  outside every challenge directory, so it perturbs no source checksum, and
-  cork's scan ignores it. `pin-refresh` rewrites it in place; commit the result.
+  leave `CORK_BASE_PINS` unset. corkd derives `<CORK_DIR>/.base-pins.json`, and
+  a dotfile is safe to commit: `git clean -xdf` does not touch tracked files.
+  Committed, it is versioned with the corpus it pins, restored by a fresh clone,
+  and reviewable as a diff — a pin bump is a commit rather than untracked state
+  on one machine. Unset is what makes the pins follow the tree, which is what a
+  build from somewhere else needs: `cork-build --dir` moves `CORK_DIR` and
+  nothing else, so an absolute `CORK_BASE_PINS` would go on resolving to the
+  provisioned copy while the tree was elsewhere. That does not fail — the pin
+  fingerprint is an input to every build's content identity, so it silently
+  refingerprints and rebuilds the corpus under new tags. It sits outside every
+  challenge directory, so it perturbs no source checksum, and cork's scan
+  ignores it. `pin-refresh` rewrites it in place; commit the result.
 - Keep `storage-driver: overlay2`. The containerd image store breaks the cache
   path: a *pulled* image is not usable as a cache source there (locally built
   ones are), which quietly removes the shared apt/pip layers.
