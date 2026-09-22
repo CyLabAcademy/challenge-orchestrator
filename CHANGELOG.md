@@ -7,6 +7,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+**A symlinked `CORK_DIR` is refused instead of emptying the database.** The
+challenge directory was validated with `stat`, which follows a link, but is
+walked with `lstat`, which does not — so a symlinked tree passed validation and
+then inventoried nothing. An empty inventory is not an error, so every challenge
+on record was classified as removed and dropped, and the run reported success
+with exit 0. Measured: 8 challenges on record, one `update` through a symlink to
+the same tree, 0 left. If you point `CORK_DIR` at a symlink today, bind-mount the
+tree instead — a bind mount is indistinguishable from a real directory to both
+the check and the walk.
+
 ## [1.1.0] — 2026-09-21
 
 ### Added
