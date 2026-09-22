@@ -277,8 +277,10 @@ func (m *Manager) removeArtifactBundle(schema, filename string) error {
 }
 
 // setChallengeDirectory reads CORK_DIR, normalizes it to an absolute path
-// and requires it to be a directory that exists: a mistyped challenge path
-// must fail the start, not bring a daemon up over an empty catalogue.
+// and requires it to be a real directory that exists -- not a symlink to one.
+// A mistyped challenge path must fail the start rather than bring a daemon up
+// over an empty catalogue, and a symlinked one is worse than mistyped: see the
+// refusal below.
 func (m *Manager) setChallengeDirectory() error {
 	chalDir, isSet := LookupEnv(DIR_ENV)
 	if !isSet {
@@ -303,6 +305,33 @@ func (m *Manager) setChallengeDirectory() error {
 	if !info.IsDir() {
 		m.log.error("challenge directory must be a directory")
 		return errors.New(m.chalDir + " is not a directory")
+	}
+
+	// Refused rather than followed, and checked after the two above so that a
+	// missing path and a symlink to a file are reported as what they are.
+	//
+	// os.Stat resolves the link, so the check above passes one happily.
+	// filepath.Walk does not: it lstats its root, and a symlink is not a
+	// directory to it, so the scan visits the link itself and descends into
+	// nothing. That produces no error -- which is the dangerous part. An empty
+	// inventory means every challenge on record was in the scanned path and is
+	// not in the inventory, so all of them are classified Removed and dropped,
+	// and the run reports success. On a build plane that is the database the
+	// orchestrator's build ids are keyed to.
+	//
+	// Bind-mount the tree instead; a bind mount is indistinguishable from a
+	// real directory both here and to the walk.
+	link, err := os.Lstat(m.chalDir)
+	if err != nil {
+		m.log.errorf("could not lstat the challenge directory: %s", err)
+		return err
+	}
+	if link.Mode()&os.ModeSymlink != 0 {
+		// The whole explanation goes in the log, not in the error: a command
+		// prints "could not initialize cork" and drops the error's text, so
+		// this line is all the operator gets.
+		m.log.errorf("challenge directory %s is a symlink. The tree is walked without following links, so the scan would find no challenges and would take every challenge on record to have been removed. Name the directory itself, or bind-mount it here", m.chalDir)
+		return errors.New(m.chalDir + " is a symlink")
 	}
 
 	return nil
