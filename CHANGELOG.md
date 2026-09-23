@@ -7,17 +7,43 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-09-23
+
+Three fixes found while deploying a 534-challenge corpus onto a fresh build
+plane. All three are about a failure telling you what it was.
+
 ### Fixed
 
-**A symlinked `CORK_DIR` is refused instead of emptying the database.** The
-challenge directory was validated with `stat`, which follows a link, but is
+**A symlinked `CORK_DIR` is refused rather than quietly emptying the catalogue.**
+The challenge directory was validated with `stat`, which follows a link, but is
 walked with `lstat`, which does not — so a symlinked tree passed validation and
 then inventoried nothing. An empty inventory is not an error, so every challenge
-on record was classified as removed and dropped, and the run reported success
-with exit 0. Measured: 8 challenges on record, one `update` through a symlink to
-the same tree, 0 left. If you point `CORK_DIR` at a symlink today, bind-mount the
-tree instead — a bind mount is indistinguishable from a real directory to both
-the check and the walk.
+on record counted as removed: ones with no builds were deleted and the run exited
+0, while ones with builds hit a foreign-key constraint that rolled the delete
+back and reported `FOREIGN KEY constraint failed` instead of the real problem.
+Measured: 8 challenges on record, one `update` through a symlink to the same
+tree, 0 left. Serve a tree from elsewhere with a bind mount, which is
+indistinguishable from a real directory to both the check and the walk.
+
+**Build and artifact failures name the challenge they belong to.** Every error
+path in `executeBuild` reported only its underlying cause, and those causes do
+not identify anything: `failed to build image: process "/bin/sh -c make main"
+did not complete successfully: exit code: 2` is the same sentence for every
+challenge of a type, and `could not cache artifacts: artifact "source.tar.gz"
+is …` names a file dozens of challenges could produce. A deploy that reported
+seven of the first offered no way to tell which seven short of re-running the
+whole thing under `--verbose`. Each now carries the challenge id, build id and
+seed.
+
+### Changed
+
+**Base pins are documented as `<CORK_DIR>/.base-pins.json` with `CORK_BASE_PINS`
+left unset**, so they travel with the tree they are committed alongside — which
+is what `cork-build --dir` needs when a runner builds from a checkout in its
+workspace. BUILDER.md previously advised a non-dotted file at an explicit path,
+reasoning that a dotfile goes uncommitted; it does not, and an absolute path goes
+on resolving to the old location when the tree moves, which refingerprints every
+build rather than failing. Behaviour is unchanged; the advice is what moved.
 
 ## [1.1.0] — 2026-09-21
 
@@ -214,6 +240,7 @@ fallback goes, a build plane needs both.
 4. A single-host deployment needs no build plane: leave `CORK_BUILD_PLANE` unset
    and `corkd` builds on its own docker daemon, as cmgr did.
 
+[1.1.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.1
 [1.1.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.0
 [1.0.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.0.1
 [1.0.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.0.0
