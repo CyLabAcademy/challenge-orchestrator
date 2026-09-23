@@ -1,7 +1,9 @@
 package cork
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -224,6 +226,60 @@ func TestWorkerPublicAddr(t *testing.T) {
 	for _, tc := range tests {
 		if got := m.workerPublicAddr(tc.ip); got != tc.want {
 			t.Fatalf("workerPublicAddr(%s): got %q, want %q", tc.ip, got, tc.want)
+		}
+	}
+}
+
+// The picoCTF platform reads the player-facing address under "hostname": with
+// dynamic_public_hostname set it stores the whole launch response and looks that
+// key up to resolve {{server}} in a challenge description. It is the same value
+// as worker_public, so the two are asserted to agree here rather than being left
+// to drift apart in a later edit.
+func TestHostnameMirrorsWorkerPublic(t *testing.T) {
+	withPublic := okWorker("10.0.0.1")
+	withPublic.public = "ctf.example.org"
+	m := managerWithWorkers(t, withPublic, okWorker("10.0.0.2"))
+
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2"} {
+		meta := &InstanceMetadata{Id: 1, Worker: ip}
+		meta.WorkerPublic = m.workerPublicAddr(meta.Worker)
+		meta.Hostname = meta.WorkerPublic
+
+		if meta.Hostname != meta.WorkerPublic {
+			t.Fatalf("worker %s: hostname %q and worker_public %q disagree", ip, meta.Hostname, meta.WorkerPublic)
+		}
+		body, err := json.Marshal(meta)
+		if err != nil {
+			t.Fatalf("marshalling the instance: %s", err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatalf("unmarshalling the instance: %s", err)
+		}
+		// Both keys, under the exact names each consumer reads.
+		if out["hostname"] != meta.WorkerPublic {
+			t.Errorf("worker %s: json 'hostname' is %v, want %q", ip, out["hostname"], meta.WorkerPublic)
+		}
+		if out["worker_public"] != meta.WorkerPublic {
+			t.Errorf("worker %s: json 'worker_public' is %v, want %q", ip, out["worker_public"], meta.WorkerPublic)
+		}
+		if out["worker"] != ip {
+			t.Errorf("worker %s: json 'worker' is %v, want the private address", ip, out["worker"])
+		}
+	}
+}
+
+// A local (single-host) instance has no worker, so neither address appears --
+// omitempty keeps both keys out rather than reporting an empty hostname a
+// consumer might template into a description.
+func TestHostnameAbsentWithoutAWorker(t *testing.T) {
+	body, err := json.Marshal(&InstanceMetadata{Id: 1})
+	if err != nil {
+		t.Fatalf("marshalling the instance: %s", err)
+	}
+	for _, key := range []string{"hostname", "worker_public", "worker"} {
+		if strings.Contains(string(body), `"`+key+`"`) {
+			t.Errorf("a workerless instance reported %q: %s", key, body)
 		}
 	}
 }

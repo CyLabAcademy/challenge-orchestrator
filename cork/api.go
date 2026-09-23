@@ -898,6 +898,7 @@ func (m *Manager) GetInstanceMetadata(instance InstanceId) (*InstanceMetadata, e
 	// address can be corrected by re-adding it, without touching instances.
 	if iMeta.Worker != "" {
 		iMeta.WorkerPublic = m.workerPublicAddr(iMeta.Worker)
+		iMeta.Hostname = iMeta.WorkerPublic
 	}
 	return iMeta, nil
 }

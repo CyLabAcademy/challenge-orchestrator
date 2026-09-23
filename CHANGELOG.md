@@ -7,6 +7,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.1.2] — 2026-09-23
+
+### Fixed
+
+**A launch reports the player-facing address as `hostname`**, the key the
+platform reads it by, restoring an interface contract this drifted away from.
+With a challenge server's `dynamic_public_hostname` set, the platform stores the
+whole launch response and looks up `hostname` to resolve the `{{server}}` and
+`{{http_base}}` tokens in a challenge description; cork reported the same value
+only as `worker_public`, so those tokens went unresolved and players were shown
+a literal `{{server}}`.
+
+`worker_public` stays, and `worker` stays as the private orchestration address
+that nothing player-facing should read. `hostname` is the same value from the
+same read-time lookup, so the two cannot disagree — a test asserts it.
+
+
 ## [1.1.1] — 2026-09-23
 
 Three fixes found while deploying a 534-challenge corpus onto a fresh build
@@ -240,6 +257,7 @@ fallback goes, a build plane needs both.
 4. A single-host deployment needs no build plane: leave `CORK_BUILD_PLANE` unset
    and `corkd` builds on its own docker daemon, as cmgr did.
 
+[1.1.2]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.2
 [1.1.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.1
 [1.1.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.0
 [1.0.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.0.1
