@@ -1079,7 +1079,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 
 	if m.hostOSType == "linux" {
 		m.log.debug("inserting custom seccomp profile")
-		hConfig.SecurityOpt = []string{"seccomp:" + seccompPolicy}
+		hConfig.SecurityOpt = []string{seccompSecurityOpt(seccompPolicy)}
 	}
 
 	respCC, err := m.cli.ContainerCreate(m.ctx, client.ContainerCreateOptions{
@@ -1490,7 +1490,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			hConfig.ReadonlyRootfs = cOpts.ReadonlyRootfs
 			hConfig.CapDrop = (strslice.StrSlice)(cOpts.DroppedCaps)
 			if cOpts.NoNewPrivileges {
-				hConfig.SecurityOpt = append(hConfig.SecurityOpt, "no-new-privileges:true")
+				hConfig.SecurityOpt = append(hConfig.SecurityOpt, "no-new-privileges=true")
 			}
 			if cOpts.DiskQuota != "" {
 				_, quotas_enabled := LookupEnv(DISK_QUOTA_ENV)
@@ -1524,7 +1524,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			} else {
 				m.log.debug("inserting custom seccomp profile")
 			}
-			hConfig.SecurityOpt = append(hConfig.SecurityOpt, "seccomp:"+profile)
+			hConfig.SecurityOpt = append(hConfig.SecurityOpt, seccompSecurityOpt(profile))
 		}
 
 		nConfig := network.NetworkingConfig{

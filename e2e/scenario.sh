@@ -2919,7 +2919,7 @@ OPTS
   # full HostConfig carries the whole seccomp policy inline in SecurityOpt and
   # is not something to print in a failure message. no-new-privileges is
   # matched on its prefix, not on the exact string: cork sends
-  # "no-new-privileges:true" (docker.go:1088-1090) and the promise is the flag,
+  # "no-new-privileges=true" (docker.go:1492-1494) and the promise is the flag,
   # not dockerd's spelling of it in the stored HostConfig.
   hc=$(worker_api "$w" "/containers/$cid/json" |
     jq -c '.HostConfig | {NanoCpus, Memory, PidsLimit: (.PidsLimit // 0), Init,
@@ -6279,10 +6279,10 @@ step "seccomp: a challenge's own policy reaches the container, through the runti
   # not the empty "unconfined" that a dropped profile would leave.
   sec_cid=$(jq -r '.containers[0]' <<<"$sec_inst")
   sec_hc=$(worker_api "$SEC_WORKER" "/containers/$sec_cid/json")
-  sec_opt=$(jq -r '[.HostConfig.SecurityOpt // [] | .[] | select(startswith("seccomp:"))] | first // ""' <<<"$sec_hc")
+  sec_opt=$(jq -r '[.HostConfig.SecurityOpt // [] | .[] | select(startswith("seccomp="))] | first // ""' <<<"$sec_hc")
   [[ -n "$sec_opt" ]] ||
     fail "instance $SEC_INST of $CH_SECCOMP runs with no seccomp SecurityOpt on $SEC_WORKER, although the challenge declares the profile '$sec_profile': $(jq -c '.HostConfig.SecurityOpt' <<<"$sec_hc")"
-  [[ "$sec_opt" != "seccomp:unconfined" ]] ||
+  [[ "$sec_opt" != "seccomp=unconfined" ]] ||
     fail "instance $SEC_INST of $CH_SECCOMP runs unconfined on $SEC_WORKER although it declares '$sec_profile'"
   # And through the runtime production runs, which is what rewrites the spec
   # this policy travels in (worker/daemon.json sets it as default-runtime).

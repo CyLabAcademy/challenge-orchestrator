@@ -7,6 +7,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+**A challenge's seccomp profile may contain `=`.** Cork passed security options
+to Docker in the deprecated `key:value` form, but Docker splits an option at its
+first `=` whenever it has one, so a profile with an `=` anywhere in its JSON was
+cut inside the profile and every launch failed with `invalid --security-opt 2`.
+A per-syscall `comment` is enough: Docker's profile format allows it and cork's
+validation ignores it, so such a profile passed validation and then never
+launched. Options now go as `seccomp=` and `no-new-privileges=true`, and workers
+stop logging Docker's colon-separator deprecation warning on every launch.
+
+`docker inspect` on new containers shows the `=` form; containers already
+running keep the colon form, which Docker still accepts, so nothing migrates.
+
 ## [1.1.2] — 2026-09-23
 
 ### Fixed
