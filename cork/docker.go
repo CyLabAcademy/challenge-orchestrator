@@ -1029,19 +1029,26 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 		m.log.debugf("creating image %s", imageName)
 		resp, err := m.cli.ImageBuild(m.ctx, buildCtx, opts)
 		if err != nil {
-			m.log.errorf("failed to build base image: %s", err)
+			m.log.errorf("failed to build base image for %s/%d: %s", cMeta.Id, bMeta.Id, err)
 			return err
 		}
 
 		messages, err := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			m.log.errorf("failed to read build response from docker: %s", err)
+			m.log.errorf("failed to read build response from docker for %s/%d: %s", cMeta.Id, bMeta.Id, err)
 			return err
 		}
 
+		// Named, because this is the failure an operator actually meets and
+		// docker's half of it says only which RUN step exited non-zero -- the
+		// same "process \"/bin/sh -c make main\" did not complete successfully"
+		// for every challenge of a type. A build of 500 challenges that reports
+		// seven of those and no ids leaves nothing to act on but a re-run with
+		// --verbose, and the ids are right here.
 		if streamErr := dockerStreamError(messages); streamErr != nil {
-			err = fmt.Errorf("failed to build image: %s", streamErr)
+			err = fmt.Errorf("failed to build image for %s (build %d, seed %d): %s",
+				cMeta.Id, bMeta.Id, bMeta.Seed, streamErr)
 			m.log.error(err)
 			return err
 		}
