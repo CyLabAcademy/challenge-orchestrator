@@ -1151,7 +1151,7 @@ func (m *Manager) executeBuild(cMeta *ChallengeMetadata, bMeta *BuildMetadata, b
 			stagedArtifactsPath = filepath.Join(artifactsDir, "."+bMeta.getArtifactsFilename()+".staged")
 			files, err = m.cacheArtifacts(cTar, stagedArtifactsPath)
 			if err != nil {
-				m.log.errorf("could not cache artifacts: %s", err)
+				m.log.errorf("could not cache artifacts for %s (build %d, seed %d): %s", cMeta.Id, bMeta.Id, bMeta.Seed, err)
 				return err
 			}
 			for _, name := range files {
