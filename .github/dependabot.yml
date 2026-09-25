@@ -13,3 +13,16 @@ updates:
     rebase-strategy: "auto"
     cooldown:
       default-days: 7
+
+  # The workflows pin every action to a commit sha with the tag in a trailing
+  # comment, which is what keeps a moving tag from silently changing what CI
+  # runs. Dependabot understands that form and bumps both, so the pins stay
+  # pinned rather than drifting back to tags nobody is watching.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    rebase-strategy: "auto"
+    cooldown:
+      default-days: 7

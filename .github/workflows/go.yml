@@ -1,10 +1,35 @@
 name: Go
 
 on:
+  # This job checks out, builds and tests, which a documentation or ansible
+  # change gives no reason to do. Anything the build or the tests actually
+  # read is listed; the embedded assets come along with their directories.
   push:
     branches: [ main ]
+    paths:
+      - 'cork/**'
+      - 'cmd/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'ci/**'
+      # The seccomp tests read examples/seccomp and examples/execstack off
+      # disk and fail when either has drifted from the embedded profile, so a
+      # change there is a change this job has to see.
+      - 'examples/**'
+      - '.github/workflows/go.yml'
   pull_request:
     branches: [ main ]
+    paths:
+      - 'cork/**'
+      - 'cmd/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'ci/**'
+      # The seccomp tests read examples/seccomp and examples/execstack off
+      # disk and fail when either has drifted from the embedded profile, so a
+      # change there is a change this job has to see.
+      - 'examples/**'
+      - '.github/workflows/go.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
