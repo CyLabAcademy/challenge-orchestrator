@@ -140,6 +140,12 @@ type Manager struct {
 	placementEnabled  bool
 	launchConcurrency int          // per-daemon launch (and teardown) slots from CORK_CONCURRENT_LAUNCHES
 	workerTiming      workerTiming // poll/timeout tunables, from the environment (see timing())
+
+	// metrics exports launch latency to a local CloudWatch agent, and is nil
+	// unless CORK_EMF_ENDPOINT names one (see launchmetrics.go). A nil one is
+	// a working no-op, so every other build of a Manager -- the CLI, tests --
+	// carries no exporter and pays a nil check per launch.
+	metrics *launchMetrics
 }
 
 type PortInfo struct {

@@ -3,6 +3,7 @@ package cork
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -166,10 +167,17 @@ func (m *Manager) restartInstance(build *BuildMetadata, cMeta *ChallengeMetadata
 		return err
 	}
 	limits := m.restartLimits()
-	if err := m.ensureImages(cli, build, instance, limits); err != nil {
+	// Timed here because this is where a restart's pull happens -- before the
+	// teardown, so the instance keeps serving while its new images arrive.
+	// The launch below cannot see it otherwise and would report none.
+	pullStart := time.Now()
+	pulled, err := m.ensureImages(cli, build, instance, limits)
+	if err != nil {
 		return err
 	}
 	limits.imagesEnsured = true
+	limits.ensuredImageWait = time.Since(pullStart)
+	limits.ensuredPulled = pulled
 	// stopContainers releases the port assignments; reassignPorts reclaims
 	// them (same numbers when free) so the instance keeps its address across
 	// the rebuild.

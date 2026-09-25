@@ -77,6 +77,14 @@ func NewManager(logLevel LogLevel, options ...ManagerOption) *Manager {
 		return nil
 	}
 
+	// Last, so that a Manager abandoned by one of the failures above never
+	// leaves an emitter goroutine behind it. Not on a build plane, which
+	// takes no launches and would otherwise announce an exporter that could
+	// never have anything to send.
+	if !mgr.buildPlane {
+		mgr.metrics = newLaunchMetrics(mgr.log)
+	}
+
 	mgr.pruneInterval = 1 * time.Minute
 	pruneAgeStr, isSet := LookupEnv(PRUNE_AGE_ENV)
 	if !isSet {
@@ -419,16 +427,29 @@ func (m *Manager) newInstance(build *BuildMetadata, envVars map[string]string, l
 	if m.placementEnabled {
 		worker, err := m.selectWorker()
 		if err != nil {
+			// Recorded, like the admission refusal below. A fleet with
+			// nowhere to put a launch is the moment LaunchFailed most needs
+			// to move, and this path returns before any worker, any row or
+			// any daemon is involved -- so without this it would go quiet
+			// exactly when everything is wrong.
+			m.recordUnplaced(build, err)
 			return 0, err
 		}
 		iMeta.Worker = worker
 	}
 	if iMeta.Worker == "" && m.externalBuildPlane {
+		m.recordUnplaced(build, ErrNoWorkers)
 		return 0, ErrNoWorkers
 	}
 
 	// Refuse at once what would only be refused after the wait (admit).
 	if err := m.admit(iMeta, limits); err != nil {
+		// Recorded like any refusal reached through the daemon. This is the
+		// fast path for an overloaded worker, so leaving it out would hide
+		// exactly the condition the metric exists to show -- and would count
+		// one half of one condition, since the same refusal arriving from
+		// acquireSlot inside launchStages is counted.
+		m.beginLaunch(build, iMeta, limits).finish(err)
 		return 0, err
 	}
 

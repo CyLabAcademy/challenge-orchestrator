@@ -49,6 +49,11 @@ export CORK_SERVER # picked up by cork
 SCHEMA_NAME=e2e
 CH_PERSISTENT=cmgr/examples/custom-socat   # service, instance_count 1
 CH_ONDEMAND=cmgr/examples/runtime-env-vars # service, instance_count -1, answers over HTTP
+# Where corkd's launch-metrics export lands: e2e/emf-stub.py writes what it
+# receives here, on the volume this container shares with cork. Must match
+# E2E_EMF_CAPTURE and CORK_EMF_LOG_GROUP in compose.yaml.
+EMF_CAPTURE=/var/lib/cork/emf.ndjson
+EMF_GROUP=/cork/launches
 CH_MAKE=cmgr/examples/binex101             # service, instance_count -1, remote-make over TCP
 CH_FLAGONLY=cmgr/examples/layer-cake       # flag_only, never launched
 PERSISTENT_SRC=custom/Dockerfile           # files the update steps edit, under CORK_DIR
@@ -1102,6 +1107,17 @@ else
 fi
 
 # ------------------------------------------------- 1. register the workers
+
+# The launch-metrics capture (step 15i) is emptied here rather than in
+# cork-entrypoint.sh, and before anything launches: the volume outlives a run,
+# so a reused one would otherwise hold records from earlier runs, written by an
+# older cork whose records need not be the shape this run asserts -- which is
+# exactly how a passing change looked like a failing one once the Worker
+# dimension moved from the private address to the public name. Not in the
+# entrypoint, because a corkd restart mid-run (step 8) would then wipe the
+# records this run had already made.
+: >"$EMF_CAPTURE" 2>/dev/null || true
+rm -f "$EMF_CAPTURE.unframed"
 
 step "registering the workers: cork worker-add <private ip> <public name>"
 for ip in "${WORKER_IPS[@]}"; do
@@ -6667,6 +6683,159 @@ else
   deselect "base image pins"
   deselect "the inline cache is imported, not just published"
 fi
+# -------------------- 15i. launch latency reaches the agent socket
+
+step "launch metrics: every launch this run made left the daemon as embedded metric format, and the daemon's own summary agrees with what arrived"
+[[ -s "$EMF_CAPTURE" ]] ||
+  fail "nothing reached the agent socket: corkd runs with CORK_EMF_ENDPOINT set and e2e/emf-stub.py captured no record at $EMF_CAPTURE"
+
+# One datagram is one log event, and the agent drops an event it cannot parse
+# without saying so -- so a record that spans lines or is not an object would
+# vanish in production with nothing to show for it. Counting parsed values
+# against lines catches both.
+# The agent takes each event as a line, and its own reference clients append
+# a newline to every record. One sent without it is held for a delimiter that
+# never comes and discarded with nothing said on either side -- so the stub
+# writes each datagram verbatim and notes any that arrived unterminated,
+# rather than tidying them up and hiding exactly that.
+if [[ -s "$EMF_CAPTURE.unframed" ]]; then
+  fail "$(wc -l <"$EMF_CAPTURE.unframed") record(s) arrived without a terminating newline; the agent would discard them silently"
+fi
+
+emf_lines=$(wc -l <"$EMF_CAPTURE")
+emf_values=$(jq -s 'length' "$EMF_CAPTURE") ||
+  fail "the capture holds a line that is not valid JSON; the agent would drop it silently"
+[[ "$emf_values" == "$emf_lines" ]] ||
+  fail "$emf_lines captured lines parsed as $emf_values JSON values: a record is not one line"
+
+# The rule the whole format turns on: every name a directive lists, as a metric
+# or as a dimension, must resolve to a member of the root node. CloudWatch
+# drops an event that breaks it and reports nothing back to cork, so this is
+# the failure that would otherwise be invisible from this side.
+emf_unresolved=$(jq -r '. as $e
+  | $e._aws.CloudWatchMetrics[]
+  | (.Metrics[].Name        | select(($e[.] | type) != "number") | "metric " + .),
+    (.Dimensions[][]        | select(($e[.] | type) != "string" or $e[.] == "") | "dimension " + .)
+' "$EMF_CAPTURE" | sort -u | tr '\n' ' ')
+[[ -z "$emf_unresolved" ]] ||
+  fail "records name targets that do not resolve to a root member: $emf_unresolved"
+
+emf_groups=$(jq -r '._aws.LogGroupName' "$EMF_CAPTURE" | sort -u | tr '\n' ' ')
+[[ "$emf_groups" == "$EMF_GROUP " ]] ||
+  fail "records carry log group(s) '$emf_groups', expected '$EMF_GROUP': the agent files each event by the name in the record"
+emf_ns=$(jq -r '._aws.CloudWatchMetrics[].Namespace' "$EMF_CAPTURE" | sort -u | tr '\n' ' ')
+[[ "$emf_ns" == "cork " ]] || fail "records carry namespace(s) '$emf_ns', expected 'cork'"
+
+# The dimension is the worker's player-facing name -- permanent per slot on an
+# autoscaled fleet, where the private IP changes under a replacement -- and the
+# machine that served the launch rides along as a field. Both are checked: a
+# name nobody registered, or an address outside the fleet, is a record nobody
+# could act on.
+# "unplaced" is not a worker: it is a launch the fleet had nowhere to put,
+# which the every-worker-unavailable step makes on purpose. Those must be
+# counted -- a fleet that can place nothing is when LaunchFailed most needs to
+# move -- so their absence is as much a failure here as a stray name.
+emf_names=" $(printf '%s ' "${PUBLIC[@]}")"
+for w in $(jq -r '.Worker' "$EMF_CAPTURE" | sort -u); do
+  [[ "$w" == "local" || "$w" == "unplaced" || "$emf_names" == *" $w "* ]] ||
+    fail "a record names worker '$w', which is not a public name this fleet registered ($emf_names)"
+done
+emf_unplaced=$(jq -s '[.[] | select(.Worker == "unplaced")] | length' "$EMF_CAPTURE")
+(( emf_unplaced > 0 )) ||
+  fail "no launch was exported as unplaced, though a step took every worker out of placement: a fleet with nowhere to put a launch is going uncounted"
+emf_bad_unplaced=$(jq -s '[.[] | select(.Worker == "unplaced" and .Outcome == "ok")] | length' "$EMF_CAPTURE")
+(( emf_bad_unplaced == 0 )) ||
+  fail "$emf_bad_unplaced unplaced record(s) claim to have succeeded"
+for w in $(jq -r '.WorkerIP // empty' "$EMF_CAPTURE" | sort -u); do
+  [[ -n "${PUBLIC[$w]:-}" ]] ||
+    fail "a record carries WorkerIP '$w', which is not an address in this fleet"
+done
+
+emf_ok=$(jq -s '[.[] | select(.Outcome == "ok")] | length' "$EMF_CAPTURE")
+(( emf_ok > 0 )) || fail "no successful launch was exported, though this run made many"
+emf_slowest=$(jq -s '[.[] | select(.Outcome == "ok") | .LaunchDuration] | max' "$EMF_CAPTURE")
+(( emf_slowest > 0 )) ||
+  fail "every exported launch reports a duration of 0ms: the stages are not being timed"
+
+# A refusal is counted but never timed. Publishing its duration would drag
+# every quantile down and make a daemon turning work away look like the
+# fastest in the fleet, so a failed record must carry LaunchFailed and nothing
+# else.
+emf_failed=$(jq -s '[.[] | select(.Outcome != "ok")] | length' "$EMF_CAPTURE")
+if (( emf_failed > 0 )); then
+  emf_failed_metrics=$(jq -r 'select(.Outcome != "ok") | ._aws.CloudWatchMetrics[].Metrics[].Name' "$EMF_CAPTURE" |
+    sort -u | tr '\n' ' ')
+  [[ "$emf_failed_metrics" == "LaunchFailed " ]] ||
+    fail "refused launches published '$emf_failed_metrics'; only LaunchFailed belongs on a failure"
+fi
+
+# The context that makes one record answer for itself rather than having to be
+# correlated against everything else that was running.
+emf_ctx=$(jq -s '[.[] | select(has("Waiting") and has("SlotsBusy") and has("ImagePulled") and has("Outcome"))] | length' "$EMF_CAPTURE")
+[[ "$emf_ctx" == "$emf_values" ]] ||
+  fail "only $emf_ctx of $emf_values records carry the daemon context (Waiting, SlotsBusy, ImagePulled, Outcome)"
+
+# What corkd says about itself has to agree with what left it. The ring counts
+# only the launches the platform asked for, and only since the last restart --
+# this run restarts corkd -- so the socket must have seen at least as many.
+for ip in "${WORKER_IPS[@]}"; do
+  ring=$(api GET /workers | jq -r --arg ip "$ip" '.[] | select(.ip==$ip) | .launch.count')
+  [[ -n "$ring" && "$ring" != "null" ]] || fail "worker $ip reports no launch summary at all"
+  sent=$(jq -s --arg ip "$ip" '[.[] | select(.WorkerIP == $ip and .Trigger == "request")] | length' "$EMF_CAPTURE")
+  (( sent >= ring )) ||
+    fail "worker $ip summarises $ring launches but only $sent request records reached the socket"
+done
+emf_restarts=$(jq -s '[.[] | select(.Trigger == "restart")] | length' "$EMF_CAPTURE")
+emf_pulls=$(jq -s '[.[] | select(.ImagePulled)] | length' "$EMF_CAPTURE")
+note "$emf_values records: $emf_ok succeeded, $emf_failed refused, $emf_restarts from rebuild restarts, $emf_pulls paid for a pull; slowest ${emf_slowest}ms"
+cork worker-list | sed 's/^/       /'
+ok "every launch left corkd as well-formed embedded metric format, and worker-list agrees with the socket"
+
+# ------------- 15j. the agent going away costs launches nothing
+
+step "losing the CloudWatch agent: with nothing on the socket, corkd keeps orchestrating and keeps its own summary"
+emf_before=$(wc -l <"$EMF_CAPTURE")
+emf_ring_before=0
+for ip in "${WORKER_IPS[@]}"; do
+  emf_ring_before=$(( emf_ring_before + $(api GET /workers | jq -r --arg ip "$ip" '.[] | select(.ip==$ip) | .launch.count') ))
+done
+# The stand-in polls for this on a one second socket timeout. That it really
+# stopped listening is not taken on trust: the record count below has to stand
+# still, or this step proved nothing.
+touch "$EMF_CAPTURE.stop"
+sleep 3
+note "the agent is gone; every export from here draws a refusal instead"
+
+# Three, not one: a connected UDP socket reports the refusal of the previous
+# write, so the first launch after the socket dies still succeeds at the write
+# and only the second sees the ICMP. All three must be served regardless.
+for i in 91 92 93; do
+  inst=$(launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i") ||
+    fail "launch $i was refused with the agent socket down: the export is not isolated from orchestration"
+  id=$(jq -r .id <<<"$inst")
+  [[ -n "$id" && "$id" != "null" ]] || fail "launch $i returned no instance id"
+  track "$inst" "$i"
+  # Serving its own environment and the build's flag, not merely recorded: the
+  # claim is that players are unaffected, and only the challenge answering
+  # shows that.
+  check_ondemand "$inst" "$i"
+done
+[[ "$(api_status GET /version)" == 200 ]] || fail "corkd stopped answering after the agent went away"
+
+# The local view is not the export, and must survive it: worker-list is what
+# an operator reads on a box with no agent beside it.
+emf_ring_after=0
+for ip in "${WORKER_IPS[@]}"; do
+  emf_ring_after=$(( emf_ring_after + $(api GET /workers | jq -r --arg ip "$ip" '.[] | select(.ip==$ip) | .launch.count') ))
+done
+(( emf_ring_after >= emf_ring_before + 3 )) ||
+  fail "corkd summarised $emf_ring_before launches before the agent died and $emf_ring_after after three more; the ring stopped when the socket did"
+emf_after=$(wc -l <"$EMF_CAPTURE")
+(( emf_after - emf_before <= 1 )) ||
+  fail "$(( emf_after - emf_before )) records arrived after the stand-in was told to exit; it is still listening and this step proved nothing"
+cork worker-list | sed 's/^/       /'
+ok "three launches served with the agent socket dead; corkd healthy, and its own launch summary still keeping count"
+
 # -------------------------------------------------------------- 16. teardown
 
 step "teardown: stop the remaining on-demand instances, remove the schema, check the workers, builder, and registry are clean"

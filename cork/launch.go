@@ -65,6 +65,18 @@ type launchLimits struct {
 	slotWait      time.Duration // zero waits as long as it takes
 	pullTimeout   time.Duration
 	imagesEnsured bool // the caller ran ensureImages itself (a restart pulls before its teardown)
+	// restart marks a launch the schema converge created rather than one the
+	// platform asked for. No player is waiting on it, so it is kept out of
+	// the per-worker ring: a rebuild of a large corpus would otherwise flush
+	// several hundred restarts through a 256-sample window and leave
+	// worker-list describing restarts for a while. It is still exported,
+	// under Trigger, where it can be asked for or excluded.
+	restart bool
+	// What the caller's own ensureImages cost, when imagesEnsured. Without
+	// it a restart reports no image time however cold its pull was, since
+	// the pull happened before the launch it belongs to began.
+	ensuredImageWait time.Duration
+	ensuredPulled    bool
 }
 
 // restartPullTimeout is the pull ceiling of a restart during a rebuild; the
@@ -77,7 +89,7 @@ func (m *Manager) requestLimits() launchLimits {
 }
 
 func (m *Manager) restartLimits() launchLimits {
-	return launchLimits{slotWait: 0, pullTimeout: max(restartPullTimeout, m.timing().pullTimeout)}
+	return launchLimits{slotWait: 0, pullTimeout: max(restartPullTimeout, m.timing().pullTimeout), restart: true}
 }
 
 // launch brings an instance up on its daemon within limits: images, network,
@@ -91,8 +103,21 @@ func (m *Manager) restartLimits() launchLimits {
 // (launchFailure).
 func (m *Manager) launch(build *BuildMetadata, instance *InstanceMetadata, netOpts NetworkOptions,
 	opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string, limits launchLimits) (started bool, err error) {
-	started, err = m.launchStages(build, instance, netOpts, opts, envVars, revPortMap, limits)
-	return started, m.launchFailure(instance, err)
+	// Timed from out here rather than inside launchStages so that the sample
+	// records the error the caller is actually given: launchFailure below
+	// turns a generic failure against a worker that has since been given up
+	// on into an unreachable one, and a docker call that timed out against a
+	// worker that kept its place into a busy one. A sample taken any earlier
+	// would file both under "error" and lose the distinctions the platform
+	// retries on. finish runs on every path (see launchmetrics.go).
+	t := m.beginLaunch(build, instance, limits)
+	defer func() { t.finish(err) }()
+
+	started, err = m.launchStages(t, build, instance, netOpts, opts, envVars, revPortMap, limits)
+	// Assigned rather than returned straight out: the deferred finish above
+	// reads the named return, so it has to be the reclassified error.
+	err = m.launchFailure(instance, err)
+	return started, err
 }
 
 // launchFailure marks a launch failure the platform's retry should be placed
@@ -114,7 +139,7 @@ func (m *Manager) launchFailure(instance *InstanceMetadata, err error) error {
 	return err
 }
 
-func (m *Manager) launchStages(build *BuildMetadata, instance *InstanceMetadata, netOpts NetworkOptions,
+func (m *Manager) launchStages(t *launchTimer, build *BuildMetadata, instance *InstanceMetadata, netOpts NetworkOptions,
 	opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string, limits launchLimits) (bool, error) {
 	cli, err := m.instanceClient(instance)
 	if err != nil {
@@ -123,10 +148,13 @@ func (m *Manager) launchStages(build *BuildMetadata, instance *InstanceMetadata,
 	if instance.Worker != "" && m.workerUnreachable(instance.Worker) {
 		return false, fmt.Errorf("%w: worker %s, before the launch of instance %d", ErrWorkerUnreachable, instance.Worker, instance.Id)
 	}
-	if err := m.ensureImages(cli, build, instance, limits); err != nil {
+	pulled, err := m.ensureImages(cli, build, instance, limits)
+	t.images(pulled)
+	if err != nil {
 		return false, err
 	}
 	release, err := m.acquireLaunchSlot(m.daemonQueue(instance), instance, limits.slotWait)
+	t.slot()
 	if err != nil {
 		return false, err
 	}
@@ -134,16 +162,24 @@ func (m *Manager) launchStages(build *BuildMetadata, instance *InstanceMetadata,
 	if err := m.startNetwork(instance, netOpts); err != nil {
 		return true, err
 	}
-	return true, m.startContainers(build, instance, opts, envVars, revPortMap, limits)
+	t.network()
+	err = m.startContainers(build, instance, opts, envVars, revPortMap, limits)
+	t.containers()
+	return true, err
 }
 
 // ensureImages makes sure the daemon holds every image of the build, each
 // pull under the limits' pull timeout, unless the caller already did
 // (limits.imagesEnsured). Registry mode only: without a registry the daemon
 // built the images itself.
-func (m *Manager) ensureImages(cli *client.Client, build *BuildMetadata, instance *InstanceMetadata, limits launchLimits) error {
+//
+// pulled reports whether anything was actually fetched, which is what
+// separates a cold launch from a warm one in the metrics: the first launch
+// of an image on a worker pays for the pull and the rest do not, and without
+// this the two are indistinguishable in the latency.
+func (m *Manager) ensureImages(cli *client.Client, build *BuildMetadata, instance *InstanceMetadata, limits launchLimits) (pulled bool, err error) {
 	if limits.imagesEnsured || m.challengeRegistry == "" {
-		return nil
+		return false, nil
 	}
 	for _, image := range build.Images {
 		if image.Host == "builder" {
@@ -152,7 +188,7 @@ func (m *Manager) ensureImages(cli *client.Client, build *BuildMetadata, instanc
 		name := m.instanceImageName(build.Challenge, build, image)
 		present, err := m.imagePresent(cli, instance.Worker, name)
 		if err != nil {
-			return err
+			return pulled, err
 		}
 		if present {
 			continue
@@ -165,10 +201,11 @@ func (m *Manager) ensureImages(cli *client.Client, build *BuildMetadata, instanc
 			if !errors.Is(err, ErrPullTimeout) {
 				m.noteWorkerTransportError(instance.Worker, cli, err)
 			}
-			return err
+			return pulled, err
 		}
+		pulled = true
 	}
-	return nil
+	return pulled, nil
 }
 
 // imagePresent reports whether the daemon already holds the tag, in which

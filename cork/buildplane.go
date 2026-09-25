@@ -106,6 +106,9 @@ var orchestratorOnlySettings = []string{
 	WORKER_TIMEOUT_WINDOW_ENV,
 	WORKER_PULL_TIMEOUT_ENV,
 	WORKER_LAUNCH_WAIT_ENV,
+	EMF_ENDPOINT_ENV,
+	EMF_LOG_GROUP_ENV,
+	EMF_NAMESPACE_ENV,
 }
 
 // BuildPlane reports the configured build plane, BuildPlaneLocal or
