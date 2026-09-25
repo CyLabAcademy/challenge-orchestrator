@@ -1,6 +1,7 @@
 package cork
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -36,8 +37,9 @@ import (
 // and its recent pace, is refused before anything is recorded (admit).
 
 var (
-	// ErrWorkerBusy: no slot on the instance's daemon within the wait.
-	// Retryable (corkd answers 503 with Retry-After).
+	// ErrWorkerBusy: no slot on the instance's daemon within the wait, or a
+	// docker call timed out against a daemon slow rather than gone (see
+	// launchFailure). Retryable (corkd answers 503 with Retry-After).
 	ErrWorkerBusy = errors.New("worker is busy")
 	// ErrWorkerUnreachable: the instance's worker stopped answering between
 	// placement and the launch stage. Retryable: placement now skips it, and
@@ -85,15 +87,31 @@ func (m *Manager) restartLimits() launchLimits {
 // pull failed, no slot within the wait) left nothing on the daemon, so its
 // caller can clear the instance's records without a docker round trip,
 // which against a wedged daemon would cost another control timeout. A
-// failure that leaves the worker unreachable (its hung call is what ejected it) is
-// reported as ErrWorkerUnreachable: the platform's retry is placed elsewhere.
+// failure the platform should simply place again is reported as such
+// (launchFailure).
 func (m *Manager) launch(build *BuildMetadata, instance *InstanceMetadata, netOpts NetworkOptions,
 	opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string, limits launchLimits) (started bool, err error) {
 	started, err = m.launchStages(build, instance, netOpts, opts, envVars, revPortMap, limits)
-	if err != nil && !errors.Is(err, ErrWorkerUnreachable) && instance.Worker != "" && m.workerUnreachable(instance.Worker) {
-		err = fmt.Errorf("%w: worker %s, during the launch of instance %d: %v", ErrWorkerUnreachable, instance.Worker, instance.Id, err)
+	return started, m.launchFailure(instance, err)
+}
+
+// launchFailure marks a launch failure the platform's retry should be placed
+// elsewhere for. One that left the worker unreachable (its hung call is what
+// ejected it) is ErrWorkerUnreachable. One that timed a docker call out
+// against a daemon that kept its place -- slow, but answering pings
+// (noteWorkerTransportError) -- is ErrWorkerBusy. Anything else is reported
+// as it was.
+func (m *Manager) launchFailure(instance *InstanceMetadata, err error) error {
+	if err == nil || instance.Worker == "" || errors.Is(err, ErrWorkerUnreachable) {
+		return err
 	}
-	return started, err
+	if m.workerUnreachable(instance.Worker) {
+		return fmt.Errorf("%w: worker %s, during the launch of instance %d: %v", ErrWorkerUnreachable, instance.Worker, instance.Id, err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrWorkerBusy) {
+		return fmt.Errorf("%w: worker %s timed out a docker call during the launch of instance %d: %v", ErrWorkerBusy, instance.Worker, instance.Id, err)
+	}
+	return err
 }
 
 func (m *Manager) launchStages(build *BuildMetadata, instance *InstanceMetadata, netOpts NetworkOptions,

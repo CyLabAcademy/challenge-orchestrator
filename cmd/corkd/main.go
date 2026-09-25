@@ -26,9 +26,10 @@ type state struct {
 // the probes recover from without anyone intervening. Every worker having
 // been taken down by an operator is not going to resolve itself, so it stays
 // a 500 (ErrAllWorkersDown is deliberately absent here). A launch refused by
-// its own worker -- no slot in time, the worker stopped answering under it,
-// or its image pull timed out -- is retryable too, as is one that lost the
-// race for the database's write lock: the retry is placed afresh.
+// its own worker -- no slot in time, a docker call timed out on a slow one,
+// the worker stopped answering under it, or its image pull timed out -- is
+// retryable too, as is one that lost the race for the database's write lock:
+// the retry is placed afresh.
 var retryableLaunch = []error{
 	cork.ErrAllWorkersOverloaded,
 	cork.ErrAllWorkersUnresponsive,
@@ -232,10 +233,18 @@ Relevant environment variables:
       then run clean to have one ejection forgiven (defaults to '5m').
 
   CORK_WORKER_CONTROL_TIMEOUT - ceiling for one container or network call to
-      a worker's docker daemon (defaults to '30s'); a call that hits it, or
-      fails at the connection level, ejects the worker at once. One failure is
-      enough because it is evidence already paid for, about the daemon that
-      matters -- and because the ejection reverses itself.
+      a worker's docker daemon (defaults to '30s'). A call that fails at the
+      connection level ejects the worker at once. One that hits the timeout
+      has cork ping the daemon: no answer ejects it at once too, but a daemon
+      that answers is slow rather than gone -- dockerd blocks every create
+      while it deletes an evicted image -- and stays in placement.
+
+  CORK_WORKER_TIMEOUTS_TO_EJECT, CORK_WORKER_TIMEOUT_WINDOW - how many
+      separate stalls, against a daemon that still answers pings, eject the
+      worker, and within what window (defaults to 3 within '2m'). One stall
+      counts once however many calls it times out; stalls are a control
+      timeout apart at least. That pattern is a daemon wedged underneath a
+      /_ping that answers.
 
   CORK_WORKER_PULL_TIMEOUT - ceiling for one image pull before a launch
       (defaults to '30s'); a pull that hits it fails that launch as
@@ -351,7 +360,8 @@ Workers:
   is refused as soon as its worker stops being reachable; all three answer 503
   with Retry-After so the platform's retry is placed afresh. A stop whose
   worker hangs mid-way clears the records once the worker is ejected and
-  returns success. Stops wait
+  returns success, and so does one whose teardown times out against a daemon
+  that is only slow; docker-reaper removes what it left. Stops wait
   for a teardown slot on their worker as long as it takes, since a stop must
   go through, so a deluge of them queues in corkd, bounded, rather than
   inside dockerd.

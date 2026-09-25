@@ -3,8 +3,12 @@ package cork
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -203,6 +207,190 @@ func TestTransportErrorSparesAnUnreconciledWorker(t *testing.T) {
 	}
 }
 
+// answeringDaemon is a docker daemon that answers /_ping at once and hands
+// every other request to other, or a 404 when that is nil: alive, and as slow
+// as other makes it, like one deleting an evicted image.
+func answeringDaemon(t *testing.T, other http.HandlerFunc) *client.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/_ping") {
+			w.Header().Set("Api-Version", "1.44")
+			_, _ = w.Write([]byte("OK"))
+			return
+		}
+		if other != nil {
+			other(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	cli, err := client.NewClientWithOpts(client.WithHost("tcp://"+srv.Listener.Addr().String()), client.WithVersion("1.44"))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
+
+// One image removal blocks every create, remove and image inspect on the
+// daemon, so on a busy worker it times out many calls together. That is one
+// stall against a daemon still answering pings: slow, not dead, and the worker
+// stays in placement however many calls it took with it. The probe is still
+// woken.
+func TestOneStallKeepsTheWorkerHoweverManyCallsItTimesOut(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED), ctx: context.Background()}
+	w := testWorkerConn(workerReachableOk)
+	w.reconciled.Store(true)
+	w.cli = answeringDaemon(t, nil)
+	m.workers = map[string]*workerConn{w.ip: w}
+	timedOut := fmt.Errorf("inspecting image: %w", context.DeadlineExceeded)
+
+	for i := 1; i <= 3*defaultWorkerTiming.timeoutsToEject; i++ {
+		m.noteWorkerTransportError(w.ip, w.cli, timedOut)
+		if got := reachableOf(w); got != workerReachableOk {
+			t.Fatalf("call %d timed out by one stall ejected the worker: %s", i, got)
+		}
+		select {
+		case <-w.probeNow:
+		default:
+			t.Fatalf("timeout %d did not wake the probe", i)
+		}
+	}
+}
+
+// Separate stalls do add up, and enough of them within the window eject: a
+// daemon wedged underneath a /_ping that answers.
+func TestSeparateStallsEjectTheWorker(t *testing.T) {
+	timing := defaultWorkerTiming
+	timing.controlTimeout = time.Nanosecond // every timeout is a stall of its own
+	m := &Manager{log: newLogger(DISABLED), ctx: context.Background(), workerTiming: timing}
+	w := testWorkerConn(workerReachableOk)
+	w.reconciled.Store(true)
+	w.cli = answeringDaemon(t, nil)
+	m.workers = map[string]*workerConn{w.ip: w}
+	timedOut := fmt.Errorf("creating container: %w", context.DeadlineExceeded)
+
+	limit := timing.timeoutsToEject
+	for i := 1; i < limit; i++ {
+		m.noteWorkerTransportError(w.ip, w.cli, timedOut)
+		if got := reachableOf(w); got != workerReachableOk {
+			t.Fatalf("stall %d of %d ejected the worker: %s", i, limit, got)
+		}
+	}
+	m.noteWorkerTransportError(w.ip, w.cli, timedOut)
+	if got := reachableOf(w); got != workerUnresponsive {
+		t.Fatalf("reachable %s after %d stalls within the window, want unresponsive", got, limit)
+	}
+}
+
+// A timeout against a daemon that does not answer a ping either is the hung
+// daemon the timeout was always meant to catch, and ejects at once -- which is
+// what lets a stop against it clear its records instead of failing.
+func TestATimeoutAgainstASilentDaemonEjectsAtOnce(t *testing.T) {
+	m := &Manager{log: newLogger(DISABLED), ctx: context.Background()}
+	w := testWorkerConn(workerReachableOk) // its client dials a port nothing listens on
+	w.reconciled.Store(true)
+	m.workers = map[string]*workerConn{w.ip: w}
+
+	m.noteWorkerTransportError(w.ip, w.cli, fmt.Errorf("creating container: %w", context.DeadlineExceeded))
+	if got := reachableOf(w); got != workerUnresponsive {
+		t.Fatalf("reachable %s after a timeout against a daemon that does not answer pings, want unresponsive", got)
+	}
+}
+
+// A timeout within one call timeout of the last one counted belongs to the
+// same stall; only stalls within the window count; an ejection starts the
+// count again.
+func TestTimeoutsCountStallsWithinTheWindow(t *testing.T) {
+	w := testWorkerConn(workerReachableOk)
+	start := time.Unix(1_000_000, 0)
+	callTimeout, window := 30*time.Second, 2*time.Minute
+	for _, step := range []struct {
+		after time.Duration
+		n     int
+		eject bool
+	}{
+		{0, 1, false},
+		{10 * time.Second, 1, false}, // in flight when the first fired: the same stall
+		{29 * time.Second, 1, false},
+		{40 * time.Second, 2, false},
+		{2*time.Minute + time.Second, 2, false}, // the first has aged out
+		{2*time.Minute + 31*time.Second, 3, true},
+		{2*time.Minute + 32*time.Second, 1, false}, // counted afresh after an ejection
+	} {
+		n, eject := w.noteTimeout(start.Add(step.after), callTimeout, window, 3)
+		if n != step.n || eject != step.eject {
+			t.Fatalf("at +%s: got (%d, %t), want (%d, %t)", step.after, n, eject, step.n, step.eject)
+		}
+	}
+}
+
+// A stop whose removals time out against a daemon that answers pings keeps
+// the worker and succeeds: the platform does not retry a failed stop, dockerd
+// finishes a forced removal it was sent, and docker-reaper takes what is left.
+// Every container is still attempted, since each one left running holds its
+// port, and so is the network, which does not wait on the layer store.
+func TestStopInstanceSucceedsAgainstASlowDaemon(t *testing.T) {
+	var containerRemovals, networkRemovals atomic.Int32
+	m := setupTestManager(t)
+	t.Cleanup(func() { m.db.Close() })
+	m.ctx = context.Background()
+	timing := defaultWorkerTiming
+	timing.controlTimeout = 100 * time.Millisecond
+	m.workerTiming = timing
+
+	w := testWorkerConn(workerReachableOk)
+	w.reconciled.Store(true)
+	w.queue = newDaemonQueue(2)
+	w.cli = answeringDaemon(t, func(rw http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/containers/"):
+			containerRemovals.Add(1)
+			time.Sleep(300 * time.Millisecond) // behind an image removal
+			rw.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/networks/"):
+			networkRemovals.Add(1)
+			rw.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(rw, r)
+		}
+	})
+	m.workers = map[string]*workerConn{w.ip: w}
+
+	challenge := testChallenge("test/slow-stop", 0)
+	if errs := m.addChallenges([]*ChallengeMetadata{challenge}); len(errs) > 0 {
+		t.Fatalf("addChallenges: %v", errs)
+	}
+	build := insertTestBuild(t, m, "event", string(challenge.Id), "flag{%s}", 1, 0x1111)
+	res, err := m.db.Exec("INSERT INTO instances(build, is_finalized, worker) VALUES (?, 1, ?);", build, w.ip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+
+	instance := &InstanceMetadata{Id: InstanceId(id), Build: build, Worker: w.ip, Containers: []string{"first", "second"}}
+	if err := m.stopInstance(instance); err != nil {
+		t.Fatalf("a stop against a slow daemon failed: %s", err)
+	}
+	var rows int
+	if err := m.db.Get(&rows, "SELECT COUNT(1) FROM instances WHERE id = ?;", id); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatal("the instance's records were not cleared")
+	}
+	if got := containerRemovals.Load(); got != 2 {
+		t.Fatalf("%d of 2 container removals were attempted", got)
+	}
+	if got := networkRemovals.Load(); got != 1 {
+		t.Fatalf("%d network removals were attempted, want 1", got)
+	}
+	if got := reachableOf(w); got != workerReachableOk {
+		t.Fatalf("a slow stop ejected the worker: %s", got)
+	}
+}
+
 // A worker's connection is rebuilt whenever it comes back: by worker-add, and
 // by the probe recovering it. A call that was already in flight on the old one
 // can fail long afterwards -- a hung call runs to the transport timeout -- and
@@ -317,6 +505,8 @@ func TestWorkerTimingFromEnv(t *testing.T) {
 	t.Setenv(WORKER_RECOVER_BACKOFF_MAX_ENV, "9s")
 	t.Setenv(WORKER_EJECTION_DECAY_ENV, "7m")
 	t.Setenv(WORKER_CONTROL_TIMEOUT_ENV, "3s")
+	t.Setenv(WORKER_TIMEOUTS_TO_EJECT_ENV, "4")
+	t.Setenv(WORKER_TIMEOUT_WINDOW_ENV, "90s")
 	t.Setenv(WORKER_PULL_TIMEOUT_ENV, "1m")
 	t.Setenv(WORKER_LAUNCH_WAIT_ENV, "2s")
 	want := workerTiming{
@@ -331,6 +521,8 @@ func TestWorkerTimingFromEnv(t *testing.T) {
 		recoverBackoffMax: 9 * time.Second,
 		ejectionDecay:     7 * time.Minute,
 		controlTimeout:    3 * time.Second,
+		timeoutsToEject:   4,
+		timeoutWindow:     90 * time.Second,
 		pullTimeout:       time.Minute,
 		launchWait:        2 * time.Second,
 	}

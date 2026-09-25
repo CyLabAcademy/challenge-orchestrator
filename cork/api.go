@@ -1,6 +1,7 @@
 package cork
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -549,6 +550,15 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 		// success now rather than from a second attempt.
 		if m.unreachable(instance) {
 			m.log.warnf("worker %s stopped answering during the stop of instance %d: clearing its records without further docker teardown", instance.Worker, instance.Id)
+			return m.removeInstanceMetadata(instance.Id)
+		}
+		// A removal that timed out against a daemon that kept its place: slow,
+		// not gone, and the timeout has already counted against it. dockerd
+		// finishes a forced removal it has been sent, and docker-reaper takes
+		// what is left, so the stop succeeds rather than failing a caller
+		// that does not retry.
+		if errors.Is(err, context.DeadlineExceeded) {
+			m.log.warnf("worker %s timed out tearing down instance %d: clearing its records; docker-reaper removes anything the teardown left: %s", instance.Worker, instance.Id, err)
 			return m.removeInstanceMetadata(instance.Id)
 		}
 		return err

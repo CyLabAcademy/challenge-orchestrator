@@ -1,7 +1,9 @@
 package cork
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -104,6 +106,34 @@ func TestRestartLimitsAndTransportTimeout(t *testing.T) {
 	m.workerTiming = m.workerTimingFromEnv()
 	if got := m.transportTimeout(); got != 20*time.Minute {
 		t.Fatalf("transport timeout %s, want the control timeout", got)
+	}
+}
+
+// A launch that timed a docker call out is one the platform should place
+// again: ErrWorkerUnreachable when the worker was ejected over it, and
+// ErrWorkerBusy when its daemon answered the ping and kept its place. Without
+// the second, a slow daemon's timeout would reach the platform as a 500 it
+// does not retry. Anything else is reported as it was.
+func TestLaunchFailureMakesATimeoutRetryable(t *testing.T) {
+	w := testWorkerConn(workerReachableOk)
+	m := &Manager{log: newLogger(DISABLED), workers: map[string]*workerConn{w.ip: w}}
+	inst := &InstanceMetadata{Id: 7, Worker: w.ip}
+	timedOut := fmt.Errorf("creating container: %w", context.DeadlineExceeded)
+
+	if err := m.launchFailure(inst, timedOut); !errors.Is(err, ErrWorkerBusy) {
+		t.Fatalf("a timeout on a worker that kept its place: got %v, want ErrWorkerBusy", err)
+	}
+	other := errors.New("No such image: challenge:1")
+	if err := m.launchFailure(inst, other); err != other {
+		t.Fatalf("a failure that is not a timeout was changed: %v", err)
+	}
+	if err := m.launchFailure(inst, nil); err != nil {
+		t.Fatalf("success became %v", err)
+	}
+
+	m.eject(w, "a control call timed out and the daemon did not answer a ping")
+	if err := m.launchFailure(inst, timedOut); !errors.Is(err, ErrWorkerUnreachable) {
+		t.Fatalf("a timeout that ejected the worker: got %v, want ErrWorkerUnreachable", err)
 	}
 }
 

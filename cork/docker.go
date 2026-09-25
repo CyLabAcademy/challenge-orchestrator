@@ -1347,7 +1347,7 @@ func (m *Manager) teardown(instance *InstanceMetadata) error {
 	}
 	defer release()
 	cErr := m.stopContainers(instance)
-	if cErr != nil && isTransportError(cErr) {
+	if cErr != nil && isTransportError(cErr) && m.workerUnreachable(instance.Worker) {
 		return cErr
 	}
 	return errors.Join(cErr, m.stopNetwork(instance))
@@ -1683,9 +1683,11 @@ func (m *Manager) stopContainers(instance *InstanceMetadata) error {
 		m.log.errorf("failed to remove container: %s", rmErr)
 		m.noteWorkerTransportError(instance.Worker, cli, rmErr)
 		errs = append(errs, rmErr)
-		if isTransportError(rmErr) {
+		if isTransportError(rmErr) && m.workerUnreachable(instance.Worker) {
 			// The daemon is unreachable and the worker is down now;
-			// the remaining removals would only repeat the timeout.
+			// the remaining removals would only repeat the timeout. A
+			// daemon that timed out but kept its place is only slow, and
+			// the rest still hold their ports until they are removed.
 			break
 		}
 	}
