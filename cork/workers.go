@@ -383,6 +383,11 @@ type WorkerInfo struct {
 	Since     time.Time `json:"since"`
 	Reason    string    `json:"reason,omitempty"`
 	Instances int       `json:"instances"`
+	// Launch summarizes what launches on this worker have recently cost,
+	// from the daemon's ring (see launchmetrics.go). It is the same figure
+	// the CloudWatch export carries, kept here so that an operator on a box
+	// with no agent beside it -- an e2e run, the test VM -- can still see it.
+	Launch LaunchStats `json:"launch"`
 }
 
 // derivedHealth collapses the two axes onto the old single-axis vocabulary,
@@ -1346,27 +1351,55 @@ func (m *Manager) ListWorkers() ([]WorkerInfo, error) {
 		countMap[c.Worker] = c.N
 	}
 
+	// Snapshotted under the lock and summarized outside it. stats() allocates
+	// and sorts a ring per worker, and this runs on every GET /workers, which
+	// the autoscaler polls -- so doing that work here would hold workersMu for
+	// a whole fleet's worth of it. selectWorker takes the same lock for
+	// writing on every placement, and Go parks readers behind a waiting
+	// writer, so a slow pass here does not merely delay the poll: it stalls
+	// the launches whose own lookups queue up behind it.
+	type workerSnapshot struct {
+		ip, public, reason string
+		reachable          workerReachable
+		load               workerLoad
+		since              time.Time
+		launches           *launchRing
+	}
 	m.workersMu.RLock()
-	defer m.workersMu.RUnlock()
-
-	infos := make([]WorkerInfo, 0, len(m.workerOrder))
+	snaps := make([]workerSnapshot, 0, len(m.workerOrder))
 	for _, ip := range m.workerOrder {
 		w := m.workers[ip]
-		reachable := workerReachable(w.reachable.Load())
-		load := workerLoad(w.load.Load())
 		reason := ""
 		if r := w.reason.Load(); r != nil {
 			reason = *r
 		}
+		snap := workerSnapshot{
+			ip:        ip,
+			public:    w.public,
+			reason:    reason,
+			reachable: workerReachable(w.reachable.Load()),
+			load:      workerLoad(w.load.Load()),
+			since:     time.Unix(0, w.since.Load()),
+		}
+		if w.queue != nil {
+			snap.launches = &w.queue.launches
+		}
+		snaps = append(snaps, snap)
+	}
+	m.workersMu.RUnlock()
+
+	infos := make([]WorkerInfo, 0, len(snaps))
+	for _, snap := range snaps {
 		infos = append(infos, WorkerInfo{
-			IP:        ip,
-			Public:    w.public,
-			Health:    derivedHealth(reachable, load),
-			Reachable: reachable.String(),
-			Load:      load.String(),
-			Since:     time.Unix(0, w.since.Load()),
-			Reason:    reason,
-			Instances: countMap[ip],
+			IP:        snap.ip,
+			Public:    snap.public,
+			Health:    derivedHealth(snap.reachable, snap.load),
+			Reachable: snap.reachable.String(),
+			Load:      snap.load.String(),
+			Since:     snap.since,
+			Reason:    snap.reason,
+			Instances: countMap[snap.ip],
+			Launch:    snap.launches.stats(), // nil-safe
 		})
 	}
 	return infos, nil
@@ -1546,6 +1579,11 @@ type daemonQueue struct {
 	teardownSem chan struct{}
 	waiting     atomic.Int32 // launches waiting for a launch slot
 	holdNanos   atomic.Int64 // recent hold time of a launch slot (recordHold)
+	// launches holds this daemon's recent end-to-end launch durations, which
+	// worker-list summarizes (see launchmetrics.go). Separate from holdNanos:
+	// that estimates one stage and exists for admission, while this is what a
+	// launch actually cost the player who asked for it.
+	launches launchRing
 }
 
 func newDaemonQueue(slots int) *daemonQueue {
@@ -1593,6 +1631,21 @@ func (q *daemonQueue) expectedWait() (expected time.Duration, waiting int) {
 		return 0, waiting
 	}
 	return hold * time.Duration(ahead-slots+1) / time.Duration(slots), waiting
+}
+
+// workerDaemon returns the queue of the daemon hosting the instance and the
+// worker's player-facing name, under one lock. The name is "" for the local
+// daemon and for a worker registered without one.
+func (m *Manager) workerDaemon(instance *InstanceMetadata) (*daemonQueue, string) {
+	if instance.Worker == "" {
+		return m.localQueue, ""
+	}
+	m.workersMu.RLock()
+	defer m.workersMu.RUnlock()
+	if w, ok := m.workers[instance.Worker]; ok {
+		return w.queue, w.public
+	}
+	return m.localQueue, ""
 }
 
 // daemonQueue returns the queue of the daemon hosting the instance; each

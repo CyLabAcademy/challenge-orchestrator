@@ -46,13 +46,28 @@ type ChallengeListElement struct {
 }
 
 type WorkerInfo struct {
-	IP        string    `json:"ip"`
-	Public    string    `json:"public"`
-	Reachable string    `json:"reachable"`
-	Load      string    `json:"load"`
-	Since     time.Time `json:"since"`
-	Reason    string    `json:"reason"`
-	Instances int       `json:"instances"`
+	IP        string      `json:"ip"`
+	Public    string      `json:"public"`
+	Reachable string      `json:"reachable"`
+	Load      string      `json:"load"`
+	Since     time.Time   `json:"since"`
+	Reason    string      `json:"reason"`
+	Instances int         `json:"instances"`
+	Launch    LaunchStats `json:"launch"`
+}
+
+// LaunchStats mirrors the server's summary of what launches on a worker have
+// recently cost. Declared here rather than imported for the same reason the
+// struct above is: the CLI decodes the API's JSON, and holding its own view
+// of it is what keeps a client built against one release readable by the
+// next -- an older CLI simply leaves this zero.
+type LaunchStats struct {
+	Count   int64 `json:"count"`
+	Failed  int64 `json:"failed"`
+	Samples int64 `json:"samples"`
+	P50Ms   int64 `json:"p50_ms"`
+	P90Ms   int64 `json:"p90_ms"`
+	MaxMs   int64 `json:"max_ms"`
 }
 
 func runtimeError(err error) int {
@@ -432,13 +447,46 @@ func workerListCommand(c *client, args []string) int {
 		if !worker.Since.IsZero() {
 			state += fmt.Sprintf(" %s", time.Since(worker.Since).Round(time.Second))
 		}
-		fmt.Printf("%-15s  public=%-30s  %-22s  load=%-10s  %d instances\n",
-			worker.IP, public, state, worker.Load, worker.Instances)
+		fmt.Printf("%-15s  public=%-30s  %-22s  load=%-10s  %d instances%s\n",
+			worker.IP, public, state, worker.Load, worker.Instances, launchSummary(worker.Launch))
 		if worker.Reason != "" {
 			fmt.Printf("%-15s  %s\n", "", worker.Reason)
 		}
 	}
 	return NO_ERROR
+}
+
+// launchSummary renders what launches on a worker have recently cost. The
+// quantiles come from a bounded ring on the daemon, so they describe its last
+// couple of hundred successful launches, while n is every launch the worker
+// has taken since corkd started -- which is why a worker that has gone quiet
+// can show a large n against quantiles measured some time ago.
+//
+// Nothing is printed for a worker that has taken no launches: a row of zeroes
+// reads like a fast worker rather than an unused one. A worker taking
+// launches and finishing none says that instead, for the same reason.
+func launchSummary(s LaunchStats) string {
+	if s.Count == 0 {
+		return ""
+	}
+	failed := ""
+	if s.Failed > 0 {
+		failed = fmt.Sprintf(" failed=%d", s.Failed)
+	}
+	if s.Samples == 0 {
+		return fmt.Sprintf("  launch=none succeeded n=%d%s", s.Count, failed)
+	}
+	return fmt.Sprintf("  launch=p50 %s/p90 %s/max %s n=%d%s",
+		shortMillis(s.P50Ms), shortMillis(s.P90Ms), shortMillis(s.MaxMs), s.Count, failed)
+}
+
+// shortMillis prints a duration the way an operator scanning a column reads
+// it: whole milliseconds under a second, then one decimal of seconds.
+func shortMillis(ms int64) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	return fmt.Sprintf("%.1fs", float64(ms)/1000)
 }
 
 // Other -------------------------------------------------------------------

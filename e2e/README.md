@@ -251,6 +251,41 @@ docker compose exec cork cork worker-add 172.28.0.12 worker-b   # recovery, once
 docker compose exec cork cork worker-remove 172.28.0.12         # purge it and its instance records
 ```
 
+## Known intermittent: a hollow record after the launch burst
+
+The burst step occasionally fails with
+
+```
+worker 172.28.0.12 records 7 instances after the burst, expected 6
+```
+
+one more instance recorded than the burst accepted. Rerun it; it is not a
+regression, and it is deliberately left alone.
+
+A launch refused for want of a slot clears its row with
+`clearInstanceRecords`, which logs a failed delete and carries on rather than
+failing a request that is already failing. corkd opens SQLite with
+`_busy_timeout=100`, so under eighteen concurrent launches a delete can lose
+the write lock inside that 100 ms and leave the row behind. The step asserts
+the count immediately, so it sees the row; the unfinalized-instance sweep
+(`cork/api.go`, crashed launches older than five minutes, on the one-minute
+prune interval) reclaims it shortly after. Look for `could not clear the
+records of instance N` in corkd's log to confirm that is what happened.
+
+It is not worth closing. The refusal comes from `acquireLaunchSlot` before the
+launch slot is taken, so nothing reached the daemon: no container, no network,
+nothing running on the worker. The row costs its port reservations for one
+sweep, and this fleet only feels that because `CORK_PORTS` here is thirty
+ports against production's 39,152. Placement is unaffected either way --
+`selectWorker` is round robin over the worker order and never reads instance
+counts -- and the platform never saw the instance, since the launch answered
+503 and handed out no id.
+
+The one real consequence is that `GET /workers` reports the worker one
+instance heavier until the sweep, which is the signal an autoscaling scale-in
+drain polls for zero. A hollow row can hold a draining box for a few extra
+minutes before it is terminated. That is the whole blast radius.
+
 ## Lifecycle
 
 `docker compose down` keeps the volumes: the PKI, the challenge tree, corkd's

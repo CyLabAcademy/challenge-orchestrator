@@ -185,6 +185,15 @@ services:
       # The scenario reads the same value (E2E_LAUNCH_WAIT_MS on the e2e
       # service below) instead of hard-coding it, so the two cannot drift.
       CORK_WORKER_LAUNCH_WAIT: ${E2E_LAUNCH_WAIT_MS:-500}ms
+      # Launch latency, exported the way the orchestrators do it: one embedded
+      # metric format datagram per launch to a CloudWatch agent on localhost.
+      # Here the far end is e2e/emf-stub.py, which the entrypoint starts and
+      # which writes what it receives to E2E_EMF_CAPTURE for the scenario to
+      # check. The address and the log group are production's.
+      CORK_EMF_ENDPOINT: 127.0.0.1:25888
+      CORK_EMF_LOG_GROUP: /cork/launches
+      # On the cork-data volume, which the e2e service also mounts.
+      E2E_EMF_CAPTURE: /var/lib/cork/emf.ndjson
     volumes:
       # The challenge tree lives in a volume so the scenario can edit a
       # challenge and run `update`; cork-entrypoint.sh seeds it from the

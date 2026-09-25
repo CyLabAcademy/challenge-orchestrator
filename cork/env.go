@@ -63,6 +63,7 @@ var settingNames = []string{
 	WORKER_TIMEOUT_WINDOW_ENV, WORKER_PULL_TIMEOUT_ENV, WORKER_LAUNCH_WAIT_ENV, BASE_PINS_ENV,
 	PURGE_AFTER_PUSH_ENV, BUILD_PLANE_ENV, maxArtifactFilesEnv,
 	maxArtifactBytesEnv, maxArtifactFileBytesEnv,
+	EMF_ENDPOINT_ENV, EMF_LOG_GROUP_ENV, EMF_NAMESPACE_ENV,
 }
 
 // legacySettingsInUse lists the pre-rename names of the settings present in

@@ -30,6 +30,10 @@ COPY --from=build /out/corkd /out/cork /out/cork-build /usr/local/bin/
 # scenario can check that they still answer.
 RUN ln -s corkd /usr/local/bin/cmgrd && ln -s cork /usr/local/bin/cmgrd-cli
 COPY e2e/cork-entrypoint.sh /usr/local/bin/cork-entrypoint.sh
+# The CloudWatch agent stand-in the entrypoint starts when E2E_EMF_CAPTURE is
+# set. Nothing outside the e2e has one; production points CORK_EMF_ENDPOINT at
+# the real agent on the same address.
+COPY e2e/emf-stub.py /usr/local/bin/emf-stub.py
 EXPOSE 4200
 ENTRYPOINT ["/usr/local/bin/cork-entrypoint.sh"]
 CMD ["corkd"]

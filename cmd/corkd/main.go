@@ -259,6 +259,41 @@ Relevant environment variables:
       waiting there and the daemon's recent pace, is refused the same way at
       once, before anything is recorded.
 
+  CORK_EMF_ENDPOINT - 'host:port' of a local CloudWatch agent listening for
+      embedded metric format (the agent's default is '127.0.0.1:25888', and
+      it listens once its config carries logs.metrics_collected.emf). When
+      set, corkd sends one datagram per launch carrying that launch's total
+      and its image, slot, network and container stages, plus the state of
+      the daemon it ran against -- how many launches were queued there, how
+      many slots were busy, whether the image had to be pulled. Each is
+      attributed to the worker's public address, falling back to the private
+      one when it has none; the private address rides along as a field, so
+      the machine behind a name is still in the record without paying for a
+      metric per machine. Unset, the
+      default, exports nothing; the same figures are still summarized per
+      worker in worker-list either way.
+
+      The export cannot delay a launch: the launch records its sample to a
+      bounded queue and an emitter goroutine owns the socket, so a slow,
+      wedged or absent agent is never waited on. A full queue drops samples
+      rather than blocking, and says so in the log once a minute.
+
+      An agent that is not answering is retried every 30s and complained
+      about every five minutes until it does, so a log read after a
+      missing-data alarm shows whether the export is still broken rather
+      than only that it once was. Recovery needs two writes in a row to
+      succeed, since a connected UDP socket reports the refusal of the
+      previous write; it then says the endpoint is accepting samples again.
+      Both are driven by launches arriving rather than a timer, so an idle
+      daemon stays quiet -- nothing is being lost there to report.
+
+  CORK_EMF_LOG_GROUP - the CloudWatch log group those records are filed
+      under (defaults to 'cork'). The agent takes it from each record, so
+      nothing in the agent's own config names it.
+
+  CORK_EMF_NAMESPACE - the CloudWatch namespace of the metrics extracted
+      from those records (defaults to 'cork').
+
   CORK_REGISTRY - the docker registry holding built challenge images; when
       set, images are pulled from it before each instance start (must match
       the value used by cork when building).
