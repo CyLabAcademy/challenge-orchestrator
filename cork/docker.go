@@ -1346,11 +1346,30 @@ func (m *Manager) teardown(instance *InstanceMetadata) error {
 		return err
 	}
 	defer release()
-	cErr := m.stopContainers(instance)
+	inFlight, cErr := m.stopContainers(instance)
 	if cErr != nil && isTransportError(cErr) && m.workerUnreachable(instance.Worker) {
 		return cErr
 	}
-	return errors.Join(cErr, m.stopNetwork(instance))
+	nErr := m.stopNetwork(instance)
+	if inFlight && errdefs.IsConflict(nErr) {
+		// The network still has an endpoint because a removal another
+		// teardown of this instance started has not landed yet -- stopContainers
+		// saw the 409 that says so. Normally that conflict is a real condition
+		// worth failing on; here there is positive evidence it is a race, and
+		// it clears itself within milliseconds.
+		//
+		// Left rather than waited for. Waiting would hold a teardown slot,
+		// and a rebuild's updateMu, for up to the control timeout (30s) at
+		// exactly the moment the fleet is busiest -- trading a failure that
+		// recovers for a stall that does not. The network costs nothing while
+		// it lasts: docker-reaper (--reap-networks) and reconcileWorker both
+		// clear a cmgr-<id> that cork no longer records, ids are never reused
+		// so no later launch wants this name, and the instance's ports are
+		// released with its rows.
+		m.log.warnf("left network %s behind: a container removal already in flight still holds it, and the reaper clears it", instance.getNetworkName())
+		nErr = nil
+	}
+	return errors.Join(cErr, nErr)
 }
 
 // portsAlreadyKnown reports whether every published port for an image already has
@@ -1641,10 +1660,14 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 	return retryableDB(m.finalizeInstance(instance))
 }
 
-func (m *Manager) stopContainers(instance *InstanceMetadata) error {
+// stopContainers removes the instance's containers. inFlight reports that at
+// least one was already being removed by another teardown of the same
+// instance, which is what tells the caller that a network still holding an
+// endpoint is a race rather than a leak.
+func (m *Manager) stopContainers(instance *InstanceMetadata) (inFlight bool, err error) {
 	cli, err := m.instanceClient(instance)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// Every failure is kept. A single reassigned err would let the next
 	// container's success erase the one before it, so a stop would report
@@ -1678,6 +1701,11 @@ func (m *Manager) stopContainers(instance *InstanceMetadata) error {
 		// real condition and not a benign race.
 		if errdefs.IsConflict(rmErr) {
 			m.log.warnf("skipped removing container (removal already in progress): %s", cid)
+			// Reported to teardown: in progress is not finished, so the
+			// container still holds its endpoint and the network removal
+			// that runs next will be refused. That refusal is the race, not
+			// a fault, and teardown needs this to tell them apart.
+			inFlight = true
 			continue
 		}
 		m.log.errorf("failed to remove container: %s", rmErr)
@@ -1696,7 +1724,7 @@ func (m *Manager) stopContainers(instance *InstanceMetadata) error {
 		errs = append(errs, retryableDB(mdErr))
 	}
 
-	return errors.Join(errs...)
+	return inFlight, errors.Join(errs...)
 }
 
 // replacedImages records the docker tags of a build generation superseded by
