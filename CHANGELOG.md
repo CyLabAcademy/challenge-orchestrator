@@ -5,60 +5,37 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] — 2026-09-25
 
 ### Added
 
-**Launch latency is measured and can be exported to CloudWatch.** cork timed
+**Launch latency is measured, and can be exported to CloudWatch.** cork timed
 nothing it did, so how long a player waited for a container was knowable only
-by reading the logs of one launch at a time, and not at all in aggregate. Each
-launch is now timed at the stage boundaries that already existed — the image
-check and pull, the wait for a launch slot, the network create, and the
-container create and start — and reported two ways.
+from the logs of one launch at a time, never in aggregate. Every launch is now
+timed at the stage boundaries that already existed: the image check and pull,
+the wait for a launch slot, the network create, and the container create and
+start.
 
-`cork worker-list` summarizes each worker's recent launches from a 256-sample
-ring on the daemon (`launch=p50 1.2s/p90 4.1s/max 8.4s n=340 failed=12`), and
-`GET /workers` carries the same figures under `launch`. This needs no
-configuration and works where CloudWatch does not: an e2e run, the test VM, or
-an operator on the box during an incident. Only successful launches are timed,
-but every launch is counted, so a worker refusing all of them reads as what it
-is rather than as a worker nothing is being sent to.
+`cork worker-list` summarizes each worker from a ring on its daemon
+(`launch=p50 1.2s/p90 4.1s/max 8.4s n=340 failed=12`), and `GET /workers`
+carries the same figures under `launch`. That needs no configuration, and works
+where CloudWatch does not — an e2e run, the test VM, an operator on the box
+mid-incident.
 
 Setting `CORK_EMF_ENDPOINT` to a local CloudWatch agent's embedded-metric-format
-socket also sends one record per launch, from which CloudWatch extracts
-`LaunchDuration` and `LaunchFailed` per worker and the four stages fleet-wide.
-A worker is identified by its player-facing name rather than the address corkd
-dials: on an autoscaled fleet that name is permanent per EIP slot, so a machine
-replaced from the AMI keeps its series instead of starting a new one under a
-new address. The machine is still in the record, as a field.
-A rebuild's restarts are exported too, marked `Trigger=restart`, but they are
-kept out of the per-worker ring: no player is waiting on one, and a rebuild of
-a large corpus would otherwise leave `worker-list` describing restarts.
-Because the records carry raw values rather than pre-aggregated ones, CloudWatch
-computes true percentiles from them — a mean launch time hides exactly the tail
-a player feels. Each record also carries what the daemon was doing when the
-launch was admitted: how many launches were queued there, how many slots were
-busy, and whether the image had to be pulled. That is what lets one slow launch
-be diagnosed on its own in Logs Insights, without correlating it against
-anything else; it is also context that is lost forever if aggregation happens
-before it leaves the box.
+socket additionally sends one record per launch, carrying the stage breakdown
+and what the daemon was doing at the time: launches queued, slots busy, whether
+the image had to be pulled. The records hold raw values, so CloudWatch computes
+true percentiles from them rather than a mean that hides the tail a player
+feels. A worker is named by its player-facing name, which an autoscaled fleet
+keeps permanent per slot, so a machine replaced from the AMI keeps its series.
 
-cork keeps no time series. A sample lives in the ring and in a bounded queue
-until the emitter has written it, and nothing else is stored.
-
-The export cannot slow a launch. The launching goroutine only reads the clock,
-inserts into the ring and makes a non-blocking queue send — 313ns and one
-allocation per launch, against a launch measured in seconds — while a separate
-goroutine owns the socket. A full queue drops samples rather than making a
-launch wait, and reports the loss once a minute rather than once a launch. An
-agent that is slow, wedged or not running is never waited on, and a panic in
-the exporter is caught rather than taking the daemon down with it: cork does
-not stop orchestrating because it could not describe what it was doing.
-
-The e2e covers both halves. It runs a stand-in for the agent on the address the
-real one uses, checks that every launch of a run arrives as well-formed
-embedded metric format, and then takes the agent away and shows three more
-instances launching and serving with nothing on the socket.
+cork keeps no time series, and the export cannot slow a launch: the launching
+goroutine only reads the clock, inserts into the ring and makes a non-blocking
+queue send, while a separate goroutine owns the socket. A full queue drops
+rather than waits, and an agent that is slow, wedged or absent is never waited
+on. Off unless an endpoint is configured; see `corkd --help` for
+`CORK_EMF_ENDPOINT`, `CORK_EMF_LOG_GROUP` and `CORK_EMF_NAMESPACE`.
 
 ### Fixed
 
@@ -73,6 +50,15 @@ stop logging Docker's colon-separator deprecation warning on every launch.
 
 `docker inspect` on new containers shows the `=` form; containers already
 running keep the colon form, which Docker still accepts, so nothing migrates.
+
+**A raced container removal no longer fails a rebuild.** When two teardowns of
+the same instance overlap — a stop the platform asked for, and a rebuild's own —
+the loser is told the removal is already in progress and moves on. But the
+container holds its endpoint for a few milliseconds more, so the network removal
+that follows was refused, and the whole `update-schema` failed with it. That
+conflict is now recognised as the race it is: the network is left to
+docker-reaper, which already clears a `cmgr-<id>` cork no longer records. A
+network still held for any other reason fails the stop exactly as before.
 
 **A worker is no longer ejected over one slow docker call.** Any call that hit
 `CORK_WORKER_CONTROL_TIMEOUT` took its worker out of placement, and a slow daemon
@@ -339,6 +325,7 @@ fallback goes, a build plane needs both.
 4. A single-host deployment needs no build plane: leave `CORK_BUILD_PLANE` unset
    and `corkd` builds on its own docker daemon, as cmgr did.
 
+[1.2.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.2.0
 [1.1.2]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.2
 [1.1.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.1
 [1.1.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.0
