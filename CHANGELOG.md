@@ -21,6 +21,21 @@ stop logging Docker's colon-separator deprecation warning on every launch.
 `docker inspect` on new containers shows the `=` form; containers already
 running keep the colon form, which Docker still accepts, so nothing migrates.
 
+**A worker is no longer ejected over one slow docker call.** Any call that hit
+`CORK_WORKER_CONTROL_TIMEOUT` took its worker out of placement, and a slow daemon
+is ordinary: while dockerd deletes an image, docker-reaper evicting one for
+space, every container create, remove and image check on that worker waits for
+it. A timeout now has cork ping the daemon. No answer ejects the worker at once,
+as before; an answer keeps it in placement until `CORK_WORKER_TIMEOUTS_TO_EJECT`
+separate stalls (3) land within `CORK_WORKER_TIMEOUT_WINDOW` (2m). One stall
+counts once, however many calls it timed out together. Refused and reset
+connections still eject at once.
+
+A launch that timed out that way answers 503 with Retry-After, so the platform
+places it again, rather than a 500. A stop that timed out that way succeeds, as a
+stop on an ejected worker always has: the records are cleared and docker-reaper
+removes whatever the teardown did not finish.
+
 ## [1.1.2] — 2026-09-23
 
 ### Fixed

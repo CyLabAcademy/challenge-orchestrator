@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -74,8 +75,17 @@ const (
 //     forgiven. A decay rather than a reset, so forgiveness is proportional
 //     to how badly the box has behaved.
 //   - controlTimeout: ceiling for one container/network API call. These
-//     normally finish in well under a second; a call that hangs this long
-//     means a wedged daemon, so it doubles as an ejection trigger.
+//     normally finish in well under a second, so one that hangs this long
+//     has cork ping the daemon at once: a daemon that does not answer is
+//     ejected there and then (noteWorkerTransportError).
+//   - timeoutsToEject / timeoutWindow: a daemon that times a control call
+//     out but still answers the ping is slow rather than gone -- dockerd
+//     holds its image and layer store locks for the whole of an image
+//     removal, and every create waits behind it -- so one such stall keeps
+//     it in placement, however many calls it times out. This many separate
+//     stalls within the window eject it: a daemon wedged underneath a /_ping
+//     that answers. Stalls are at least a controlTimeout apart, so the
+//     window has to span that many less one of them.
 //   - pullTimeout: ceiling for one image pull before a request-driven
 //     launch. Challenge images are tens of MB over a fast private network,
 //     so a pull that takes longer than this is already an incident: it fails
@@ -98,6 +108,8 @@ type workerTiming struct {
 	recoverBackoffMax time.Duration
 	ejectionDecay     time.Duration
 	controlTimeout    time.Duration
+	timeoutsToEject   int
+	timeoutWindow     time.Duration
 	pullTimeout       time.Duration
 	launchWait        time.Duration
 }
@@ -114,6 +126,8 @@ var defaultWorkerTiming = workerTiming{
 	recoverBackoffMax: 5 * time.Minute,
 	ejectionDecay:     5 * time.Minute,
 	controlTimeout:    30 * time.Second,
+	timeoutsToEject:   3,
+	timeoutWindow:     2 * time.Minute,
 	pullTimeout:       30 * time.Second,
 	launchWait:        10 * time.Second,
 }
@@ -133,11 +147,13 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 	m.envDuration(WORKER_RECOVER_BACKOFF_MAX_ENV, &t.recoverBackoffMax)
 	m.envDuration(WORKER_EJECTION_DECAY_ENV, &t.ejectionDecay)
 	m.envDuration(WORKER_CONTROL_TIMEOUT_ENV, &t.controlTimeout)
+	m.envDuration(WORKER_TIMEOUT_WINDOW_ENV, &t.timeoutWindow)
 	m.envDuration(WORKER_PULL_TIMEOUT_ENV, &t.pullTimeout)
 	m.envDuration(WORKER_LAUNCH_WAIT_ENV, &t.launchWait)
 	m.envCount(WORKER_MAX_MISSES_ENV, &t.maxMisses)
 	m.envCount(WORKER_LOAD_MISSES_ENV, &t.loadMisses)
 	m.envCount(WORKER_HEALTHY_THRESHOLD_ENV, &t.healthyThreshold)
+	m.envCount(WORKER_TIMEOUTS_TO_EJECT_ENV, &t.timeoutsToEject)
 	if t.pollInterval < minPollInterval {
 		m.log.warnf("worker poll interval %s is below the %s floor; using %s", t.pollInterval, minPollInterval, minPollInterval)
 		t.pollInterval = minPollInterval
@@ -147,6 +163,12 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 	// zero timeout means no timeout at all (http.Client).
 	m.clampProbeTimeout("poll", &t.pollTimeout, t.pollInterval)
 	m.clampProbeTimeout("ping", &t.pingTimeout, t.pollInterval)
+	if span := time.Duration(t.timeoutsToEject-1) * t.controlTimeout; t.timeoutsToEject > 1 && t.timeoutWindow <= span {
+		// Separate stalls are at least a control timeout apart (noteTimeout),
+		// so this many can never land inside the window.
+		m.log.warnf("%s %s cannot hold %d stalls a %s control timeout apart: a daemon that answers pings is never ejected for timing calls out, only by the probes",
+			WORKER_TIMEOUT_WINDOW_ENV, t.timeoutWindow, t.timeoutsToEject, t.controlTimeout)
+	}
 	if t.deepProbeInterval < t.pollInterval {
 		// The deep probe rides the same tick, so it cannot run more often
 		// than one.
@@ -155,11 +177,12 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 	if t != defaultWorkerTiming {
 		m.log.infof("worker timing: probe every %s (telemetry timeout %s, ping timeout %s, deep probe every %s), "+
 			"unresponsive after %d misses, load unknown after %d, recovered after %d good probes, "+
-			"recovery backoff %s (max %s), ejection decay %s, control timeout %s, pull timeout %s, launch wait %s",
+			"recovery backoff %s (max %s), ejection decay %s, control timeout %s (eject after %d answered by a ping within %s), "+
+			"pull timeout %s, launch wait %s",
 			t.pollInterval, t.pollTimeout, t.pingTimeout, t.deepProbeInterval,
 			t.maxMisses, t.loadMisses, t.healthyThreshold,
 			t.recoverBackoff, t.recoverBackoffMax, t.ejectionDecay,
-			t.controlTimeout, t.pullTimeout, t.launchWait)
+			t.controlTimeout, t.timeoutsToEject, t.timeoutWindow, t.pullTimeout, t.launchWait)
 	}
 	return t
 }
@@ -333,8 +356,12 @@ type workerConn struct {
 	// stop path to skip a docker teardown -- that is how a live container
 	// keeps serving with its records deleted. Only ejection is.
 	daemonFailed atomic.Bool
-	queue        *daemonQueue
-	done         chan struct{} // closed on removal/replacement to stop the poller
+	// timeouts holds when recent control calls timed out against a daemon
+	// that still answered a ping; see noteWorkerTransportError.
+	timeoutsMu sync.Mutex
+	timeouts   []time.Time
+	queue      *daemonQueue
+	done       chan struct{} // closed on removal/replacement to stop the poller
 	// probeNow nudges the poller to probe before its next tick, after a real
 	// control call has failed. Buffered and sent to without blocking, so a
 	// burst of failing launches costs one extra probe, not one each.
@@ -1021,13 +1048,19 @@ func (m *Manager) markWorkerDown(w *workerConn) {
 // failure on cli, the connection the call went out on, and asks its poller to
 // probe at once.
 //
-// One failure is enough, and deliberately so: a control call that failed is
-// evidence already paid for, about the daemon that actually matters, and
-// discarding it to wait for a synthetic probe would waste it. That is how
-// load balancers do it — eject on real traffic, probe only to cover hosts
-// that are not receiving any. What made this a hair trigger before was not
-// the single failure but the verdict being terminal; now that the worker
-// probes its own way back, being wrong costs a probe interval.
+// A refused, reset or unresolvable connection ejects at once: the daemon is
+// not there. A timeout alone does not, because it cannot tell a dead daemon
+// from a slow one, and a slow one is ordinary -- dockerd holds its image and
+// layer store locks while it deletes an image's files, so every create on the
+// worker waits out an image eviction. Ejecting on that wakes every launch
+// queued there and keeps the worker out for a recovery backoff, a reconcile
+// and escalating waits, all for a daemon that was about to answer. So a
+// timeout is settled with a ping, straight away: no answer ejects, as before,
+// and an answer keeps the worker in placement until timeoutsToEject separate
+// stalls land within timeoutWindow (noteTimeout), which is what a daemon
+// wedged underneath a live /_ping looks like. Either way the timeout was a
+// strike; a call that failed because what it acted on was already gone is an
+// API error, and never reaches here.
 //
 // API-level errors pass through untouched (see isTransportError).
 func (m *Manager) noteWorkerTransportError(worker string, cli *client.Client, err error) {
@@ -1057,12 +1090,55 @@ func (m *Manager) noteWorkerTransportError(worker string, cli *client.Client, er
 		m.log.debugf("worker %s: transport error before its first reconcile finished, leaving the verdict to the reconcile: %s", worker, err)
 		return
 	}
-	m.eject(w, "a control call failed: "+err.Error())
+	if errors.Is(err, context.DeadlineExceeded) {
+		t := m.timing()
+		if pingErr := m.pingWorker(w, t.pingTimeout); pingErr != nil {
+			m.eject(w, fmt.Sprintf("a control call timed out and the daemon did not answer a ping: %s", err))
+		} else if n, eject := w.noteTimeout(time.Now(), t.controlTimeout, t.timeoutWindow, t.timeoutsToEject); eject {
+			m.eject(w, fmt.Sprintf("control calls timed out in %d separate stalls within %s, the daemon answering pings throughout; the last: %s", n, t.timeoutWindow, err))
+		} else {
+			m.log.warnf("worker %s: a control call timed out but the daemon answers pings, so it stays in placement (stall %d of %d within %s before it is ejected): %s",
+				worker, n, t.timeoutsToEject, t.timeoutWindow, err)
+		}
+	} else {
+		m.eject(w, "a control call failed: "+err.Error())
+	}
 	// Confirm it, or recover from it, without waiting out the probe interval.
 	select {
 	case w.probeNow <- struct{}{}:
 	default:
 	}
+}
+
+// noteTimeout records a control call that timed out at now against a daemon
+// that still answered a ping, and reports how many separate stalls have within
+// window and whether that reaches limit, forgetting them if it does.
+//
+// A stall is counted once, however many calls it times out: one image removal
+// blocks every create, remove and image inspect on the daemon, so a busy
+// worker's calls all time out together. A call that times out within
+// callTimeout of the last one counted was already in flight when that one
+// fired, and belongs to the same stall.
+func (w *workerConn) noteTimeout(now time.Time, callTimeout, window time.Duration, limit int) (int, bool) {
+	w.timeoutsMu.Lock()
+	defer w.timeoutsMu.Unlock()
+	recent := w.timeouts[:0]
+	for _, at := range w.timeouts {
+		if now.Sub(at) < window {
+			recent = append(recent, at)
+		}
+	}
+	w.timeouts = recent
+	if k := len(w.timeouts); k > 0 && now.Sub(w.timeouts[k-1]) < callTimeout {
+		return k, false
+	}
+	w.timeouts = append(w.timeouts, now)
+	n := len(w.timeouts)
+	if n < limit {
+		return n, false
+	}
+	w.timeouts = w.timeouts[:0]
+	return n, true
 }
 
 // SetWorkerDown marks a worker down administratively, taking it out of
