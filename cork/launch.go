@@ -28,6 +28,10 @@ import (
 //     stage keeps the daemon's queue in corkd, where it is bounded, instead
 //     of inside dockerd, where a deep queue looks like a hung call.
 //
+// The container half of that slot is exported split four ways as well, which
+// is what makes the two above measurable rather than assumed; see
+// containerSplits.
+//
 // Waiting for a slot is bounded for a request-driven launch and refused
 // outright once the worker is unreachable: under adverse load a request fails
 // fast, and the platform retries onto another worker instead of queueing
@@ -163,8 +167,9 @@ func (m *Manager) launchStages(t *launchTimer, build *BuildMetadata, instance *I
 		return true, err
 	}
 	t.network()
-	err = m.startContainers(build, instance, opts, envVars, revPortMap, limits)
-	t.containers()
+	var splits containerSplits
+	err = m.startContainers(build, instance, opts, envVars, revPortMap, limits, &splits)
+	t.containers(splits)
 	return true, err
 }
 

@@ -312,7 +312,7 @@ func TestEMFSuccessPublishesTheFullSet(t *testing.T) {
 	for _, n := range metricNames(event) {
 		got[n] = true
 	}
-	for _, want := range []string{"LaunchFailed", "LaunchDuration", "ImageWait", "SlotWait", "NetworkCreate", "ContainerStart"} {
+	for _, want := range []string{"LaunchFailed", "LaunchDuration", "ImageWait", "SlotWait", "NetworkCreate", "ContainerStart", "DockerCreate", "DockerStart", "PortReadback", "Finalize"} {
 		if !got[want] {
 			t.Errorf("a successful launch did not publish %q", want)
 		}

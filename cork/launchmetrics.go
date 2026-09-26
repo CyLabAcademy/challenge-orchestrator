@@ -110,11 +110,44 @@ type launchSample struct {
 	slotWait   time.Duration
 	netCreate  time.Duration
 	containers time.Duration
-	waiting    int // launches queued on the daemon when this one was admitted
-	slotsBusy  int // launch slots in use at the same moment
-	pulled     bool
-	trigger    string
-	at         time.Time
+	// Where the container stage went. These need not sum to containers: a
+	// create that retried after a vanished image pulled in between, and that
+	// pull belongs to none of them. The gap is itself worth seeing.
+	ctrCreate time.Duration
+	ctrStart  time.Duration
+	portRead  time.Duration
+	finalize  time.Duration
+	ctrCount  int
+	waiting   int // launches queued on the daemon when this one was admitted
+	slotsBusy int // launch slots in use at the same moment
+	pulled    bool
+	trigger   string
+	at        time.Time
+}
+
+// containerSplits is where the container stage's time went, filled by
+// startContainers and folded into the sample by launch. The stage is most of
+// a launch and it is the one that stops scaling -- slots measured out at two
+// on both firewall backends (see launch.go) -- and as a single number it
+// cannot say which half is responsible: dockerd's create, dockerd's start, a
+// read-back sleeping on its own backoff, or the metadata write. Four numbers
+// can. Separate from launchTimer so that docker.go carries no metrics
+// plumbing.
+//
+// Two of them read differently from the rest, and a dashboard that does not
+// know it will draw the wrong conclusion. portRead is zero, not fast, on
+// every launch that skipped the read-back (CORK_PORTS reserves the port up
+// front, so only rebuilds and Docker-assigned ports pay it): read its tail,
+// never its mean. And on the rare create that retried after a vanished
+// image, create counts both calls while count counts one container, so that
+// launch over-reports per-container create -- as does the pull between them,
+// which belongs to no split at all.
+type containerSplits struct {
+	create   time.Duration // ContainerCreate calls
+	start    time.Duration // ContainerStart calls
+	portRead time.Duration // the port read-back, its backoff sleeps included
+	finalize time.Duration // the instance's metadata write
+	count    int
 }
 
 // launchRing holds the most recent launch durations for one daemon. A ring
@@ -498,6 +531,14 @@ type emfEvent struct {
 	NetworkCreate  int64 `json:"NetworkCreate"`
 	ContainerStart int64 `json:"ContainerStart"`
 
+	// The container stage, split. ContainerStart above keeps its meaning --
+	// the whole stage -- because renaming it would silently change what every
+	// panel already built on it plots.
+	DockerCreate int64 `json:"DockerCreate"`
+	DockerStart  int64 `json:"DockerStart"`
+	PortReadback int64 `json:"PortReadback"`
+	Finalize     int64 `json:"Finalize"`
+
 	// Context. Not metrics and not dimensions: this is what makes one record
 	// answer for itself in Logs Insights without being correlated against
 	// anything.
@@ -508,7 +549,11 @@ type emfEvent struct {
 	Waiting     int    `json:"Waiting"`
 	SlotsBusy   int    `json:"SlotsBusy"`
 	ImagePulled bool   `json:"ImagePulled"`
-	Trigger     string `json:"Trigger,omitempty"`
+	// A field, not a metric: it is what the stage splits must be read against
+	// (a three-container challenge spends three creates), and a field answers
+	// that for nothing.
+	ContainerCount int    `json:"ContainerCount"`
+	Trigger        string `json:"Trigger,omitempty"`
 }
 
 type emfMetadata struct {
@@ -555,6 +600,10 @@ func (lm *launchMetrics) payload(s launchSample) emfEvent {
 			{Name: "SlotWait", Unit: "Milliseconds"},
 			{Name: "NetworkCreate", Unit: "Milliseconds"},
 			{Name: "ContainerStart", Unit: "Milliseconds"},
+			{Name: "DockerCreate", Unit: "Milliseconds"},
+			{Name: "DockerStart", Unit: "Milliseconds"},
+			{Name: "PortReadback", Unit: "Milliseconds"},
+			{Name: "Finalize", Unit: "Milliseconds"},
 		}
 	}
 
@@ -590,6 +639,11 @@ func (lm *launchMetrics) payload(s launchSample) emfEvent {
 		SlotWait:       s.slotWait.Milliseconds(),
 		NetworkCreate:  s.netCreate.Milliseconds(),
 		ContainerStart: s.containers.Milliseconds(),
+		DockerCreate:   s.ctrCreate.Milliseconds(),
+		DockerStart:    s.ctrStart.Milliseconds(),
+		PortReadback:   s.portRead.Milliseconds(),
+		Finalize:       s.finalize.Milliseconds(),
+		ContainerCount: s.ctrCount,
 		Outcome:        s.outcome,
 		Challenge:      s.challenge,
 		Build:          s.build,
@@ -609,7 +663,8 @@ func (lm *launchMetrics) payload(s launchSample) emfEvent {
 // overload, so counting only the other would go quiet exactly when it
 // mattered.
 //
-// The whole cost on the launch path is five time.Now calls (a vDSO read
+// The whole cost on the launch path is five time.Now calls for the stages,
+// up to six more per container and two for the metadata write (a vDSO read
 // each), one ring insert and one non-blocking channel send, against a launch
 // measured in seconds.
 type launchTimer struct {
@@ -687,9 +742,16 @@ func (t *launchTimer) images(pulled bool) {
 		t.sample.pulled = t.limits.ensuredPulled
 	}
 }
-func (t *launchTimer) slot()       { t.sample.slotWait = t.split() }
-func (t *launchTimer) network()    { t.sample.netCreate = t.split() }
-func (t *launchTimer) containers() { t.sample.containers = t.split() }
+func (t *launchTimer) slot()    { t.sample.slotWait = t.split() }
+func (t *launchTimer) network() { t.sample.netCreate = t.split() }
+func (t *launchTimer) containers(s containerSplits) {
+	t.sample.containers = t.split()
+	t.sample.ctrCreate = s.create
+	t.sample.ctrStart = s.start
+	t.sample.portRead = s.portRead
+	t.sample.finalize = s.finalize
+	t.sample.ctrCount = s.count
+}
 
 // finish records the launch against the daemon's ring and hands it to the
 // exporter. Only a launch that succeeded contributes a duration, but every
