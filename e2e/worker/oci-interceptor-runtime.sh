@@ -24,8 +24,10 @@
 #   - Keep "$@" quoted. Docker's generated wrapper uses a bare $@, which
 #     word-splits and glob-expands its arguments.
 #
-# The flag itself is an accepted no-op as of oci-interceptor v0.3.0, which
-# applies the read-only networking mounts unconditionally. It is passed anyway
-# because production passes it: what is under test is the chain, and a flag is
-# what puts a wrapper in the chain at all.
-exec /usr/local/bin/oci-interceptor --oi-readonly-networking-mounts "$@"
+# Both flags, in this order, because that is the argv the role renders: its
+# oci_interceptor_flags still defaults to --oi-readonly-networking-mounts and the
+# template appends the crun selection after it. The first is an accepted no-op as of
+# v0.3.0, which applies those mounts unconditionally; it is passed anyway so the fleet
+# keeps proving the interceptor still accepts the flag production ships. The wrapper is
+# in the chain because daemon.json names it, not because it carries a flag.
+exec /usr/local/bin/oci-interceptor --oi-readonly-networking-mounts --oi-runtime-path /usr/local/bin/crun "$@"

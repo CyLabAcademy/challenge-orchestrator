@@ -34,6 +34,21 @@ FROM docker:${DIND_VERSION}-dind
 # images carry iptables but not nft, so it is added here.
 RUN apk add --no-cache nftables
 
+# crun rather than runc under the interceptor, matching the role. Pinned and
+# checksummed because this binary creates every container; the release assets are
+# statically linked, so the glibc build runs on Alpine unchanged.
+#
+# Track upstream, not a distro archive. noble carries 1.14.1, which cannot parse
+# Docker 29's ociVersion at all, and resolute carries 1.21, which is four CVE
+# fixes behind -- including the rootfs /dev symlink family, reachable on a
+# challenge whose rootfs is writable and whose instance gets restarted.
+ARG CRUN_VERSION=1.30.1
+ARG CRUN_SHA256=86d1e6a0e76945975d3aebfab39cbc6a26eea15f1c3fc66b6776d19e5dc346a0
+RUN wget -qO /usr/local/bin/crun \
+      "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64" \
+ && echo "${CRUN_SHA256}  /usr/local/bin/crun" | sha256sum -c - \
+ && chmod 0755 /usr/local/bin/crun
+
 # daemon.json names the wrapper, not the binary, and passes no runtimeArgs --
 # the shape the multihost_docker ansible role deploys. Both halves matter:
 # docker generates its own wrapper for any runtime whose runtimeArgs is
