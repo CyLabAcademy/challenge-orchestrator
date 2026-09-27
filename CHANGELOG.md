@@ -5,6 +5,65 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-09-27
+
+### Fixed
+
+**A stop could wait for a teardown slot forever.** Launch slots and teardown
+slots are separate pools of the same size, and a teardown waited for one as long
+as it took: a stop must go through, and the queue is corkd's own. That holds
+while the daemon makes progress. It stops holding for a daemon that has gone
+slow at removals but still answers its probes — image eviction takes the
+image-store and layer locks, and the deep probe's `ContainerList` does not need
+them, so the worker is never ejected and the wait's escape on the unreachable
+channel never fires. The queue then grew without limit, and because the
+platform's workers block on their request, each waiting stop held one until that
+pool was drained and nothing could be dispatched to any worker. One sick box
+stalled the fleet.
+
+A stop now waits `CORK_WORKER_TEARDOWN_WAIT` and is then refused. The refusal
+changes nothing else, which is what makes it safe: the instance and its port
+reservations stay exactly as they were, so nothing is freed while a live
+container still holds it, and a retry finds what the first call did. A rebuild's
+teardown still waits as long as it takes — nothing retries one, and it cannot
+relaunch over containers that are still up.
+
+The default is 30s, and deliberately generous: the bound only protects a caller
+that dispatches under load, and a host serving persistent challenges sees no
+launches and no stops but an operator redeploying, so it never builds a queue at
+all. Set it to a second or two where launches and stops do arrive together.
+
+### Added
+
+**Teardowns are measured.** A teardown was the one thing cork did that nothing
+could see — no ring, since the rings hold what a player waited for and nobody
+waits on a stop, no stage timings, and no record at all. With the two pools
+sized together, that left half of a daemon's concurrent work unmeasured. Every
+teardown now files a record of its own carrying `TeardownWait`,
+`TeardownDuration` and `TeardownFailed`, cut by worker.
+
+`TeardownWait` is the one to alarm on: a daemon gone slow at removals while
+still answering its probes shows up there first and nowhere else. A rebuild's
+teardown is kept out of that metric, since its wait is unbounded by design and
+would otherwise fire the alarm on every `update-schema`; the value stays on the
+record for a query to find.
+
+Both kinds of record now carry both queue depths, `Waiting` and
+`TeardownsWaiting`, because the two operations share a daemon but not a pool — a
+launch that slowed while removals piled up is only diagnosable if the two
+numbers sit on the same line. Every record also carries `Operation`, which is
+what lets a query written against launches exclude teardowns instead of taking a
+zero for each one.
+
+### Changed
+
+**A stop can now answer 503.** A refused teardown slot is retryable, like a stop
+that lost the race for the database's write lock, and comes with a
+`Retry-After`. Nothing else on that path moved: a removal that timed out against
+a merely slow daemon, and one whose worker had gone, already reported success
+and still do.
+
+
 ## [1.2.1] — 2026-09-26
 
 ### Added
@@ -361,6 +420,7 @@ fallback goes, a build plane needs both.
 4. A single-host deployment needs no build plane: leave `CORK_BUILD_PLANE` unset
    and `corkd` builds on its own docker daemon, as cmgr did.
 
+[1.3.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.3.0
 [1.2.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.2.1
 [1.2.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.2.0
 [1.1.2]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.2
