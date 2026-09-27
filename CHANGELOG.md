@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] — 2026-09-26
+
+### Added
+
+**The container stage is exported split four ways.** It is most of a launch and
+it is the one that stops scaling — `CORK_CONCURRENT_LAUNCHES` measured out at
+two on iptables and shows no gain past two on nftables either — and as a single
+number it could not say which part was responsible. That mattered less when the
+network create was expensive and globally serialised; it does not any more, so
+whatever holds concurrency at two now sits inside this stage with nothing to
+show which part of it.
+
+`DockerCreate` and `DockerStart` time the `ContainerCreate` and `ContainerStart`
+calls. `PortReadback` times the port read-back loop, its backoff sleeps
+included, and `Finalize` times the instance's metadata write. `ContainerStart`
+keeps meaning the whole stage, so panels already built on it plot what they
+always did. `ContainerCount` joins them as a log field rather than a metric,
+since the four are sums over an instance's containers and a three-container
+challenge spends three creates.
+
+The last two were inside the stage all along and invisible, which is the part
+worth stating plainly: the read-back sleeps on a doubling backoff and the
+finalize is a database write, so some unknown share of what read as daemon time
+was neither the daemon nor time anything contends for.
+
+Two things to know before reading a dashboard. `PortReadback` is zero, not
+fast, on every launch that skipped the read-back — with `CORK_PORTS` set that is
+most request launches — so read its tail and never its mean. And on the rare
+create that retried after a vanished image, `DockerCreate` counts both calls
+while `ContainerCount` counts one container, so that launch over-reports its
+per-container create cost.
+
+Measurement only: nothing about a launch changed, and the launch path costs
+31ns more per launch with no additional allocation.
+
+
 ## [1.2.0] — 2026-09-25
 
 ### Added
@@ -325,6 +361,7 @@ fallback goes, a build plane needs both.
 4. A single-host deployment needs no build plane: leave `CORK_BUILD_PLANE` unset
    and `corkd` builds on its own docker daemon, as cmgr did.
 
+[1.2.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.2.1
 [1.2.0]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.2.0
 [1.1.2]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.2
 [1.1.1]: https://github.com/CyLabAcademy/challenge-orchestrator/releases/tag/v1.1.1
