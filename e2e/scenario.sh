@@ -6751,9 +6751,11 @@ for w in $(jq -r '.WorkerIP // empty' "$EMF_CAPTURE" | sort -u); do
     fail "a record carries WorkerIP '$w', which is not an address in this fleet"
 done
 
-emf_ok=$(jq -s '[.[] | select(.Outcome == "ok")] | length' "$EMF_CAPTURE")
+# Every count below says Operation, because a teardown is a record too now and
+# a launch assertion that silently counted them would pass on the wrong ones.
+emf_ok=$(jq -s '[.[] | select(.Operation == "launch" and .Outcome == "ok")] | length' "$EMF_CAPTURE")
 (( emf_ok > 0 )) || fail "no successful launch was exported, though this run made many"
-emf_slowest=$(jq -s '[.[] | select(.Outcome == "ok") | .LaunchDuration] | max' "$EMF_CAPTURE")
+emf_slowest=$(jq -s '[.[] | select(.Operation == "launch" and .Outcome == "ok") | .LaunchDuration] | max' "$EMF_CAPTURE")
 (( emf_slowest > 0 )) ||
   fail "every exported launch reports a duration of 0ms: the stages are not being timed"
 
@@ -6761,9 +6763,9 @@ emf_slowest=$(jq -s '[.[] | select(.Outcome == "ok") | .LaunchDuration] | max' "
 # every quantile down and make a daemon turning work away look like the
 # fastest in the fleet, so a failed record must carry LaunchFailed and nothing
 # else.
-emf_failed=$(jq -s '[.[] | select(.Outcome != "ok")] | length' "$EMF_CAPTURE")
+emf_failed=$(jq -s '[.[] | select(.Operation == "launch" and .Outcome != "ok")] | length' "$EMF_CAPTURE")
 if (( emf_failed > 0 )); then
-  emf_failed_metrics=$(jq -r 'select(.Outcome != "ok") | ._aws.CloudWatchMetrics[].Metrics[].Name' "$EMF_CAPTURE" |
+  emf_failed_metrics=$(jq -r 'select(.Operation == "launch" and .Outcome != "ok") | ._aws.CloudWatchMetrics[].Metrics[].Name' "$EMF_CAPTURE" |
     sort -u | tr '\n' ' ')
   [[ "$emf_failed_metrics" == "LaunchFailed " ]] ||
     fail "refused launches published '$emf_failed_metrics'; only LaunchFailed belongs on a failure"
@@ -6771,9 +6773,29 @@ fi
 
 # The context that makes one record answer for itself rather than having to be
 # correlated against everything else that was running.
-emf_ctx=$(jq -s '[.[] | select(has("Waiting") and has("SlotsBusy") and has("ImagePulled") and has("Outcome"))] | length' "$EMF_CAPTURE")
+emf_ctx=$(jq -s '[.[] | select(has("Waiting") and has("TeardownsWaiting") and has("SlotsBusy") and has("Outcome"))] | length' "$EMF_CAPTURE")
 [[ "$emf_ctx" == "$emf_values" ]] ||
-  fail "only $emf_ctx of $emf_values records carry the daemon context (Waiting, SlotsBusy, ImagePulled, Outcome)"
+  fail "only $emf_ctx of $emf_values records carry the daemon context (Waiting, TeardownsWaiting, SlotsBusy, Outcome)"
+emf_launch_ctx=$(jq -s '[.[] | select(.Operation == "launch" and has("ImagePulled"))] | length' "$EMF_CAPTURE")
+emf_launches=$(jq -s '[.[] | select(.Operation == "launch")] | length' "$EMF_CAPTURE")
+[[ "$emf_launch_ctx" == "$emf_launches" ]] ||
+  fail "only $emf_launch_ctx of $emf_launches launch records say whether they paid for a pull"
+
+# Teardowns are exported too, and are the half of a daemon's concurrent work
+# that used to be invisible. A stop is refused rather than queued without a
+# deadline now, so TeardownWait is the number an alarm watches: it has to be
+# published on a refusal, which is exactly when there is no duration to report.
+emf_downs=$(jq -s '[.[] | select(.Operation == "teardown")] | length' "$EMF_CAPTURE")
+(( emf_downs > 0 )) ||
+  fail "no teardown was exported, though this run stopped many instances: half of what a daemon does is going uncounted"
+emf_down_metrics=$(jq -r 'select(.Operation == "teardown" and .Outcome == "ok") | ._aws.CloudWatchMetrics[].Metrics[].Name' "$EMF_CAPTURE" |
+  sort -u | tr '\n' ' ')
+[[ "$emf_down_metrics" == "TeardownDuration TeardownFailed TeardownWait " ]] ||
+  fail "teardowns published '$emf_down_metrics', want 'TeardownDuration TeardownFailed TeardownWait '"
+emf_down_launch_metrics=$(jq -r 'select(.Operation == "teardown") | ._aws.CloudWatchMetrics[].Metrics[].Name | select(startswith("Launch") or . == "ImageWait" or . == "SlotWait" or . == "NetworkCreate" or . == "ContainerStart")' "$EMF_CAPTURE" |
+  sort -u | tr '\n' ' ')
+[[ -z "$emf_down_launch_metrics" ]] ||
+  fail "teardown records published launch metrics ($emf_down_launch_metrics); a stop is not a launch and would corrupt them"
 
 # What corkd says about itself has to agree with what left it. The ring counts
 # only the launches the platform asked for, and only since the last restart --
@@ -6785,7 +6807,7 @@ for ip in "${WORKER_IPS[@]}"; do
   (( sent >= ring )) ||
     fail "worker $ip summarises $ring launches but only $sent request records reached the socket"
 done
-emf_restarts=$(jq -s '[.[] | select(.Trigger == "restart")] | length' "$EMF_CAPTURE")
+emf_restarts=$(jq -s '[.[] | select(.Operation == "launch" and .Trigger == "restart")] | length' "$EMF_CAPTURE")
 emf_pulls=$(jq -s '[.[] | select(.ImagePulled)] | length' "$EMF_CAPTURE")
 note "$emf_values records: $emf_ok succeeded, $emf_failed refused, $emf_restarts from rebuild restarts, $emf_pulls paid for a pull; slowest ${emf_slowest}ms"
 cork worker-list | sed 's/^/       /'
