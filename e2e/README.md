@@ -316,10 +316,18 @@ drive other content with `cork`.
   `multihost_docker` role deploys, and for the same reason. Docker generates
   its own wrapper for any runtime whose `runtimeArgs` is non-empty and that
   generated wrapper does not `exec`, so it stays in the process tree between
-  the containerd shim and runc; a cancelled `runc delete` then orphans the
+  the containerd shim and the runtime; a cancelled `delete` then orphans the
   runtime and leaks its shim. Keep this file and the role's
   `oci_interceptor_runtime.sh.j2` in step: the point of running the interceptor
   here is that the fleet exercises the runtime chain production runs.
+- The chain ends in **crun**, not runc, because the role now selects it: the
+  wrapper passes `--oi-runtime-path` and `worker.Dockerfile` fetches a pinned,
+  checksummed release binary. Unlike the interceptor this one is *not* built
+  from source — crun's release assets are statically linked, so the published
+  binary runs on Alpine unchanged. The fleet asserts the chain really ends
+  there (`run.oci.crun.version` in the runtime's reported features), because
+  the interceptor falls back to runc without complaint if the flag goes
+  missing, and every other step would still pass.
 - Telemetry samples the docker VM's `/proc`, not a per-worker host, so it only
   reports overloaded when the whole machine is.
 - The registry is `zot.internal` on 443 rather than `<host>:5000`: the address

@@ -906,6 +906,24 @@ for ip in "${WORKER_IPS[@]}"; do
     fail "worker $ip registered oci-interceptor as '$rt_path', not the exec'ing wrapper e2e/worker/daemon.json names. A path under /var/lib/docker/runtimes/ means docker generated its own wrapper because runtimeArgs is non-empty, and that wrapper does not exec: it stays between the containerd shim and runc and leaks a shim per cancelled runtime call"
   [[ "$rt_args" == 0 ]] ||
     fail "worker $ip has $rt_args runtimeArgs on the oci-interceptor runtime; it must have none. Docker generates a non-exec'ing wrapper for any runtime whose runtimeArgs is non-empty, which re-inserts the process layer oci-interceptor v0.3.0 removed. The interceptor's flags belong in e2e/worker/oci-interceptor-runtime.sh, which execs"
+  # And the chain has to end in crun, which is the same class of silent fallback as
+  # the two checks above: drop or typo --oi-runtime-path and the interceptor quietly
+  # uses its default of runc, while every other step in the suite still passes.
+  # Nothing inside a container shows it either -- the state crun and runc build is
+  # identical bar the mount table.
+  #
+  # This reads the features dockerd probed by exec'ing the wrapper at daemon start,
+  # which the interceptor answers by proxying to the runtime beneath it, and only
+  # crun annotates with run.oci.crun.version. Two things other than a runc fallback
+  # can make it absent, so the message names them: the probe is cached from daemon
+  # start, so a wrapper edited without restarting dockerd still reports the old
+  # runtime, and an interceptor that answered the features subcommand itself rather
+  # than proxying would report neither runtime's annotations.
+  rt_crun=$(jq -r '.Runtimes["oci-interceptor"].status["org.opencontainers.runtime-spec.features"] // "{}"
+                   | fromjson | .annotations["run.oci.crun.version"] // "absent"' <<<"$info")
+  [[ "$rt_crun" != absent ]] ||
+    fail "worker $ip does not report a crun runtime: its registered oci-interceptor runtime carries no run.oci.crun.version annotation, so the fleet is probably exercising runc while production runs crun. Check that e2e/worker/oci-interceptor-runtime.sh passes --oi-runtime-path (the interceptor defaults to runc without complaint), that this dockerd started after that wrapper was written since the feature probe is cached from daemon start, and that the interceptor still proxies the features subcommand to the runtime rather than answering it"
+  ok "worker $ip runs the interceptor over crun $rt_crun"
   sweep_worker "$ip"
 done
 # The pre-rename names are symlinks in this image, as in the release tarball
