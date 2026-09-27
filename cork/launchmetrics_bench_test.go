@@ -29,7 +29,7 @@ func benchLaunch(b *testing.B, m *Manager) {
 		t.images(false)
 		t.slot()
 		t.network()
-		t.containers()
+		t.containers(containerSplits{count: 1})
 		t.finish(nil)
 	}
 }

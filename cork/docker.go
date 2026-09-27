@@ -1393,7 +1393,7 @@ func portsAlreadyKnown(portLow int, imagePorts []string, ports map[string]int, r
 	return true
 }
 
-func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetadata, opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string, limits launchLimits) error {
+func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetadata, opts map[string]ContainerOptions, envVars map[string]string, revPortMap map[string]string, limits launchLimits, splits *containerSplits) error {
 	// Everything below runs against the daemon hosting this instance: the
 	// local one, or the recorded worker's.
 	cli, err := m.instanceClient(instance)
@@ -1556,11 +1556,13 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 		}
 
 		ccCtx, ccCancel := m.controlCtx()
+		ccBegun := time.Now()
 		respCC, err := cli.ContainerCreate(ccCtx, client.ContainerCreateOptions{
 			Config:           &cConfig,
 			HostConfig:       &hConfig,
 			NetworkingConfig: &nConfig,
 		})
+		splits.create += time.Since(ccBegun)
 		ccCancel()
 		if errdefs.IsNotFound(err) && m.challengeRegistry != "" {
 			// The image vanished between the pre-launch digest check and the
@@ -1574,11 +1576,13 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 			m.log.warnf("image '%s' disappeared before create; pulling and retrying", cConfig.Image)
 			if err = m.pullImage(cli, cConfig.Image, m.timing().controlTimeout); err == nil {
 				ccCtx, ccCancel = m.controlCtx()
+				ccBegun = time.Now()
 				respCC, err = cli.ContainerCreate(ccCtx, client.ContainerCreateOptions{
 					Config:           &cConfig,
 					HostConfig:       &hConfig,
 					NetworkingConfig: &nConfig,
 				})
+				splits.create += time.Since(ccBegun)
 				ccCancel()
 			}
 		}
@@ -1590,10 +1594,13 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 
 		cid := respCC.ID
 		instance.Containers = append(instance.Containers, cid)
+		splits.count++
 		m.log.infof("created new container: %s", cid)
 
 		csCtx, csCancel := m.controlCtx()
+		csBegun := time.Now()
 		_, err = cli.ContainerStart(csCtx, cid, client.ContainerStartOptions{})
+		splits.start += time.Since(csBegun)
 		csCancel()
 		if err != nil {
 			m.log.errorf("failed to start container: %s", err)
@@ -1610,6 +1617,7 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 		// ephemeral ports, or an explicit-port path entered with instance.Ports
 		// cleared (e.g. rebuild), where the bound port must be read back.
 		if !portsAlreadyKnown(m.portLow, image.Ports, instance.Ports, revPortMap) {
+			prBegun := time.Now()
 			backoff := time.Millisecond
 			done := false
 			for !done && backoff < time.Second {
@@ -1654,10 +1662,14 @@ func (m *Manager) startContainers(build *BuildMetadata, instance *InstanceMetada
 					m.log.debugf("container port %s mapped to %s", cPort, hPortInfo[0].HostPort)
 				}
 			}
+			splits.portRead += time.Since(prBegun)
 		}
 	}
 
-	return retryableDB(m.finalizeInstance(instance))
+	fBegun := time.Now()
+	err = retryableDB(m.finalizeInstance(instance))
+	splits.finalize = time.Since(fBegun)
+	return err
 }
 
 // stopContainers removes the instance's containers. inFlight reports that at
