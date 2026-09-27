@@ -563,7 +563,7 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 		return m.removeInstanceMetadata(instance.Id)
 	}
 
-	err := m.teardown(instance)
+	err := m.teardown(instance, m.timing().teardownWait)
 	if err != nil {
 		// The teardown itself ejected the worker (a control call hung), or the
 		// worker stopped answering while it waited for its slot: finish the
@@ -582,6 +582,17 @@ func (m *Manager) stopInstance(instance *InstanceMetadata) error {
 			m.log.warnf("worker %s timed out tearing down instance %d: clearing its records; docker-reaper removes anything the teardown left: %s", instance.Worker, instance.Id, err)
 			return m.removeInstanceMetadata(instance.Id)
 		}
+		// A refused slot is NOT joined to the two branches above, and the
+		// difference is the whole reason this is safe. Both of those have
+		// already sent the removal -- dockerd finishes one it has been given --
+		// or are talking to a worker that has left placement, where
+		// reconcileWorker clears what is left when it rejoins. A refusal sent
+		// nothing and the worker stays placeable, so clearing the rows would
+		// free ports that a live container still holds and the next launch
+		// placed there would fail on the bind. The deployed reaper only takes
+		// containers labelled cmgr.dynamic=true, so a static one would never
+		// be collected at all. The records stay, the ports stay reserved, and
+		// the error goes back: the caller has lost nothing except the wait.
 		return err
 	}
 

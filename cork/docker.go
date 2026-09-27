@@ -1328,11 +1328,33 @@ func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
 	return err
 }
 
-// teardown removes an instance's containers and network from its daemon
-// under a teardown slot (daemonQueue), waiting for one as long as it takes: a
-// stop must go through, and the queue is corkd's own. It is refused with
-// ErrWorkerUnreachable once the instance's worker is down, which the callers treat
-// as the DB-only case.
+// teardown removes an instance's containers and network from its daemon under
+// a teardown slot (daemonQueue). It is refused with ErrWorkerUnreachable once
+// the instance's worker is down, which the callers treat as the DB-only case.
+//
+// wait bounds the queue for that slot, and the two callers want different
+// things from it, exactly as launchLimits splits them. A stop passes
+// teardownWait: a daemon that has gone slow at removals while still answering
+// its probes is never ejected, so an unbounded queue there holds one of the
+// platform's blocked workers per stop until the whole pool is drained and
+// nothing can be dispatched to any worker.
+//
+// Its default is deliberately generous, because that pool is the only thing
+// the bound protects and a deployment without one has nothing to gain by
+// giving up early: a host serving persistent challenges sees no launches and
+// no stops but an operator's redeployments, so there is never a queue, and if
+// there somehow is, waiting is free and succeeding is worth more. A deployment
+// that does dispatch under load should set it down to a second or two, where
+// the arithmetic is that four slots at ~85ms drain about fifty a second, so
+// even a second absorbs a queue deeper than a worker holds. The bound costs that stop its wait
+// and nothing else -- a refusal leaves the instance's rows and its port
+// reservations exactly as they were, so the containers it did not remove are
+// still accounted for and no later launch is handed a port one of them holds.
+// It is the caller (stopInstance) that decides a removal already sent can be
+// forgotten; a removal never sent cannot.
+//
+// A rebuild passes zero and waits as long as it takes: nothing retries one,
+// and it cannot relaunch over containers that are still up.
 //
 // The network goes even when the containers did not go cleanly, since by then
 // they are removed on the daemon whatever the call reported: a failure to
@@ -1340,11 +1362,40 @@ func (m *Manager) stopNetwork(instance *InstanceMetadata) error {
 // nothing records, holding its address-pool subnet until the box next rejoins
 // placement. Only an unreachable daemon skips the network, where the call
 // would spend another control timeout to fail the same way.
-func (m *Manager) teardown(instance *InstanceMetadata) error {
-	release, err := m.acquireSlot(m.daemonQueue(instance).teardownSem, instance, "teardown", 0)
+func (m *Manager) teardown(instance *InstanceMetadata, wait time.Duration) (teardownErr error) {
+	q, public := m.workerDaemon(instance)
+	begun := time.Now()
+	q.teardownWaiting.Add(1)
+	release, err := m.acquireSlot(q.teardownSem, instance, "teardown", wait)
+	q.teardownWaiting.Add(-1)
+	slotWait := time.Since(begun)
+	// Sampled here rather than where the record is filed: by then the removal
+	// has run and the slot has gone back, so a queue this teardown actually
+	// waited in would have drained out of the number that reports it. Taken
+	// after the decrement, so a teardown does not count itself -- the same
+	// way a launch reads the queue before taking its own slot.
+	depth := queueDepth{
+		waiting:          int(q.waiting.Load()),
+		teardownsWaiting: int(q.teardownWaiting.Load()),
+		slotsBusy:        len(q.teardownSem),
+	}
+	// A rebuild waits as long as it takes (wait == 0) and a stop does not, so
+	// the wait is also what tells the two apart on the record: without it an
+	// alarm on TeardownWait would fire on every ordinary update-schema.
+	trigger := ""
+	if wait <= 0 {
+		trigger = launchTriggerRestart
+	}
 	if err != nil {
+		m.recordTeardown(depth, public, instance, trigger, slotWait, 0, err)
 		return err
 	}
+	// Ordered to run after release(), not before it: a defer registered later
+	// runs earlier, and recording while still holding the slot would add the
+	// record's own work to every teardown's hold time.
+	defer func() {
+		m.recordTeardown(depth, public, instance, trigger, slotWait, time.Since(begun)-slotWait, teardownErr)
+	}()
 	defer release()
 	inFlight, cErr := m.stopContainers(instance)
 	if cErr != nil && isTransportError(cErr) && m.workerUnreachable(instance.Worker) {
@@ -1369,7 +1420,8 @@ func (m *Manager) teardown(instance *InstanceMetadata) error {
 		m.log.warnf("left network %s behind: a container removal already in flight still holds it, and the reaper clears it", instance.getNetworkName())
 		nErr = nil
 	}
-	return errors.Join(cErr, nErr)
+	teardownErr = errors.Join(cErr, nErr)
+	return teardownErr
 }
 
 // portsAlreadyKnown reports whether every published port for an image already has

@@ -39,10 +39,14 @@ var retryableLaunch = []error{
 	cork.ErrDatabaseBusy,
 }
 
-// retryableStop is the same for a stop, which places nothing and so can only
-// lose the race for the database's write lock, retryable like a launch that
-// did.
-var retryableStop = []error{cork.ErrDatabaseBusy}
+// retryableStop is the same for a stop. It places nothing, so most of the
+// launch list cannot apply to it: it can lose the race for the database's
+// write lock, and it can be refused a teardown slot on a daemon that has gone
+// slow at removals (CORK_WORKER_TEARDOWN_WAIT). Both are transient and clear
+// without anyone intervening, so both are a 503 with a Retry-After rather
+// than a 500 that reads as a fault. A refused stop leaves the instance and
+// its ports recorded, so a retry finds exactly what the first call did.
+var retryableStop = []error{cork.ErrDatabaseBusy, cork.ErrWorkerBusy}
 
 // errorResponse maps a failed manager call onto the response code, and onto
 // whether the caller is being told to try again -- which the handler turns
@@ -179,6 +183,17 @@ Relevant environment variables:
   CORK_PRUNE_AGE - the maximum age for on-demand challenge instances; old
       instances are automatically pruned from the database (defaults to '1h');
       set to '0' to disable automatic pruning.
+  CORK_WORKER_TEARDOWN_WAIT - how long a stop waits for a teardown slot on its
+      worker before giving up and returning an error (defaults to '30s'). A
+      daemon gone slow at removals while still answering its probes is never
+      ejected, so without a bound each stop holds one of the caller's workers
+      until that pool is drained and nothing can be dispatched anywhere. The
+      instance and its ports are left recorded, so nothing else is affected;
+      only the stop fails. The default is generous because the bound only
+      protects a caller that dispatches under load -- a host serving
+      persistent challenges never builds a queue at all. Set it to a second
+      or two where launches and stops do arrive together. A rebuild ignores
+      this and waits as long as it takes.
   CORK_DB_WAL - controls whether SQLite WAL journaling mode is enabled;
       on by default for improved throughput under high concurrency;
       creates <db>-wal and <db>-shm sidecar files; do NOT use on network-mounted
@@ -396,10 +411,11 @@ Workers:
   with Retry-After so the platform's retry is placed afresh. A stop whose
   worker hangs mid-way clears the records once the worker is ejected and
   returns success, and so does one whose teardown times out against a daemon
-  that is only slow; docker-reaper removes what it left. Stops wait
-  for a teardown slot on their worker as long as it takes, since a stop must
-  go through, so a deluge of them queues in corkd, bounded, rather than
-  inside dockerd.
+  that is only slow; docker-reaper removes what it left. Stops queue for a
+  teardown slot in corkd rather than inside dockerd, and wait there up to
+  CORK_WORKER_TEARDOWN_WAIT; past that the stop is refused and the instance is
+  left recorded, ports and all, so nothing is freed that a container still
+  holds. A rebuild's teardown waits as long as it takes.
 
   The restart of a persistent instance during an update is exempt, since
   nothing retries it: it pulls the new image under a ceiling of five minutes,
