@@ -509,6 +509,7 @@ func TestWorkerTimingFromEnv(t *testing.T) {
 	t.Setenv(WORKER_TIMEOUT_WINDOW_ENV, "90s")
 	t.Setenv(WORKER_PULL_TIMEOUT_ENV, "1m")
 	t.Setenv(WORKER_LAUNCH_WAIT_ENV, "2s")
+	t.Setenv(WORKER_TEARDOWN_WAIT_ENV, "7s")
 	want := workerTiming{
 		pollInterval:      100 * time.Millisecond,
 		pollTimeout:       40 * time.Millisecond,
@@ -525,6 +526,7 @@ func TestWorkerTimingFromEnv(t *testing.T) {
 		timeoutWindow:     90 * time.Second,
 		pullTimeout:       time.Minute,
 		launchWait:        2 * time.Second,
+		teardownWait:      7 * time.Second,
 	}
 	if got := m.workerTimingFromEnv(); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)

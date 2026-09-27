@@ -44,16 +44,19 @@ func TestErrorResponseLaunch(t *testing.T) {
 	}
 }
 
-// A stop places nothing, so only the database's write lock is retryable there.
-// The launch-only errors must not pick up a 503 on this path by accident.
+// A stop places nothing, so most of the launch list cannot reach it. Two
+// things can: the database's write lock, and a teardown slot refused on a
+// daemon gone slow at removals. The launch-only errors must not pick up a 503
+// on this path by accident.
 func TestErrorResponseStop(t *testing.T) {
-	if code, retry := errorResponse(cork.ErrDatabaseBusy, retryableStop); code != http.StatusServiceUnavailable || !retry {
-		t.Fatalf("a busy database on a stop: got (%d, retry=%t), want (503, retry=true)", code, retry)
+	for _, err := range []error{cork.ErrDatabaseBusy, cork.ErrWorkerBusy} {
+		if code, retry := errorResponse(err, retryableStop); code != http.StatusServiceUnavailable || !retry {
+			t.Fatalf("%v on a stop: got (%d, retry=%t), want (503, retry=true)", err, code, retry)
+		}
 	}
 
 	for _, err := range []error{
 		cork.ErrAllWorkersOverloaded,
-		cork.ErrWorkerBusy,
 		cork.ErrWorkerUnreachable,
 		cork.ErrPullTimeout,
 	} {

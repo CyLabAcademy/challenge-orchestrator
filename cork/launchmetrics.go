@@ -94,7 +94,19 @@ const (
 // launch on an idle one, and cork is the only process that knows which it
 // was. Carrying it here is what makes each record answer for itself instead
 // of having to be correlated against something else.
+// sampleKind says which operation a sample describes. Teardowns share the
+// exporter, the socket and the drop-rather-than-block queue with launches --
+// everything about shipping a per-operation record is the same -- but they are
+// a different event and publish different metrics.
+type sampleKind uint8
+
+const (
+	sampleLaunch sampleKind = iota
+	sampleTeardown
+)
+
 type launchSample struct {
+	kind sampleKind
 	// worker is the dimension: the player-facing name when the worker has
 	// one, its private IP otherwise. See payload for why that way round.
 	worker string
@@ -119,7 +131,14 @@ type launchSample struct {
 	finalize  time.Duration
 	ctrCount  int
 	waiting   int // launches queued on the daemon when this one was admitted
-	slotsBusy int // launch slots in use at the same moment
+	// teardownsWaiting is the other queue's depth at the same moment. Carried
+	// on both kinds: teardowns and launches share a daemon but not a pool, so
+	// a launch that slowed while teardowns piled up says which it was.
+	teardownsWaiting int
+	// slotsBusy is the pool this record's own operation takes from: launch
+	// slots on a launch, teardown slots on a teardown. Filter on Operation
+	// before aggregating it -- the two are separate pools of equal size.
+	slotsBusy int
 	pulled    bool
 	trigger   string
 	at        time.Time
@@ -534,10 +553,25 @@ type emfEvent struct {
 	// The container stage, split. ContainerStart above keeps its meaning --
 	// the whole stage -- because renaming it would silently change what every
 	// panel already built on it plots.
+	// Teardown counterparts. A record carries one operation's set; the
+	// directives decide which is published.
+	// No omitempty on any of these: a zero is a legitimate value for all three
+	// (a teardown that succeeded, or one that got its slot at once), and
+	// CloudWatch drops the whole event, silently, when a directive names a
+	// member the root does not have.
+	TeardownFailed   int   `json:"TeardownFailed"`
+	TeardownDuration int64 `json:"TeardownDuration"`
+	TeardownWait     int64 `json:"TeardownWait"`
+
 	DockerCreate int64 `json:"DockerCreate"`
 	DockerStart  int64 `json:"DockerStart"`
 	PortReadback int64 `json:"PortReadback"`
 	Finalize     int64 `json:"Finalize"`
+
+	// Operation says which kind of record this is. Every field below is
+	// present on both kinds, so a query written against launches sees a zero
+	// per teardown and halves its own averages unless it filters on this.
+	Operation string `json:"Operation"`
 
 	// Context. Not metrics and not dimensions: this is what makes one record
 	// answer for itself in Logs Insights without being correlated against
@@ -552,8 +586,12 @@ type emfEvent struct {
 	// A field, not a metric: it is what the stage splits must be read against
 	// (a three-container challenge spends three creates), and a field answers
 	// that for nothing.
-	ContainerCount int    `json:"ContainerCount"`
-	Trigger        string `json:"Trigger,omitempty"`
+	ContainerCount int `json:"ContainerCount"`
+	// TeardownsWaiting is the depth of the other queue at the moment this
+	// operation was counted -- the number that tells you a daemon is slow at
+	// removals while still answering everything else.
+	TeardownsWaiting int    `json:"TeardownsWaiting"`
+	Trigger          string `json:"Trigger,omitempty"`
 }
 
 type emfMetadata struct {
@@ -589,6 +627,10 @@ func (lm *launchMetrics) payload(s launchSample) emfEvent {
 		// orchestrator itself" is a real placement -- single-host
 		// deployments have no other.
 		worker = "local"
+	}
+
+	if s.kind == sampleTeardown {
+		return lm.teardownPayload(s, worker)
 	}
 
 	headline := []emfMetricDefinition{{Name: "LaunchFailed", Unit: "Count"}}
@@ -631,27 +673,75 @@ func (lm *launchMetrics) payload(s launchSample) emfEvent {
 			LogGroupName:      lm.logGroup,
 			CloudWatchMetrics: directives,
 		},
-		Worker:         worker,
-		WorkerIP:       s.workerIP,
-		LaunchFailed:   failed,
-		LaunchDuration: s.total.Milliseconds(),
-		ImageWait:      s.imageWait.Milliseconds(),
-		SlotWait:       s.slotWait.Milliseconds(),
-		NetworkCreate:  s.netCreate.Milliseconds(),
-		ContainerStart: s.containers.Milliseconds(),
-		DockerCreate:   s.ctrCreate.Milliseconds(),
-		DockerStart:    s.ctrStart.Milliseconds(),
-		PortReadback:   s.portRead.Milliseconds(),
-		Finalize:       s.finalize.Milliseconds(),
-		ContainerCount: s.ctrCount,
-		Outcome:        s.outcome,
-		Challenge:      s.challenge,
-		Build:          s.build,
-		Instance:       s.instance,
-		Waiting:        s.waiting,
-		SlotsBusy:      s.slotsBusy,
-		ImagePulled:    s.pulled,
-		Trigger:        s.trigger,
+		Worker:           worker,
+		WorkerIP:         s.workerIP,
+		Operation:        "launch",
+		LaunchFailed:     failed,
+		LaunchDuration:   s.total.Milliseconds(),
+		ImageWait:        s.imageWait.Milliseconds(),
+		SlotWait:         s.slotWait.Milliseconds(),
+		NetworkCreate:    s.netCreate.Milliseconds(),
+		ContainerStart:   s.containers.Milliseconds(),
+		DockerCreate:     s.ctrCreate.Milliseconds(),
+		DockerStart:      s.ctrStart.Milliseconds(),
+		PortReadback:     s.portRead.Milliseconds(),
+		Finalize:         s.finalize.Milliseconds(),
+		ContainerCount:   s.ctrCount,
+		TeardownsWaiting: s.teardownsWaiting,
+		Outcome:          s.outcome,
+		Challenge:        s.challenge,
+		Build:            s.build,
+		Instance:         s.instance,
+		Waiting:          s.waiting,
+		SlotsBusy:        s.slotsBusy,
+		ImagePulled:      s.pulled,
+		Trigger:          s.trigger,
+	}
+}
+
+// teardownPayload is the launch payload's counterpart. A teardown has one
+// stage worth naming -- the wait for a slot -- and the rest is the removal
+// itself, so it publishes three metrics rather than nine. TeardownWait is the
+// one to alarm on: a daemon that has gone slow at removals while still
+// answering its probes shows up here first, and nowhere else.
+func (lm *launchMetrics) teardownPayload(s launchSample, worker string) emfEvent {
+	metrics := []emfMetricDefinition{{Name: "TeardownFailed", Unit: "Count"}}
+	// A rebuild waits as long as it takes, on purpose, so its wait says
+	// nothing about the daemon. It stays on the record as a field, where a
+	// query can ask for it, but out of the metric an alarm watches: Trigger
+	// is not a dimension, so a published rebuild wait could not be excluded.
+	if s.trigger != launchTriggerRestart {
+		metrics = append(metrics, emfMetricDefinition{Name: "TeardownWait", Unit: "Milliseconds"})
+	}
+	if s.outcome == launchOK {
+		metrics = append(metrics, emfMetricDefinition{Name: "TeardownDuration", Unit: "Milliseconds"})
+	}
+	failed := 1
+	if s.outcome == launchOK {
+		failed = 0
+	}
+	return emfEvent{
+		AWS: emfMetadata{
+			Timestamp:    s.at.UnixMilli(),
+			LogGroupName: lm.logGroup,
+			CloudWatchMetrics: []emfMetricDirective{{
+				Namespace:  lm.namespace,
+				Dimensions: perWorkerDimensions,
+				Metrics:    metrics,
+			}},
+		},
+		Worker:           worker,
+		WorkerIP:         s.workerIP,
+		Operation:        "teardown",
+		Trigger:          s.trigger,
+		TeardownFailed:   failed,
+		TeardownDuration: s.total.Milliseconds(),
+		TeardownWait:     s.slotWait.Milliseconds(),
+		Outcome:          s.outcome,
+		Instance:         s.instance,
+		Waiting:          s.waiting,
+		TeardownsWaiting: s.teardownsWaiting,
+		SlotsBusy:        s.slotsBusy,
 	}
 }
 
@@ -719,6 +809,7 @@ func (m *Manager) beginLaunch(build *BuildMetadata, instance *InstanceMetadata, 
 		_, waiting := q.expectedWait()
 		t.sample.waiting = waiting
 		t.sample.slotsBusy = len(q.launchSem)
+		t.sample.teardownsWaiting = int(q.teardownWaiting.Load())
 	}
 	return t
 }
@@ -776,6 +867,46 @@ func (t *launchTimer) finish(err error) {
 		r.add(t.sample.total, t.sample.outcome == launchOK)
 	}
 	t.m.metrics.record(t.sample)
+}
+
+// recordTeardown files one teardown. No ring: the rings hold what a player
+// waited for, and nobody waits on a stop -- the platform does not even retry
+// one. The record is the only place a teardown is visible at all.
+// queueDepth is what both queues looked like at the moment an operation was
+// admitted. Sampled by the caller rather than read here, because by the time a
+// record is filed the work is done and the queue that mattered has drained.
+type queueDepth struct {
+	waiting          int
+	teardownsWaiting int
+	slotsBusy        int
+}
+
+// The depth and the public name are passed in rather than resolved here: the
+// caller already holds both, and re-resolving would take workersMu again and
+// could read off a queue the worker no longer has. public is the same name a
+// launch is filed under -- permanent per EIP slot -- so the two operations
+// line up on one dashboard instead of the teardowns landing under a private IP
+// that changes with every replacement.
+func (m *Manager) recordTeardown(depth queueDepth, public string, instance *InstanceMetadata, trigger string, slotWait, removal time.Duration, err error) {
+	worker := public
+	if worker == "" {
+		worker = instance.Worker
+	}
+	s := launchSample{
+		kind:     sampleTeardown,
+		worker:   worker,
+		workerIP: instance.Worker,
+		instance: int64(instance.Id),
+		outcome:  launchOutcomeOf(err),
+		trigger:  trigger,
+		slotWait: slotWait,
+		total:    removal,
+		at:       time.Now(),
+	}
+	s.waiting = depth.waiting
+	s.teardownsWaiting = depth.teardownsWaiting
+	s.slotsBusy = depth.slotsBusy
+	m.metrics.record(s)
 }
 
 // ring is the ring this sample belongs in, or nil when there is none to put

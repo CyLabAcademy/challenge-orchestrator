@@ -182,7 +182,7 @@ func (m *Manager) restartInstance(build *BuildMetadata, cMeta *ChallengeMetadata
 	// them (same numbers when free) so the instance keeps its address across
 	// the rebuild.
 	previousPorts := instance.Ports
-	if err := m.teardown(instance); err != nil {
+	if err := m.teardown(instance, 0); err != nil {
 		return err
 	}
 	if err := m.reassignPorts(build, instance, revPortMap, previousPorts); err != nil {

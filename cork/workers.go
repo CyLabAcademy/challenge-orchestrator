@@ -112,6 +112,7 @@ type workerTiming struct {
 	timeoutWindow     time.Duration
 	pullTimeout       time.Duration
 	launchWait        time.Duration
+	teardownWait      time.Duration
 }
 
 var defaultWorkerTiming = workerTiming{
@@ -130,6 +131,7 @@ var defaultWorkerTiming = workerTiming{
 	timeoutWindow:     2 * time.Minute,
 	pullTimeout:       30 * time.Second,
 	launchWait:        10 * time.Second,
+	teardownWait:      30 * time.Second,
 }
 
 // workerTimingFromEnv returns defaultWorkerTiming with the CORK_WORKER_*
@@ -150,6 +152,7 @@ func (m *Manager) workerTimingFromEnv() workerTiming {
 	m.envDuration(WORKER_TIMEOUT_WINDOW_ENV, &t.timeoutWindow)
 	m.envDuration(WORKER_PULL_TIMEOUT_ENV, &t.pullTimeout)
 	m.envDuration(WORKER_LAUNCH_WAIT_ENV, &t.launchWait)
+	m.envDuration(WORKER_TEARDOWN_WAIT_ENV, &t.teardownWait)
 	m.envCount(WORKER_MAX_MISSES_ENV, &t.maxMisses)
 	m.envCount(WORKER_LOAD_MISSES_ENV, &t.loadMisses)
 	m.envCount(WORKER_HEALTHY_THRESHOLD_ENV, &t.healthyThreshold)
@@ -1578,7 +1581,11 @@ type daemonQueue struct {
 	launchSem   chan struct{}
 	teardownSem chan struct{}
 	waiting     atomic.Int32 // launches waiting for a launch slot
-	holdNanos   atomic.Int64 // recent hold time of a launch slot (recordHold)
+	// teardownWaiting is the same count for the other pool. Separate because
+	// the pools are independent: a teardown never waits on a launch slot, so a
+	// queue on one says nothing about the other.
+	teardownWaiting atomic.Int32
+	holdNanos       atomic.Int64 // recent hold time of a launch slot (recordHold)
 	// launches holds this daemon's recent end-to-end launch durations, which
 	// worker-list summarizes (see launchmetrics.go). Separate from holdNanos:
 	// that estimates one stage and exists for admission, while this is what a
