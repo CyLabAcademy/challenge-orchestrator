@@ -699,11 +699,15 @@ func (m *Manager) retagLegacyImages(db *sqlx.DB, id BuildId, challenge string, s
 // pushed after building and pulled before launching; cork and corkd must be
 // configured with the same registry value for the derived names to agree.
 func (m *Manager) instanceImageName(challenge ChallengeId, bMeta *BuildMetadata, image Image) string {
-	name := fmt.Sprintf("%s:%s", challenge, bMeta.dockerId(image))
+	return fmt.Sprintf("%s:%s", m.imageRepository(challenge), bMeta.dockerId(image))
+}
+
+// imageRepository is the repository every image of the challenge is tagged in.
+func (m *Manager) imageRepository(challenge ChallengeId) string {
 	if m.challengeRegistry != "" {
-		name = fmt.Sprintf("%s/%s", m.challengeRegistry, name)
+		return fmt.Sprintf("%s/%s", m.challengeRegistry, challenge)
 	}
-	return name
+	return string(challenge)
 }
 
 // cacheRefsFor picks the BuildKit cache sources for one image build.
