@@ -2284,7 +2284,7 @@ ok "instance $oci_id went through oci-interceptor on $oci_worker: /etc/hosts, /e
 ############################################################################
 
 if (( FULL )); then
-  step "registry identities: the worker's certificate pulls from zot but may not push to it, and a client with no certificate is refused outright"
+  step "registry identities: the worker's certificate pulls from zot but may not push to it, a client with no certificate is refused outright, and a CA-signed certificate under a retired worker name reads nothing"
   # Every probe here is driven through $WA's own dockerd, which carries the
   # worker's certs.d identity (CN=worker, read-only in e2e/zot/config.json) --
   # the same files, over the same identity, a pull travels with. Doing it this
@@ -2402,9 +2402,48 @@ if (( FULL )); then
       *) fail "an anonymous client got HTTP $acode from $E2E_REGISTRY$path: zot's defaultPolicy and anonymousPolicy are both empty (e2e/zot/config.json), so nothing without a certificate may read the registry" ;;
     esac
   done
-  ok "the worker's certificate read $probe_src from zot and was refused the push of $probe_ref, which left neither tag nor repository behind; an anonymous client was refused /v2/, the tag list and the catalog, all three of which cork's own certificate reads"
+
+  # A certificate the zot CA did sign, under a name the policy does not list:
+  # the worker certificate after a rotation renames the identity. Renaming is
+  # the only revocation zot's mTLS auth has, so this is what makes it work.
+  RETIRED_CERT_DIR=/opt/e2e/retired-registry
+  [[ -f "$RETIRED_CERT_DIR/client.cert" ]] ||
+    fail "no retired worker certificate in $RETIRED_CERT_DIR: certgen mints it on its next run, so bring the fleet up again (docker compose up) before this step"
+  retired_curl() { # retired_curl <path> [curl args...]
+    local path=$1
+    shift
+    curl -sS --connect-timeout 5 --max-time 15 --cacert "$RETIRED_CERT_DIR/ca.crt" \
+      --cert "$RETIRED_CERT_DIR/client.cert" --key "$RETIRED_CERT_DIR/client.key" \
+      "$@" "https://$E2E_REGISTRY$path"
+  }
+  for path in "/v2/$CH_ONDEMAND/tags/list" "/v2/$CH_ONDEMAND/manifests/${IMAGE_TAG[$CH_ONDEMAND]}"; do
+    ccode=$(registry_status "$path")
+    [[ "$ccode" == 200 ]] ||
+      fail "cork's read-write certificate got HTTP $ccode from $path, so a refusal of the retired identity there would say nothing"
+    rcode=$(retired_curl "$path" -o /dev/null -w '%{http_code}' 2>/dev/null) || true
+    case "${rcode:-000}" in
+      401|403) note "retired worker identity, GET $path: HTTP $rcode" ;;
+      000) fail "the retired worker certificate was refused at the TLS handshake on $path, so the probe never reached zot's policy: it is signed by the zot CA and should get that far" ;;
+      *) fail "a certificate whose name zot's policy does not list got HTTP $rcode from $E2E_REGISTRY$path: renaming the worker identity is how a leaked worker certificate is revoked, and this one can still read" ;;
+    esac
+  done
+  # The catalog may answer an authenticated name with 200, filtered to what it
+  # may read; for this identity that has to be nothing.
+  out=$(retired_curl /v2/_catalog -w '\n%{http_code}' 2>/dev/null) || out=$'\n000'
+  rcode=${out##*$'\n'}
+  case "$rcode" in
+    401|403) note "retired worker identity, GET /v2/_catalog: HTTP $rcode" ;;
+    200)
+      listed=$(jq -r '.repositories // [] | length' <<<"${out%$'\n'*}") || listed=unparseable
+      [[ "$listed" == 0 ]] ||
+        fail "the retired worker identity sees $listed repositories in $E2E_REGISTRY/v2/_catalog: its name is in no policy, so it may list nothing"
+      note "retired worker identity, GET /v2/_catalog: HTTP 200 with no repositories"
+      ;;
+    *) fail "the retired worker identity got HTTP $rcode from $E2E_REGISTRY/v2/_catalog" ;;
+  esac
+  ok "the worker's certificate read $probe_src from zot and was refused the push of $probe_ref, which left neither tag nor repository behind; an anonymous client was refused /v2/, the tag list and the catalog, all three of which cork's own certificate reads; a CA-signed certificate under a retired worker name was refused the tag list and the manifest, and listed nothing"
 else
-  deselect "registry identities: the worker's certificate is read-only and anonymous access is refused"
+  deselect "registry identities: the worker's certificate is read-only, anonymous access is refused, and a retired worker name reads nothing"
 fi
 
 # ------------------------------------------------- 6b. launch slot burst

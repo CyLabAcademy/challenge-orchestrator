@@ -97,6 +97,7 @@ services:
       - worker-docker-certs:/dist/worker-docker
       - worker-registry-certs:/dist/worker-registry
       - zot-certs:/dist/zot
+      - retired-registry-certs:/dist/retired-registry
 
   zot:
     image: ghcr.io/project-zot/zot-linux-amd64:v2.1.18
@@ -290,6 +291,8 @@ services:
       - challenges:/challenges
       - cork-docker-certs:/root/.docker_certs:ro
       - cork-registry-certs:/etc/docker/certs.d/zot.internal:ro
+      # A rotated-out worker identity, for the registry identities step.
+      - retired-registry-certs:/opt/e2e/retired-registry:ro
       # corkd's own state, writable, for the one step that has to hold
       # SQLite's write lock from outside corkd. Nothing else reads it: every
       # other assertion goes through the HTTP API.
@@ -321,6 +324,7 @@ volumes:
   worker-docker-certs:    # worker dockerd server identity
   worker-registry-certs:  # worker -> zot, read-only (certs.d)
   zot-certs:              # registry server identity
+  retired-registry-certs: # a worker identity zot's policy no longer lists (scenario only)
   # State
   challenges:             # writable copy of the challenge tree (CORK_DIR)
   cork-data:
