@@ -14,7 +14,7 @@
 #   zot-ca-cert / zot-ca-key            zot CA (registry mTLS)
 #   zot-server-cert / -key              zot server            (CN/SAN = registry address)
 #   zot-client-cert / -key              cmgr -> zot, READ-WRITE (CN cmgr; orchestrator push + delete)
-#   zot-worker-cert / -key              worker -> zot, READ-ONLY (CN worker; image pull, shared)
+#   zot-worker-cert / -key              worker -> zot, READ-ONLY (CN $ZOT_WORKER_CN; image pull, shared)
 #
 # "client" is the orchestrator (cmgr) in both domains. zot has a second client — the
 # workers' read-only pull identity — which gets the "worker" role since it is the one
@@ -37,18 +37,41 @@
 # Re-running reuses existing CAs in $OUT, so leaves can be re-issued (or new ones
 # added) without re-deploying either CA across the fleet.
 #
+# Partial rotation: LEAVES names the leaves to re-issue and leaves the rest alone.
+# Copy in the CA cert + key of each domain involved; with LEAVES set, a missing CA
+# is an error, not a new CA. To revoke the worker identity, re-issue zot-worker
+# under a new ZOT_WORKER_CN and swap the name in zot's policy:
+#   LEAVES=zot-worker ZOT_WORKER_CN=worker-2026b ./gen-docker-certs.sh
+#
 # SECURITY: docker-ca-key.pem and zot-ca-key.pem never leave this machine — they are
 # deployed to NO box. zot must keep anonymousPolicy/defaultPolicy empty; the CNs above
-# are the only identities (users "cmgr" and "worker" in zot's config.json).
+# are the only identities (users "cmgr" and $ZOT_WORKER_CN in zot's config.json).
 #
 # Usage: ./gen-docker-certs.sh [registry-address]   (default 10.12.34.121)
 #   env: DAYS=3650  OUT=./docker-certs  WORKER_SERVERNAME=academy-docker-worker
+#        ZOT_WORKER_CN=worker  LEAVES="docker-server docker-client zot-server zot-client zot-worker"
 set -euo pipefail
 
 REGISTRY="${1:-10.12.34.121}"                              # zot's address (IP or DNS name)
 WORKER_NAME="${WORKER_SERVERNAME:-academy-docker-worker}"  # must match WORKER_SERVERNAME in cork/workers.go
 DAYS="${DAYS:-3650}"                                       # cert validity (~10 years; private CA)
 OUT="${OUT:-./docker-certs}"
+ZOT_WORKER_CN="${ZOT_WORKER_CN:-worker}"                   # must be a user in zot's accessControl
+
+ALL_LEAVES="docker-server docker-client zot-server zot-client zot-worker"
+PARTIAL=0
+if [[ -n "${LEAVES:-}" ]]; then
+  PARTIAL=1
+else
+  LEAVES="$ALL_LEAVES"
+fi
+for leaf in $LEAVES; do
+  if [[ " $ALL_LEAVES " != *" $leaf "* ]]; then
+    echo "unknown leaf '$leaf' in LEAVES (choose from: $ALL_LEAVES)" >&2
+    exit 1
+  fi
+done
+wants() { [[ " $LEAVES " == *" $1 "* ]]; }
 
 mkdir -p "$OUT"
 cd "$OUT"
@@ -58,6 +81,10 @@ make_ca() {
   local domain="$1" cn="$2"
   if [[ -f "$domain-ca-cert.pem" && -f "$domain-ca-key.pem" ]]; then
     echo "== CA $domain (reusing existing) =="
+  elif (( PARTIAL )); then
+    # A new CA here would sign leaves that nothing in the fleet trusts.
+    echo "LEAVES is set but $(pwd) has no $domain-ca-cert.pem + $domain-ca-key.pem: copy in the existing $domain CA" >&2
+    exit 1
   else
     echo "== CA $domain =="
     openssl genrsa -out "$domain-ca-key.pem" 4096
@@ -88,42 +115,56 @@ else
   REGISTRY_SAN="DNS:$REGISTRY,IP:127.0.0.1"
 fi
 
-make_ca docker cmgr-docker-ca
-make_ca zot    cmgr-zot-ca
+if wants docker-server || wants docker-client; then
+  make_ca docker cmgr-docker-ca
+fi
+if wants zot-server || wants zot-client || wants zot-worker; then
+  make_ca zot cmgr-zot-ca
+fi
 
-echo "== [docker] worker dockerd server cert (shared, ServerName $WORKER_NAME) =="
-issue docker server "$WORKER_NAME" \
-  "subjectAltName = DNS:$WORKER_NAME" \
-  "extendedKeyUsage = serverAuth"
+if wants docker-server; then
+  echo "== [docker] worker dockerd server cert (shared, ServerName $WORKER_NAME) =="
+  issue docker server "$WORKER_NAME" \
+    "subjectAltName = DNS:$WORKER_NAME" \
+    "extendedKeyUsage = serverAuth"
+fi
 
-echo "== [docker] cmgr client cert (corkd -> worker dockerd) =="
-issue docker client "cmgr" \
-  "extendedKeyUsage = clientAuth"
+if wants docker-client; then
+  echo "== [docker] cmgr client cert (corkd -> worker dockerd) =="
+  issue docker client "cmgr" \
+    "extendedKeyUsage = clientAuth"
+fi
 
-echo "== [zot] zot server cert (registry @ $REGISTRY) =="
-issue zot server "$REGISTRY" \
-  "subjectAltName = $REGISTRY_SAN" \
-  "extendedKeyUsage = serverAuth"
+if wants zot-server; then
+  echo "== [zot] zot server cert (registry @ $REGISTRY) =="
+  issue zot server "$REGISTRY" \
+    "subjectAltName = $REGISTRY_SAN" \
+    "extendedKeyUsage = serverAuth"
+fi
 
-echo "== [zot] cmgr client cert (orchestrator push + corkd delete, read-write) =="
-issue zot client "cmgr" \
-  "extendedKeyUsage = clientAuth"
+if wants zot-client; then
+  echo "== [zot] cmgr client cert (orchestrator push + corkd delete, read-write) =="
+  issue zot client "cmgr" \
+    "extendedKeyUsage = clientAuth"
+fi
 
-echo "== [zot] worker client cert (image pull, read-only) =="
-issue zot worker "worker" \
-  "extendedKeyUsage = clientAuth"
+if wants zot-worker; then
+  echo "== [zot] worker client cert (image pull, read-only, CN $ZOT_WORKER_CN) =="
+  issue zot worker "$ZOT_WORKER_CN" \
+    "extendedKeyUsage = clientAuth"
+fi
 
 echo "== lock down + clean up =="
-chmod 0400 docker-ca-key.pem zot-ca-key.pem \
-  docker-server-key.pem docker-client-key.pem \
-  zot-server-key.pem zot-client-key.pem zot-worker-key.pem
-chmod 0444 docker-ca-cert.pem zot-ca-cert.pem \
-  docker-server-cert.pem docker-client-cert.pem \
-  zot-server-cert.pem zot-client-cert.pem zot-worker-cert.pem
+chmod 0400 ./*-key.pem
+chmod 0444 ./*-cert.pem
 rm -f docker-ca-cert.srl zot-ca-cert.srl
 
 echo "done -> $(pwd)"
 ls -l
+if (( PARTIAL )); then
+  echo
+  echo "Re-issued only: $LEAVES. Every other file here is as it was."
+fi
 
 cat <<EOF
 
