@@ -100,7 +100,7 @@ services:
       - retired-registry-certs:/dist/retired-registry
 
   zot:
-    image: ghcr.io/project-zot/zot-linux-amd64:v2.1.18
+    image: ghcr.io/project-zot/zot-linux-amd64:v2.1.22
     command: ["serve", "/etc/zot/config.json"]
     # Reached as zot.internal on 443: the registry address doubles as the
     # certs.d directory name, and a colon (host:port) in a mount target is

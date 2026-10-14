@@ -183,7 +183,7 @@ workers NEVER get a cmgr cert of either CA (that's the orchestrator's identity)
 
 ### Registry
 
-1. Install zot onto the server https://zotregistry.dev/v2.1.18/
+1. Install zot onto the server https://zotregistry.dev/v2.1.22/
 2. config-examples/zot/config.json -> /etc/zot/config.json
 3. config-examples/zot/zot.service -> /etc/systemd/system/zot.service
 4. Transfer the certificates over appropriately
