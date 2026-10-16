@@ -63,9 +63,9 @@ docker compose run --rm e2e    # the scenario
 `./run.sh` runs the regular mode; `./run.sh --full` (or `E2E_FULL=1`) adds the
 steps that are only worth their seconds when nobody is waiting: the registry's
 failure paths, artifact delivery, multi-container challenges, cold pulls,
-docker-reaper and container resource limits. A regular run names the full-mode
-steps it did not take, and its verdict says which mode it was, so the two are
-never confused for one another.
+preloading, docker-reaper and container resource limits. A regular run names
+the full-mode steps it did not take, and its verdict says which mode it was, so
+the two are never confused for one another.
 
 Full mode also converges a **second schema**, `schema-full.yaml`, alongside the
 first. It holds one challenge, the multi-container `aptitude-and-privileges`,

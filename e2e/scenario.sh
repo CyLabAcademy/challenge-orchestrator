@@ -227,6 +227,11 @@ declare -A FAKES=()   # fake telemetry container id -> the sidecar it replaced
 BLOCKER_NAME=e2e-reconcile-blocker
 BLOCKER_NET=cmgr-997
 BLOCKER_WORKER=""     # worker ip currently holding that blocker, if any
+# The preload step holds a superseded generation on a worker the same way, so
+# that corkd's delete of it is refused and the image is tagged stale.
+HOLDER_NAME=e2e-preload-holder
+HOLDER_WORKER=""      # worker ip currently holding it, if any
+HOLDER_STALE=""       # the stale tag it leaves there
 
 # Full-mode state. A step plants an orphan corkd is expected to reclaim later
 # in the same step; until it does, the run owes the worker its removal, since a
@@ -259,7 +264,7 @@ MULTI_INST=""         # its multi-container instance, if the run dies between la
 DB_LOCK_PID=""        # a sqlite3 holding corkd's write lock open on purpose
 DB_LOCK_FD=""         # the write end of the fifo feeding it, kept open by this shell
 cleanup() {
-  local status=$? fake
+  local status=$? fake ip
   # Before anything else: while the stand-in writer holds corkd's write
   # lock, every API call below would be refused as a busy database.
   if [[ -n "$DB_LOCK_FD" ]]; then exec {DB_LOCK_FD}>&- 2>/dev/null || true; DB_LOCK_FD=""; fi
@@ -293,6 +298,12 @@ cleanup() {
     # whole reconcile budget before it can take placements.
     worker_status "$BLOCKER_WORKER" "/containers/$BLOCKER_NAME?force=true" -X DELETE >/dev/null 2>&1 || true
     worker_status "$BLOCKER_WORKER" "/networks/$BLOCKER_NET" -X DELETE >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$HOLDER_WORKER" ]]; then
+    worker_status "$HOLDER_WORKER" "/containers/$HOLDER_NAME?force=true" -X DELETE >/dev/null 2>&1 || true
+    for ip in "${WORKER_IPS[@]}"; do
+      worker_status "$ip" "/images/$HOLDER_STALE" -X DELETE >/dev/null 2>&1 || true
+    done
   fi
   if [[ -n "$ORPHAN_WORKER" ]]; then
     # Container first, as for the blocker above: while it runs, its network
@@ -4109,6 +4120,146 @@ else
   deselect "update, generation 5 without --prune-old"
 fi
 
+if (( FULL )); then
+step "preload: every worker holds every image the schema launches before any launch asks for one; a redeploy is pulled onto both and the generation it replaced is removed from both, kept as stale where a container still uses it until nothing does; preload-remove lists what it leaves"
+# What the schema launches: each service build's non-builder images.
+preload_want() {
+  local challenge seed checksum host
+  while read -r challenge seed checksum host; do
+    printf '%s\n' "$E2E_REGISTRY/$challenge:$(printf 's%d-%x-%s' "$seed" "$checksum" "$host")"
+  done < <(api GET "/schemas/$SCHEMA_NAME" | jq -r '.[] | select(.delivery_type == "service") | .id as $c
+    | .builds[] | . as $b | .images[] | select(.host != "builder") | "\($c) \($b.seed) \($b.checksum) \(.host)"')
+}
+mapfile -t PRELOAD_WANT < <(preload_want)
+(( ${#PRELOAD_WANT[@]} > 0 )) || fail "schema $SCHEMA_NAME launches no images, so there is nothing to preload"
+# The negative control: without it a fleet that already held everything would
+# pass the wait below without the preload pulling a thing. Nothing runs
+# $CH_MAKE at this point, so its image can go from both boxes.
+PRELOAD_COLD=""
+for ref in "${PRELOAD_WANT[@]}"; do
+  if [[ "$ref" == "$E2E_REGISTRY/$CH_MAKE:"* ]]; then PRELOAD_COLD=$ref; fi
+done
+[[ -n "$PRELOAD_COLD" ]] || fail "schema $SCHEMA_NAME launches no image of $CH_MAKE to take off the workers"
+for ip in "${WORKER_IPS[@]}"; do
+  code=$(worker_status "$ip" "/images/$PRELOAD_COLD" -X DELETE)
+  case "$code" in
+    200|404) ;;
+    409) fail "worker $ip refuses to delete $PRELOAD_COLD because a container still uses it: this step expects nothing to run $CH_MAKE" ;;
+    *) fail "deleting $PRELOAD_COLD from worker $ip answered HTTP $code" ;;
+  esac
+  if has_line "$PRELOAD_COLD" worker_tags "$ip"; then fail "worker $ip still holds $PRELOAD_COLD after the delete"; fi
+done
+note "took $PRELOAD_COLD off both workers"
+out=$(cork preload-add "$SCHEMA_NAME") || fail "cork preload-add $SCHEMA_NAME failed: $out"
+sed 's/^/       /' <<<"$out"
+preloaded_everywhere() {
+  api GET /preloads | jq -e --arg s "$SCHEMA_NAME" --argjson n "${#PRELOAD_WANT[@]}" \
+    '[.[] | select(.schema == $s)] | length == 1 and (.[0].images == $n)
+      and (.[0].workers | length == 2 and all(.held == $n and .last_pass != null))' >/dev/null
+}
+retry 300 "both workers to hold all ${#PRELOAD_WANT[@]} image(s) of $SCHEMA_NAME" preloaded_everywhere
+# Checked against each daemon too: preload-list reports what corkd last saw.
+for ip in "${WORKER_IPS[@]}"; do
+  for ref in "${PRELOAD_WANT[@]}"; do
+    has_line "$ref" worker_tags "$ip" || fail "preload-list reports worker $ip complete, but its daemon does not hold $ref"
+  done
+done
+out=$(cork preload-list)
+sed 's/^/       /' <<<"$out"
+(( $(grep -c ' ready$' <<<"$out") == 2 )) || fail "preload-list does not show both workers ready"
+note "both workers hold all ${#PRELOAD_WANT[@]} image(s) the schema launches"
+
+# A container corkd does not manage holds generation 5 on $WA through the
+# redeploy, as an instance the rebuild has yet to stop would. Created, not
+# started: dockerd refuses the unforced delete for any container. Its
+# cmgr.managed is not "true", for the reason the blocker's is not.
+holder=$(worker_api "$WA" "/containers/create?name=$HOLDER_NAME" -X POST -H 'Content-Type: application/json' \
+  -d "$(jq -cn --arg img "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G5" '{Image: $img, Labels: {"cmgr.managed": "e2e-holder"}}')" | jq -r .Id)
+[[ -n "$holder" && "$holder" != null ]] || fail "could not create the holder container $HOLDER_NAME on $WA"
+HOLDER_WORKER=$WA
+HOLDER_STALE="$E2E_REGISTRY/$CH_ONDEMAND:stale-$OD_TAG_G5"
+
+# The redeploy. --prune-old so the generation this displaces from retention
+# leaves the builder and registry here rather than as an orphan to clean up.
+PRELOAD_GEN=50 # a generation no other step builds, so each still finds its own change
+set_generation $PRELOAD_GEN ondemand
+out=$(cork update --prune-old) || fail "cork update exited non-zero building generation $PRELOAD_GEN of $CH_ONDEMAND: $out"
+sed 's/^/       /' <<<"$out"
+grep -q "  $CH_ONDEMAND$" <<<"$out" || fail "$CH_ONDEMAND was not rebuilt"
+OD_TAG_PRELOAD=$(image_tag "$(api GET "/builds/$OD_BUILD")" challenge)
+[[ "$OD_TAG_PRELOAD" != "$OD_TAG_G5" ]] || fail "generation $PRELOAD_GEN has generation 5's tag: nothing was redeployed"
+for id in "${OD_IDS[@]}"; do
+  assert_torn_down "$id"
+done
+OD_IDS=()
+redeployed_everywhere() {
+  local ip tags
+  for ip in "${WORKER_IPS[@]}"; do
+    tags=$(worker_tags "$ip")
+    grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_PRELOAD" <<<"$tags" || return 1
+    if grep -qx "$E2E_REGISTRY/$CH_ONDEMAND:$OD_TAG_G5" <<<"$tags"; then return 1; fi
+  done
+}
+retry 120 "both workers to pull generation $PRELOAD_GEN of $CH_ONDEMAND and drop generation 5" redeployed_everywhere
+# Only the workers were told to let it go: generation 5 is the rollback target.
+has_line "$OD_TAG_G5" registry_tags "$CH_ONDEMAND" ||
+  fail "generation 5 ($OD_TAG_G5) left the registry: preloading removes from workers only, and it is the rollback target"
+for ip in "${WORKER_IPS[@]}"; do
+  for ref in "${PRELOAD_WANT[@]}"; do
+    [[ "$ref" == "$E2E_REGISTRY/$CH_ONDEMAND:"* ]] && continue
+    has_line "$ref" worker_tags "$ip" || fail "the redeploy of $CH_ONDEMAND cost worker $ip the image $ref of a challenge it did not touch"
+  done
+done
+note "both workers pulled $OD_TAG_PRELOAD and dropped $OD_TAG_G5, which zot still holds as the rollback target"
+
+# On $WA the holder kept generation 5, under its stale tag. $WB may have too:
+# the pass a landing build kicks can reach the delete before the rebuild has
+# stopped that worker's own generation 5 instance.
+has_line "$HOLDER_STALE" worker_tags "$WA" ||
+  fail "generation 5 left $WA while $HOLDER_NAME still used it: the delete is not forced, so the image should be kept as $HOLDER_STALE"
+code=$(worker_status "$WA" "/containers/$HOLDER_NAME?force=true" -X DELETE)
+[[ "$code" == 204 ]] || fail "could not remove the holder container from $WA: HTTP $code"
+# A later pass deletes it once nothing uses it; preload-add again (it is
+# idempotent) asks for one now rather than at the sweep.
+out=$(cork preload-add "$SCHEMA_NAME") || fail "cork preload-add $SCHEMA_NAME a second time failed: $out"
+stale_gone() {
+  local ip
+  for ip in "${WORKER_IPS[@]}"; do
+    if has_line "$HOLDER_STALE" worker_tags "$ip"; then return 1; fi
+  done
+}
+retry 60 "both workers to delete $HOLDER_STALE once nothing uses it" stale_gone
+HOLDER_WORKER=""
+note "$WA kept generation 5 as $HOLDER_STALE while a container used it, and both workers deleted it once none did"
+
+out=$(cork preload-remove "$SCHEMA_NAME") || fail "cork preload-remove $SCHEMA_NAME failed: $out"
+sed 's/^/       /' <<<"$out"
+# Nothing else is preloaded, so all the schema launches now leaves corkd's
+# cleanup, and preload-remove names each image.
+mapfile -t PRELOAD_RELEASED < <(preload_want)
+grep -q "no longer cleans up these ${#PRELOAD_RELEASED[@]} image(s)" <<<"$out" ||
+  fail "preload-remove did not report the ${#PRELOAD_RELEASED[@]} image(s) it leaves on the workers"
+for ref in "${PRELOAD_RELEASED[@]}"; do
+  grep -qx "  $ref" <<<"$out" || fail "preload-remove did not list $ref among the images corkd no longer cleans up"
+done
+[[ "$(cork preload-list)" == "no schema is preloaded" ]] || fail "preload-list still shows a preload after preload-remove"
+IMAGE_TAG[$CH_ONDEMAND]=$OD_TAG_PRELOAD
+# Back to the shape the later steps expect: tracked instances on both workers.
+retry 30 "both workers to report ok after the rebuild" all_workers_ok
+for i in 70 71; do
+  inst=$(launch "$OD_BUILD" "e2e-user-$i" "e2e-value-$i")
+  track "$inst" "$i"
+done
+ensure_instance_on "$WB" 72
+ensure_instance_on "$WA" 73
+for id in "${OD_IDS[@]}"; do
+  check_ondemand "${INST_META[$id]}" "${INST_USER[$id]}" "E2E_GENERATION=$PRELOAD_GEN"
+done
+ok "preloaded ${#PRELOAD_WANT[@]} image(s) onto both workers ahead of any launch, followed a redeploy onto both and removed the generation it replaced from both, keeping it as stale on $WA until a container there let it go, then handed the schema back to on-demand pulls, listing the ${#PRELOAD_RELEASED[@]} image(s) it leaves on the workers, with ${#OD_IDS[@]} instances serving generation $PRELOAD_GEN"
+else
+  deselect "preload"
+fi
+
 
 # =========================================================================
 
@@ -6372,8 +6523,35 @@ step "seccomp: a challenge's own policy reaches the container, through the runti
   MULTI_INST=""
   ok "$CH_SECCOMP declared the profile '$sec_profile', instance $SEC_INST ran on $SEC_WORKER under oci-interceptor carrying a seccomp policy, and its own solver got build $SEC_BUILD's flag -- which it only serves when that profile was applied"
 
-step "removing the second schema takes its builds and its images and leaves the first schema whole"
+step "removing the second schema takes its builds and its images and leaves the first schema whole; preloaded, its images stay on the workers for an operator"
+  # Preloaded first, so the removal also says what a preloaded schema leaves:
+  # corkd's cleanup lasts as long as the preload, so the images stay on the
+  # workers, and an operator takes them. Its instance is stopped by now, so
+  # nothing holds them.
+  MULTI_REFS=()
+  for host in "$MULTI_FRONT" "$MULTI_BACK"; do
+    MULTI_REFS+=("$E2E_REGISTRY/$CH_MULTI:$(image_tag "$MULTI_META" "$host")")
+  done
+  multi_on_workers() { # multi_on_workers all|none
+    local ip ref
+    for ip in "${WORKER_IPS[@]}"; do
+      for ref in "${MULTI_REFS[@]}"; do
+        if has_line "$ref" worker_tags "$ip"; then [[ "$1" == all ]] || return 1; else [[ "$1" == none ]] || return 1; fi
+      done
+    done
+  }
+  out=$(cork preload-add "$MULTI_SCHEMA") || fail "cork preload-add $MULTI_SCHEMA failed: $out"
+  retry 300 "both workers to hold $CH_MULTI's two runtime images" multi_on_workers all
   cork remove-schema "$MULTI_SCHEMA" || fail "remove-schema $MULTI_SCHEMA failed"
+  [[ "$(cork preload-list)" == "no schema is preloaded" ]] || fail "the preload of $MULTI_SCHEMA outlived the schema"
+  multi_on_workers all || fail "removing preloaded schema $MULTI_SCHEMA took its images off a worker; they are an operator's to vet"
+  for ip in "${WORKER_IPS[@]}"; do
+    for ref in "${MULTI_REFS[@]}"; do
+      code=$(worker_status "$ip" "/images/$ref" -X DELETE)
+      [[ "$code" == 200 ]] || fail "deleting $ref from worker $ip by hand answered HTTP $code"
+    done
+  done
+  multi_on_workers none || fail "worker still holds an image of $CH_MULTI after deleting it by hand"
   MULTI_SCHEMA_ADDED=""
   if has_line "$MULTI_SCHEMA" cork list-schemas; then fail "schema $MULTI_SCHEMA is still listed after remove-schema"; fi
   has_line "$SCHEMA_NAME" cork list-schemas ||
@@ -6394,7 +6572,7 @@ step "removing the second schema takes its builds and its images and leaves the 
       fail "the $host image of build $MULTI_BUILD is still on the builder after its schema was removed; destroyImages left it behind$([[ "$host" == "$MULTI_PRIVATE" ]] && printf ' -- and that stage holds the flag and the ssh key in plain text')"
     fi
   done
-  ok "schema $MULTI_SCHEMA converged alongside $SCHEMA_NAME without touching its builds or its persistent instance; $CH_MULTI shipped two runtime images and kept '$MULTI_PRIVATE' out of the registry; it handed over whole to a daemon that builds nothing, all three stages recorded and a payload missing one refused; instance $multi_done ran $MULTI_FRONT (0.5 cpu, published at $mpub:$mport) and $MULTI_BACK (0.25 cpu, unpublished) on one cmgr network and returned its flag over ssh from $MULTI_BACK through $MULTI_FRONT; the stop removed both containers and the network, and remove-schema left $SCHEMA_NAME whole"
+  ok "schema $MULTI_SCHEMA converged alongside $SCHEMA_NAME without touching its builds or its persistent instance; $CH_MULTI shipped two runtime images and kept '$MULTI_PRIVATE' out of the registry; it handed over whole to a daemon that builds nothing, all three stages recorded and a payload missing one refused; instance $multi_done ran $MULTI_FRONT (0.5 cpu, published at $mpub:$mport) and $MULTI_BACK (0.25 cpu, unpublished) on one cmgr network and returned its flag over ssh from $MULTI_BACK through $MULTI_FRONT; the stop removed both containers and the network, and remove-schema left $SCHEMA_NAME whole and, the schema being preloaded, left both runtime images on both workers for the operator's hand"
 else
   deselect "a second schema and the multi-container delivery shape"
 fi
