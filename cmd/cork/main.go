@@ -88,6 +88,12 @@ func main() {
 		exitCode = workerDownCommand(c, cmdArgs)
 	case "worker-list":
 		exitCode = workerListCommand(c, cmdArgs)
+	case "preload-add":
+		exitCode = preloadAddCommand(c, cmdArgs)
+	case "preload-remove":
+		exitCode = preloadRemoveCommand(c, cmdArgs)
+	case "preload-list":
+		exitCode = preloadListCommand(c, cmdArgs)
 	case "pin-list":
 		exitCode = pinListCommand(c, cmdArgs)
 	case "pin-refresh":
@@ -181,6 +187,31 @@ Workers:
       the fleet, each worker's two health axes (reachable, from its docker
       daemon; load, from its telemetry agent), how long it has been in that
       state, why, and how many instances it holds
+
+Preloads (when a schema's images fit on every worker, pull them ahead of its launches):
+  preload-add <schema>
+      pull every image the schema launches onto every worker, including
+      workers added later, without holding any worker out of placement: a
+      worker serves without pulling once preload-list shows it ready.
+      Cleanup is then corkd's, not docker-reaper's, for as long as the
+      schema is preloaded: after its pulls, each worker deletes the images
+      of its challenges that no current build launches, though not before
+      pulling a version that landed meanwhile. An image a container still
+      uses (an instance the update has yet to stop, a launch it overtook)
+      is tagged <repo>:stale-<tag> instead, for a later pass to delete
+      once nothing uses it. The workers' image store
+      has to hold the whole set plus a second version of what one update
+      redeploys, with docker-reaper's image eviction off. What the preload
+      stops covering -- the schema removed with remove-schema, a challenge
+      dropped from it -- may stay on the workers unless another preloaded
+      schema shares the challenge, and corkd's log lists those images
+  preload-remove <schema>
+      go back to pulling on demand: the workers pull no more of the
+      schema's images, the ones already pulled stay, and the ones that may
+      remain uncleaned are listed: turn docker-reaper's image eviction back
+      on, or remove them by hand
+  preload-list
+      each preloaded schema, and how many of its images each worker holds
 
 Base image pins:
   pin-list
