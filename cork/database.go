@@ -170,6 +170,12 @@ const schemaQuery string = `
 		public TEXT NOT NULL DEFAULT ''
 	);
 
+	-- Schemas every worker holds the images of (see preload.go). Not a
+	-- foreign key: a schema is the builds that name it, with no row of its own.
+	CREATE TABLE IF NOT EXISTS preloads (
+		schema TEXT NOT NULL PRIMARY KEY
+	);
+
 	CREATE TABLE IF NOT EXISTS containers (
 		instance INTEGER NOT NULL,
 		id TEXT NOT NULL PRIMARY KEY,

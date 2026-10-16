@@ -94,6 +94,7 @@ func (m *Manager) initBuildPlane() error {
 // or reclaiming them.
 var orchestratorOnlySettings = []string{
 	CONCURRENT_LAUNCHES_ENV,
+	PRELOAD_PULLS_ENV,
 	PORTS_ENV,
 	IFACE_ENV,
 	DISK_QUOTA_ENV,

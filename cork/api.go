@@ -52,6 +52,7 @@ func NewManager(logLevel LogLevel, options ...ManagerOption) *Manager {
 	}
 
 	mgr.workerTiming = mgr.workerTimingFromEnv()
+	mgr.preloadPulls = mgr.preloadPullSlots()
 
 	if err := mgr.setDirectories(); err != nil {
 		return nil
@@ -66,6 +67,10 @@ func NewManager(logLevel LogLevel, options ...ManagerOption) *Manager {
 	}
 
 	if err := mgr.initDatabase(); err != nil {
+		return nil
+	}
+	if err := mgr.notePreloading(); err != nil {
+		mgr.log.errorf("could not read whether any schema is preloaded: %s", err)
 		return nil
 	}
 
@@ -308,8 +313,8 @@ func (m *Manager) UpdateWithOptions(fp string, options UpdateOptions) *Challenge
 	// ports twice, and taking the network the other had just created for a
 	// leftover of an earlier generation (startNetwork). An update is an
 	// operator action, so the second one waits rather than being refused.
-	m.updateMu.Lock()
-	defer m.updateMu.Unlock()
+	m.lockUpdates()
+	defer m.unlockUpdates()
 
 	cu := m.DetectChanges(fp)
 	errs := m.addChallenges(cu.Added)
@@ -350,7 +355,9 @@ func (m *Manager) Build(challenge ChallengeId, seeds []int, flagFormat string) (
 	if m.externalBuildPlane {
 		return nil, ErrExternalBuildPlane
 	}
+	m.randMu.Lock()
 	schema := fmt.Sprintf("%s%x", manualSchemaPrefix, m.rand.Int63())
+	m.randMu.Unlock()
 	instanceCount := -1
 
 	builds := make([]*BuildMetadata, len(seeds))
@@ -648,8 +655,8 @@ func (m *Manager) ListSchemas() ([]string, error) {
 // boundary, and never inside: the unlocked helpers below are what the
 // operations call each other through.
 func (m *Manager) CreateSchema(schema *Schema) []error {
-	m.updateMu.Lock()
-	defer m.updateMu.Unlock()
+	m.lockUpdates()
+	defer m.unlockUpdates()
 	return m.createSchema(schema)
 }
 
@@ -671,8 +678,8 @@ func (m *Manager) createSchema(schema *Schema) []error {
 // state.  Serialized with rebuilds and other schema operations; see
 // CreateSchema.
 func (m *Manager) UpdateSchema(schema *Schema) []error {
-	m.updateMu.Lock()
-	defer m.updateMu.Unlock()
+	m.lockUpdates()
+	defer m.unlockUpdates()
 
 	exists, err := m.schemaExists(schema.Name)
 	if err != nil {
@@ -831,15 +838,21 @@ func (m *Manager) convergeBuildInstances(buildMeta *BuildMetadata, cMeta *Challe
 // tag is content-addressed so the orchestrator taking it resolves the same
 // one.
 func (m *Manager) DeleteSchema(name string, retire bool) error {
-	m.updateMu.Lock()
-	defer m.updateMu.Unlock()
+	m.lockUpdates()
+	defer m.unlockUpdates()
 
 	err := m.lockSchema(name)
 	if err != nil {
 		return err
 	}
 
-	return m.cleanupSchemaResources(name, retire)
+	if err := m.cleanupSchemaResources(name, retire); err != nil {
+		return err
+	}
+	// A preload goes with its schema, here only: one an update leaves empty
+	// (a converge that failed) is still preloaded when it comes back.
+	_, err = m.db.Exec("DELETE FROM preloads WHERE schema = ?;", name)
+	return err
 }
 
 // cleanupSchemaResources stops what a schema runs and takes its builds

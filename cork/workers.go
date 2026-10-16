@@ -369,6 +369,10 @@ type workerConn struct {
 	// control call has failed. Buffered and sent to without blocking, so a
 	// burst of failing launches costs one extra probe, not one each.
 	probeNow chan struct{}
+	// preloadNow asks the preloader for a pass (kickPreloads), the same way;
+	// preload is what its passes found (see preload.go).
+	preloadNow chan struct{}
+	preload    preloadStatus
 }
 
 type WorkerInfo struct {
@@ -420,6 +424,10 @@ func (m *Manager) EnableWorkerPlacement() {
 // per worker. Unreachable workers are marked down by their pollers and skipped
 // by placement — never a startup failure.
 func (m *Manager) initWorkers() error {
+	// Under the lock, as in AddWorker: each conn's goroutine starts inside
+	// newWorkerConn and may read the map before the loop below is through.
+	m.workersMu.Lock()
+	defer m.workersMu.Unlock()
 	m.workers = make(map[string]*workerConn)
 
 	var rows []struct {
@@ -503,13 +511,14 @@ func (m *Manager) newWorkerConn(ip, public string, fromRecovery bool) (*workerCo
 	}
 
 	w := &workerConn{
-		ip:        ip,
-		public:    public,
-		cli:       cli,
-		queue:     newDaemonQueue(slots(m.launchConcurrency)),
-		unreachCh: make(chan struct{}),
-		done:      make(chan struct{}),
-		probeNow:  make(chan struct{}, 1),
+		ip:         ip,
+		public:     public,
+		cli:        cli,
+		queue:      newDaemonQueue(slots(m.launchConcurrency)),
+		unreachCh:  make(chan struct{}),
+		done:       make(chan struct{}),
+		probeNow:   make(chan struct{}, 1),
+		preloadNow: make(chan struct{}, 1),
 	}
 	// Fail closed for placement until the box has proved itself: unresponsive
 	// with its load unknown, which is what is actually true of a worker
@@ -545,6 +554,9 @@ func (m *Manager) runWorker(w *workerConn) {
 		// Its load stays unknown until telemetry answers, which does not hold
 		// it back: unknown places.
 		m.setReachable(w, workerReachableOk, "")
+		// Alongside placement, not before it: a worker added under load is
+		// needed now, and its launches pull as they always have meanwhile.
+		go m.preloadLoop(w)
 		m.pollWorker(w)
 	case reconcileEjected:
 		// The daemon never answered. Poll anyway: the worker is out of

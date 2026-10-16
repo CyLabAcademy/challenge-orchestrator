@@ -27,9 +27,11 @@ const (
 	// where it is read; it is a constant so the list of what a build plane
 	// ignores can name it (orchestratorOnlySettings).
 	CONCURRENT_LAUNCHES_ENV string = "CORK_CONCURRENT_LAUNCHES"
-	DISK_QUOTA_ENV          string = "CORK_ENABLE_DISK_QUOTAS"
-	PRUNE_AGE_ENV           string = "CORK_PRUNE_AGE"
-	DB_WAL_ENV              string = "CORK_DB_WAL"
+	// PRELOAD_PULLS_ENV caps preload pulls across the fleet (see preload.go).
+	PRELOAD_PULLS_ENV string = "CORK_PRELOAD_PULLS"
+	DISK_QUOTA_ENV    string = "CORK_ENABLE_DISK_QUOTAS"
+	PRUNE_AGE_ENV     string = "CORK_PRUNE_AGE"
+	DB_WAL_ENV        string = "CORK_DB_WAL"
 
 	// Worker tunables (see workerTiming in workers.go).
 	WORKER_POLL_INTERVAL_ENV       string = "CORK_WORKER_POLL_INTERVAL"
@@ -77,8 +79,18 @@ type Manager struct {
 	// updateMu serializes rebuilds (UpdateWithOptions) and schema operations
 	// (CreateSchema, UpdateSchema, DeleteSchema) against each other: any two
 	// of them would tear down and relaunch the same instances against each
-	// other. Taken at the API boundary only; internal helpers assume it held.
+	// other. Taken at the API boundary only, through lockUpdates (preload.go);
+	// internal helpers assume it held.
 	updateMu sync.Mutex
+	// preloadPulls holds the fleet's preload pull slots (acquirePreloadPull), and
+	// updateBefore what preloading covered when the running operation began
+	// (lockUpdates), for what it releases; the latter is the updateMu holder's.
+	preloadPulls chan struct{}
+	// preloading is whether any schema is preloaded, kept by unlockUpdates and
+	// read at startup, so that on a fleet that preloads nothing a landing build
+	// kicks no one and an operation takes no preload snapshot.
+	preloading   atomic.Bool
+	updateBefore *preloadSets
 	// imageMu serializes the "is this content still referenced? if not, untag"
 	// critical sections (executeBuild cleanup, pruneReplacedImages,
 	// destroyImages) so a concurrent remover cannot delete a tag between
