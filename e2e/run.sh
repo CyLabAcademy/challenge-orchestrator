@@ -3,7 +3,8 @@
 #
 # --full adds the steps that are only worth their seconds when nobody is
 # waiting for the answer: the registry's failure paths, artifact delivery,
-# multi-container challenges, cold pulls, docker-reaper and resource limits.
+# multi-container challenges, cold pulls, preloading, docker-reaper and
+# resource limits.
 set -euo pipefail
 cd "$(dirname "$0")"
 if [[ "${1:-}" == "--full" ]]; then

@@ -120,6 +120,8 @@ func main() {
 	http.HandleFunc("/instances/", s.instanceHandler)
 	http.HandleFunc("/workers", s.workersHandler)
 	http.HandleFunc("/workers/", s.workerHandler)
+	http.HandleFunc("/preloads", s.preloadsHandler)
+	http.HandleFunc("/preloads/", s.preloadHandler)
 	http.HandleFunc("/pins", s.pinsHandler)
 	http.HandleFunc("/schemas", s.schemaHandler)
 	http.HandleFunc("/schemas/", s.existingSchemaHandler)
@@ -436,6 +438,43 @@ Workers:
   Note: The Docker client is configured via Docker's standard environment
       variables.  See https://docs.docker.com/engine/reference/commandline/cli/
       for specific details.
+
+Preloads:
+  Workers hold challenge images in one of two modes, chosen per schema by
+  whether its images fit on a worker. On demand, the default, a worker pulls
+  an image the first time it launches it, so the set being served never has
+  to fit on one box, and cleanup is out of band: corkd removes no images, and
+  docker-reaper evicts what goes unused. A preloaded schema (POST /preloads
+  {"schema": "<name>"}, or cork preload-add) instead has every image it
+  launches pulled onto every worker ahead of its launches, including workers
+  added later. Each worker's preload pulls one image at a time, in its own
+  order, and at most CORK_PRELOAD_PULLS (default 8) run at once across the
+  fleet, without holding back placement; launches still pull their own. A
+  worker checks again when a schema is preloaded, as each build lands, and
+  every five minutes; once GET /preloads shows it holding every image, its
+  launches of the schema do not wait on the registry. Until then they pull
+  as on demand: a worker just added catches up while it serves, and a
+  redeployed challenge's new version is pulled by each worker once its build
+  lands, after any pulls already under way there. Its workers need an image
+  store that holds the whole set plus a second version of what one update
+  redeploys, with docker-reaper's image eviction off.
+
+  A preloaded schema's cleanup is corkd's own. While a challenge is preloaded,
+  each worker deletes, after its pulls, the images of it that no current
+  build launches, pulling first any version that landed meanwhile. The
+  delete is never forced: an image a container still uses, such as an
+  instance the redeploy has yet to stop or a launch it overtook, is tagged
+  <repo>:stale-<tag> instead and deleted by a later pass once nothing uses
+  it. A worker's removals stop at the first that times
+  out, and a preload call that times out counts against nothing. A preload
+  ends with DELETE /preloads/<name> or with its schema's deletion. What an
+  operation takes out of preloading -- the schema deleted, a challenge
+  dropped from it -- may stay on the workers unless another preloaded schema
+  shares the challenge, and corkd logs the images that may remain, read from
+  its database rather than from the workers. DELETE /preloads/<name> returns
+  the schema to pulling on demand, so the workers pull no more of it, leaves
+  its images in place, and answers with the ones that may remain uncleaned:
+  {"released": [<image>, ...]}.
 
 `, os.Args[0])
 }

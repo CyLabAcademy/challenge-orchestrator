@@ -106,8 +106,8 @@ func (m *Manager) HandOverChallenge(id ChallengeId, handOver *HandOver, options 
 	// Serialized with updates, schema operations and other hand-overs: a
 	// hand-over restarts and relaunches the instances of what it replaces,
 	// as a rebuild does, and would work over any of them.
-	m.updateMu.Lock()
-	defer m.updateMu.Unlock()
+	m.lockUpdates()
+	defer m.unlockUpdates()
 
 	current, err := m.lookupChallengeMetadata(id)
 	if err != nil {
@@ -394,7 +394,7 @@ func (m *Manager) commitHandedOverBuild(cMeta *ChallengeMetadata, delivered *Bui
 	// bundle.
 	if delivered.Id != 0 && row.Id != delivered.Id {
 		return nil, []error{fmt.Errorf(
-			"%s is on record as build %d and was handed over as build %d: the build plane has renumbered it, and its artifact bundle is now named for the new id; release the schema (remove-schema) and hand it over again",
+			"%s is on record as build %d and was handed over as build %d: the build plane has renumbered it, and its artifact bundle is now named for the new id; release the schema (remove-schema) and hand it over again, then preload-add it again if it was preloaded",
 			handOverBuildName(index, cMeta.Id, delivered), row.Id, delivered.Id)}
 	}
 	// A row with no generation on it -- opened now, or by a hand-over that
@@ -467,8 +467,8 @@ func (m *Manager) commitHandedOverBuild(cMeta *ChallengeMetadata, delivered *Bui
 // there the tree decides: the next update finds the challenge again unless
 // it is gone from the tree as well.
 func (m *Manager) RemoveChallenge(id ChallengeId) error {
-	m.updateMu.Lock()
-	defer m.updateMu.Unlock()
+	m.lockUpdates()
+	defer m.unlockUpdates()
 
 	meta, err := m.lookupChallengeMetadata(id)
 	if err != nil {

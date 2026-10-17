@@ -280,6 +280,11 @@ func (m *Manager) finalizeBuild(build *BuildMetadata) error {
 	err = txn.Commit()
 	if err != nil { // It's undocumented what this means...
 		m.log.error(err)
+	} else if m.preloading.Load() {
+		// A new generation goes out to the workers as it lands, not when the
+		// operation it is part of ends, which for an update of many challenges
+		// can be minutes later.
+		m.kickPreloads()
 	}
 
 	return err

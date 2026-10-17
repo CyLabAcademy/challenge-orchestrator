@@ -300,6 +300,31 @@ Workers:
       show every worker, its two health states, how long it has been in the
       reachable one and why, and how many instances it holds
 
+Preloads (when a schema's images fit on every worker, pull them ahead of its launches):
+  preload-add <schema>
+      pull every image the schema launches onto every worker, including
+      workers added later, without holding any worker out of placement: a
+      worker serves without pulling once preload-list shows it ready.
+      Cleanup is then corkd's, not docker-reaper's, for as long as the
+      schema is preloaded: after its pulls, each worker deletes the images
+      of its challenges that no current build launches, though not before
+      pulling a version that landed meanwhile. An image a container still
+      uses (an instance the update has yet to stop, a launch it overtook)
+      is tagged <repo>:stale-<tag> instead, for a later pass to delete
+      once nothing uses it. The workers' image store
+      has to hold the whole set plus a second version of what one update
+      redeploys, with docker-reaper's image eviction off. What the preload
+      stops covering -- the schema removed with remove-schema, a challenge
+      dropped from it -- may stay on the workers unless another preloaded
+      schema shares the challenge, and corkd's log lists those images
+  preload-remove <schema>
+      go back to pulling on demand: the workers pull no more of the
+      schema's images, the ones already pulled stay, and the ones that may
+      remain uncleaned are listed: turn docker-reaper's image eviction back
+      on, or remove them by hand
+  preload-list
+      each preloaded schema, and how many of its images each worker holds
+
 Base image pins:
   pin-list
       show the pinned base images and how many challenges use each
@@ -387,6 +412,59 @@ changes.
 Either way, your challenges are then built and ready to run. Send HTTP
 requests for start/stop with the appropriate build IDs and watch them run.
 
+Workers hold challenge images in one of two modes, chosen per schema by
+whether its images fit on a worker:
+
+- **On demand**, the default. A worker pulls an image the first time it
+  launches it, so the set being served never has to fit on one box. This is the
+  mode for a large or growing catalogue; its cost is a pull on each worker's
+  first launch of each image. Cleanup is out of band: corkd removes no images
+  from a worker, and docker-reaper evicts what has gone unused.
+- **Preloaded**. When a schema's images fit on every worker,
+  `cork preload-add <schema>` has every worker pull all of them ahead of time,
+  and `preload-list` shows when each worker holds them. A worker that shows
+  `ready` serves the schema's launches without pulling. Until then launches on
+  it pull as they would on demand: a worker just added takes launches while it
+  catches up, and the new version of a redeployed challenge is pulled by each
+  worker once its build lands, after any pulls the worker already has under
+  way.
+
+  Cleanup is corkd's own, not docker-reaper's or an operator's, for as long as
+  a challenge is preloaded. After its pulls, each worker deletes the images of
+  it that no current build launches, such as the version a redeploy replaced
+  or a seed the schema dropped; a version that lands while the worker pulls is
+  pulled before its predecessor goes. The delete is never forced. A redeploy stops the old version's instances, or restarts them
+  on the new one; an image a container still uses -- an instance the redeploy
+  has yet to reach, a launch it overtook -- is tagged `<repo>:stale-<tag>`
+  instead, and a later pass deletes it once nothing uses it. A redeployed
+  challenge mostly shares its layers with the version it replaces, so these
+  deletes are small; while one runs, the worker's container creates and
+  removes, and its image checks and lists, wait for it.
+
+  A preload ends with `preload-remove` or with its schema's deletion; an update
+  that leaves the schema empty, such as a converge that failed, keeps it for
+  the schema's return. What leaves preloading is not tracked down: deleting a
+  preloaded schema, or dropping a challenge from it, may leave its images on
+  the workers, unless another preloaded schema shares the challenge. corkd logs
+  the images that may remain, from its database, without asking the workers
+  what they hold. Stale tags left behind that way are listed by
+  `docker images --format '{{.Repository}}:{{.Tag}}' | grep ':stale-'`, and the
+  rare race of a delete with a launch can leave an untagged image, which
+  `docker image prune` removes.
+
+  Size the workers' image store for the whole set, plus a second version of
+  whatever one update redeploys (the new version is pulled before the old one
+  goes), and turn docker-reaper's image eviction off there, since corkd decides
+  what stays.
+
+The modes are per schema but eviction is per worker: a worker with eviction off
+also keeps every image an on-demand schema has it pull, and an on-demand schema
+sharing a challenge with a preloaded one has its old versions of that challenge
+removed while the preload lasts. `preload-remove` leaves the schema's images in
+place and lists the ones that may remain uncleaned; turn docker-reaper's image
+eviction back on for those workers, or remove them by hand, since nothing else
+will.
+
 To build or run challenges by hand, use `cork`'s `build`, `start` and
 `stop` — they act on one orchestrator directly. Note that a manual build
 belongs to no schema, so it has no destination and no build plane will route
@@ -410,6 +488,7 @@ Every setting also answers to its pre-rename `CMGR_` name (`CMGR_DB` for `CORK_D
 | CORK_DB_WAL              | Enable WAL journaling for SQLite                                                                                                   | on                                                                       |
 | CORK_LOGGING             | Log verbosity for `corkd` and `cork-build`: `debug`, `info`, `warn`, `error` or `disabled`. There is no flag for it on `corkd`, so this is the only way to raise an orchestrator's logging; `cork-build --verbose` is the flag form and wins over it. A value that does not parse is warned about and not fatal | info |
 | CORK_CONCURRENT_LAUNCHES | Launch slots per daemon (1-16), and as many teardown slots: network creation plus container starts, which dockerd serializes internally on either firewall backend; no gain measured past 2 | 2                                                                        |
+| CORK_PRELOAD_PULLS       | How many preload pulls run at once across the fleet (each worker pulls one at a time); see `cork preload-add` | 8 |
 | CORK_WORKER_POLL_INTERVAL | How often each worker is probed (telemetry and docker on the same tick)                                                           | 5s                                                                       |
 | CORK_WORKER_POLL_TIMEOUT | Telemetry poll timeout; must be under the probe interval (clamped to half of it otherwise)                                         | 250ms                                                                    |
 | CORK_WORKER_PING_TIMEOUT | Docker `/_ping` timeout; clamped the same way. Looser than the telemetry one — dockerd under load answers more slowly than a cached verdict, and there is TLS in the path | 1s                          |
@@ -441,7 +520,7 @@ Every setting also answers to its pre-rename `CMGR_` name (`CMGR_DB` for `CORK_D
 Everything above is read by the shared `cork` library, so `corkd` and
 `cork-build` accept the same surface — but each ignores the other's half, and
 says so at startup rather than silently. A build plane runs nothing, so
-`CORK_CONCURRENT_LAUNCHES`, `CORK_PORTS`, `CORK_INTERFACE`,
+`CORK_CONCURRENT_LAUNCHES`, `CORK_PRELOAD_PULLS`, `CORK_PORTS`, `CORK_INTERFACE`,
 `CORK_ENABLE_DISK_QUOTAS`, `CORK_PRUNE_AGE` and the `CORK_WORKER_*`
 tunables are inert on `cork-build`; an orchestrator on an external build
 plane builds nothing, so `CORK_DIR`, `CORK_BASE_PINS`, `DOCKER_HOST` and
